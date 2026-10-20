@@ -51,7 +51,19 @@ async function main() {
 		// Monitor de estabilidade também é compartilhado
 		//const stabilityMonitor = new StabilityMonitor({instances: botInstances})
 
-		const rBots = JSON.parse(fs.readFileSync("bots.json", "utf8")) || [];
+		// bots.json tem prioridade; sem ele (ex: deploy no Railway), usa a variável BOTS_JSON
+		let botsSource = "bots.json";
+		let botsRaw;
+		if (fs.existsSync("bots.json")) {
+			botsRaw = fs.readFileSync("bots.json", "utf8");
+		} else if (process.env.BOTS_JSON) {
+			botsSource = "BOTS_JSON";
+			botsRaw = process.env.BOTS_JSON;
+		} else {
+			throw new Error("Nenhuma configuração de bots: crie o bots.json ou defina a variável BOTS_JSON.");
+		}
+		logger.info(`Carregando configuração de bots de ${botsSource}`);
+		const rBots = JSON.parse(botsRaw) || [];
 
 		if (rBots.length == 0) {
 			logger.info(`Nenhum bot definido no bots.json.`);

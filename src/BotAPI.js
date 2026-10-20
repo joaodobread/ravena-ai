@@ -2828,6 +2828,9 @@ class BotAPI {
 				res.json(JSON.parse(data));
 			} catch (error) {
 				if (error.code === "ENOENT") {
+					if (process.env.BOTS_JSON) {
+						return res.json(JSON.parse(process.env.BOTS_JSON));
+					}
 					this.logger.warn("bots.json not found, returning empty array.");
 					return res.json([]);
 				}
