@@ -11,8 +11,8 @@ RUN rm -f /etc/apt/apt.conf.d/docker-clean; \
 
 # System dependencies: ffmpeg for media, imagemagick for image processing
 # Using apt-get for Debian-based image with build cache mounts
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+RUN --mount=type=cache,id=s/ff036bb5-ef37-42a1-b695-b45e0e6b362f-/var/cache/apt,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,id=s/ff036bb5-ef37-42a1-b695-b45e0e6b362f-/var/lib/apt/lists,target=/var/lib/apt/lists,sharing=locked \
     apt-get update && apt-get install -y \
     ffmpeg \
     imagemagick \
@@ -35,7 +35,7 @@ WORKDIR /app
 
 # Install Node dependencies first (layer cache optimization)
 COPY package.json package-lock.json ./
-RUN --mount=type=cache,target=/root/.npm \
+RUN --mount=type=cache,id=s/ff036bb5-ef37-42a1-b695-b45e0e6b362f-/root/.npm,target=/root/.npm \
     npm ci --omit=dev
 
 # Copy application source
