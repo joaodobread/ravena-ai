@@ -1,13 +1,74 @@
+const fs = require("fs");
+const path = require("path");
+const crypto = require("crypto");
 const axios = require("axios");
 const cheerio = require("cheerio");
 const Database = require("../utils/Database");
 const ReturnMessage = require("../models/ReturnMessage");
 const Command = require("../models/Command");
 const Logger = require("../utils/Logger");
+const AdminUtils = require("../utils/AdminUtils");
+const RaffleMonitor = require("../services/RaffleMonitor");
+const GroupContextHelper = require("../utils/GroupContextHelper");
 
 const logger = new Logger("raffles");
 const database = Database.getInstance();
+const adminUtils = AdminUtils.getInstance();
 const dbName = "raffle_cache";
+const RAFFLES_MEDIA_DIR = path.join(database.databasePath, "media", "raffles");
+
+/**
+ * Garante que o diretório data/media/raffles exista
+ */
+async function garantirDiretorioMidia() {
+	try {
+		await fs.promises.mkdir(RAFFLES_MEDIA_DIR, { recursive: true });
+	} catch (err) {
+		logger.error("Erro ao criar diretório data/media/raffles:", err.message ?? err);
+	}
+}
+
+/**
+ * Obtém ou faz download da imagem da rifa salvando em data/media/raffles/
+ * @param {string} imageUrl - URL da imagem
+ * @returns {Promise<string|null>} Caminho local do arquivo no disco
+ */
+async function getOrDownloadRaffleImage(imageUrl) {
+	if (!imageUrl || typeof imageUrl !== "string" || !imageUrl.startsWith("http")) return null;
+	try {
+		await garantirDiretorioMidia();
+		const hash = crypto.createHash("md5").update(imageUrl).digest("hex");
+		const localPath = path.join(RAFFLES_MEDIA_DIR, `${hash}.jpg`);
+
+		// Se já existe localmente, retorna o caminho do arquivo
+		if (fs.existsSync(localPath)) {
+			return localPath;
+		}
+
+		logger.info(
+			`[Raffles] Baixando imagem da rifa para cache local em data/media/raffles/: ${imageUrl}`
+		);
+		const response = await axios.get(imageUrl, {
+			responseType: "arraybuffer",
+			timeout: 10000,
+			headers: {
+				"User-Agent":
+					"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
+			}
+		});
+
+		if (response.data && response.data.length > 0) {
+			await fs.promises.writeFile(localPath, Buffer.from(response.data));
+			return localPath;
+		}
+	} catch (err) {
+		logger.warn(
+			`[Raffles] Falha ao baixar imagem para cache local (${imageUrl}):`,
+			err.message ?? err
+		);
+	}
+	return null;
+}
 
 // Initialize SQLite database
 database.getSQLiteDb(
@@ -321,14 +382,17 @@ async function parseBoostLab(html, $, url) {
 /**
  * Fetches raffle data from URL with caching
  * @param {string} url - The raffle URL
+ * @param {boolean} [force=false] - Se true, ignora o cache em memória e força busca online
  * @returns {Promise<Object|null>} - The raffle data
  */
-async function getRaffleData(url) {
+async function getRaffleData(url, force = false) {
 	// Check memory cache first
-	const cached = memoryCache.get(url);
-	if (cached && Date.now() - cached.timestamp < 15 * 60 * 1000) {
-		logger.info(`Raffle cache hit (memory) for ${url}`);
-		return cached.data;
+	if (!force) {
+		const cached = memoryCache.get(url);
+		if (cached && Date.now() - cached.timestamp < 15 * 60 * 1000) {
+			logger.info(`Raffle cache hit (memory) for ${url}`);
+			return cached.data;
+		}
 	}
 
 	let data = null;
@@ -381,6 +445,11 @@ async function getRaffleData(url) {
 				data,
 				timestamp: Date.now()
 			});
+
+			// Baixa imagem para data/media/raffles/ em background
+			if (data.image_url) {
+				getOrDownloadRaffleImage(data.image_url).catch(() => {});
+			}
 		}
 	} catch (error) {
 		logger.error(`Error fetching raffle online for ${url}:`, error.message ?? error);
@@ -414,7 +483,139 @@ async function getRaffleData(url) {
 }
 
 /**
- * Handler command for raffle
+ * Constrói a mensagem visual formatada da rifa com barra de progresso e suporte a mídia.
+ *
+ * @param {Object} bot - Instância do bot
+ * @param {string} chatId - Chat ID de destino
+ * @param {Object} data - Dados da rifa
+ * @param {string} link - URL da rifa
+ * @param {string} [headerPhrase=null] - Frase de cabeçalho (usada em notificações)
+ * @param {Object} [quotedOrigin=null] - Mensagem original citada (se houver)
+ * @returns {Promise<ReturnMessage|ReturnMessage[]>}
+ */
+async function buildRaffleMessage(
+	bot,
+	chatId,
+	data,
+	link,
+	headerPhrase = null,
+	quotedOrigin = null
+) {
+	const available = data.available_nums;
+	const total = data.total_nums;
+	const sold = Math.max(0, total - available);
+	const percent = total ? Math.round((sold / total) * 100) : 0;
+
+	const totalBlocks = 13;
+	const filledBlocks = total ? Math.round((sold / total) * totalBlocks) : 0;
+	const emptyBlocks = Math.max(0, totalBlocks - filledBlocks);
+	const progressBar = "[" + "▰".repeat(filledBlocks) + "▱".repeat(emptyBlocks) + "]";
+
+	const baseHeader = headerPhrase ? `🎉 *${headerPhrase}*\n\n` : "";
+
+	// Base message without description
+	let textWithoutDesc = `${baseHeader}🎁 *Ação: _${data.title}_*\n`;
+	textWithoutDesc += `💸 *${data.price}* cada cota\n`;
+	textWithoutDesc += `_${percent}% vendido, ${available.toLocaleString("pt-BR")} cotas restantes_\n`;
+	textWithoutDesc += `${progressBar}\n\n`;
+
+	if (data.alert_text) {
+		textWithoutDesc += `⚠️ ${data.alert_text}\n\n`;
+	}
+	textWithoutDesc += `🔗 ${link}`;
+
+	// Message with description
+	let text = `${baseHeader}🎁 *Ação: _${data.title}_*\n`;
+	text += `💸 *${data.price}* cada cota\n`;
+	text += `_${percent}% vendido, ${available.toLocaleString("pt-BR")} cotas restantes_\n`;
+	text += `${progressBar}\n\n`;
+
+	if (data.alert_text) {
+		text += `⚠️ ${data.alert_text}\n\n`;
+	}
+
+	if (data.description) {
+		text += `📝 *Descrição:*\n${data.description}\n\n`;
+	}
+	text += `🔗 ${link}`;
+
+	const replyOptions = quotedOrigin
+		? {
+				quotedMessageId: quotedOrigin.id?._serialized,
+				goReply: quotedOrigin
+			}
+		: {};
+
+	// Try sending with image if available
+	if (data.image_url) {
+		try {
+			let media = null;
+			// 1. Tenta carregar ou baixar para o cache local em data/media/raffles/
+			const localImagePath = await getOrDownloadRaffleImage(data.image_url);
+			if (
+				localImagePath &&
+				fs.existsSync(localImagePath) &&
+				typeof bot?.createMedia === "function"
+			) {
+				media = await bot.createMedia(localImagePath);
+			} else if (typeof bot?.createMediaFromURL === "function") {
+				media = await bot.createMediaFromURL(data.image_url);
+			}
+
+			if (media) {
+				media.mimetype = "image/jpeg";
+				media.filename = "raffle.jpg";
+
+				// Captions support up to 1024 characters
+				if (text.length > 1024 && data.description) {
+					return [
+						new ReturnMessage({
+							chatId,
+							content: media,
+							options: {
+								caption: textWithoutDesc,
+								...replyOptions
+							}
+						}),
+						new ReturnMessage({
+							chatId,
+							content: `📝 *Descrição:*\n${data.description}`,
+							options: {
+								...replyOptions
+							}
+						})
+					];
+				} else {
+					return new ReturnMessage({
+						chatId,
+						content: media,
+						options: {
+							caption: text,
+							...replyOptions
+						}
+					});
+				}
+			}
+		} catch (imageError) {
+			logger.error(
+				"Error creating/sending media, falling back to text:",
+				imageError.message ?? imageError
+			);
+		}
+	}
+
+	// Text fallback
+	return new ReturnMessage({
+		chatId,
+		content: text,
+		options: {
+			...replyOptions
+		}
+	});
+}
+
+/**
+ * Handler command for raffle (!raffle <link>)
  */
 async function raffleCommand(bot, message, args, group) {
 	const chatId = message.group ?? message.author;
@@ -424,7 +625,7 @@ async function raffleCommand(bot, message, args, group) {
 			content:
 				"⚠️ *Atenção:* Use o comando informando o link da rifa. Exemplo: `!raffle https://www.narigapremios.com/campanha/fiat-palio-71054`",
 			options: {
-				quotedMessageId: message.origin.id._serialized,
+				quotedMessageId: message.origin?.id?._serialized,
 				goReply: message.origin
 			}
 		});
@@ -442,7 +643,7 @@ async function raffleCommand(bot, message, args, group) {
 			chatId,
 			content: `🎁 *Ação: _não encontrada_*\n\nNão encontrei dados de uma ação no link ${args[0]}`,
 			options: {
-				quotedMessageId: message.origin.id._serialized,
+				quotedMessageId: message.origin?.id?._serialized,
 				goReply: message.origin
 			}
 		});
@@ -450,121 +651,286 @@ async function raffleCommand(bot, message, args, group) {
 
 	try {
 		// React loading
-		message.origin.react(process.env.LOADING_EMOJI ?? "⌛️").catch(() => {});
+		if (message.origin && typeof message.origin.react === "function") {
+			message.origin.react(process.env.LOADING_EMOJI ?? "⌛️").catch(() => {});
+		}
 
-		const data = await getRaffleData(link);
+		let data = null;
+
+		// Se a rifa é seguida já, os dados do !raffle podem ser buscados direto da base de dados, agilizando o retorno
+		const raffleMonitor = RaffleMonitor.getInstance();
+		const isFollowed = await raffleMonitor.isFollowed(link);
+		if (isFollowed) {
+			const cachedRow = await database.dbGet(dbName, "SELECT * FROM raffle_cache WHERE url = ?", [
+				link
+			]);
+			if (cachedRow) {
+				logger.info(`Raffle cache hit (SQLite direto por ser seguida) para ${link}`);
+				data = {
+					title: cachedRow.title,
+					price: cachedRow.price,
+					total_nums: cachedRow.total_nums,
+					available_nums: cachedRow.available_nums,
+					alert_text: cachedRow.alert_text,
+					description: cachedRow.description,
+					image_url: cachedRow.image_url,
+					updated_at: cachedRow.updated_at
+				};
+			}
+		}
+
+		// Se não estava no cache do SQLite ou não é seguida, busca normalmente
+		if (!data) {
+			data = await getRaffleData(link);
+		}
+
 		if (!data) {
 			return new ReturnMessage({
 				chatId,
 				content: `🎁 *Ação: _não encontrada_*\n\nNão encontrei dados de uma ação no link ${link}`,
 				options: {
-					quotedMessageId: message.origin.id._serialized,
+					quotedMessageId: message.origin?.id?._serialized,
 					goReply: message.origin
 				}
 			});
 		}
 
-		// Calculate values for formatting
-		const available = data.available_nums;
-		const total = data.total_nums;
-		const sold = total - available;
-		const percent = total ? Math.round((sold / total) * 100) : 0;
-
-		const totalBlocks = 13;
-		const filledBlocks = total ? Math.round((sold / total) * totalBlocks) : 0;
-		const emptyBlocks = totalBlocks - filledBlocks;
-		const progressBar = "[" + "▰".repeat(filledBlocks) + "▱".repeat(emptyBlocks) + "]";
-
-		// Base message without description
-		let textWithoutDesc = `🎁 *Ação: _${data.title}_*\n`;
-		textWithoutDesc += `💸 *${data.price}* cada cota\n`;
-		textWithoutDesc += `_${percent}% vendido, ${available.toLocaleString("pt-BR")} cotas restantes_\n`;
-		textWithoutDesc += `${progressBar}\n\n`;
-
-		if (data.alert_text) {
-			textWithoutDesc += `⚠️ ${data.alert_text}\n\n`;
-		}
-		textWithoutDesc += `🔗 ${link}`;
-
-		// Message with description
-		let text = `🎁 *Ação: _${data.title}_*\n`;
-		text += `💸 *${data.price}* cada cota\n`;
-		text += `_${percent}% vendido, ${available.toLocaleString("pt-BR")} cotas restantes_\n`;
-		text += `${progressBar}\n\n`;
-
-		if (data.alert_text) {
-			text += `⚠️ ${data.alert_text}\n\n`;
-		}
-
-		if (data.description) {
-			text += `📝 *Descrição:*\n${data.description}\n\n`;
-		}
-		text += `🔗 ${link}`;
-
-		// Try sending with image
-		if (data.image_url) {
-			try {
-				const media = await bot.createMediaFromURL(data.image_url);
-				media.mimetype = "image/jpeg";
-				media.filename = "raffle.jpg";
-
-				// Captions support up to 1024 characters
-				if (text.length > 1024 && data.description) {
-					return [
-						new ReturnMessage({
-							chatId,
-							content: media,
-							options: {
-								caption: textWithoutDesc,
-								quotedMessageId: message.origin.id._serialized,
-								goReply: message.origin
-							}
-						}),
-						new ReturnMessage({
-							chatId,
-							content: `📝 *Descrição:*\n${data.description}`,
-							options: {
-								quotedMessageId: message.origin.id._serialized,
-								goReply: message.origin
-							}
-						})
-					];
-				} else {
-					return new ReturnMessage({
-						chatId,
-						content: media,
-						options: {
-							caption: text,
-							quotedMessageId: message.origin.id._serialized,
-							goReply: message.origin
-						}
-					});
-				}
-			} catch (imageError) {
-				logger.error("Error creating/sending media, falling back to text:", imageError);
-			}
-		}
-
-		// Text fallback
-		return new ReturnMessage({
-			chatId,
-			content: text,
-			options: {
-				quotedMessageId: message.origin.id._serialized,
-				goReply: message.origin
-			}
-		});
+		return await buildRaffleMessage(bot, chatId, data, link, null, message.origin);
 	} catch (error) {
 		logger.error("Error executing raffle command:", error);
 		return new ReturnMessage({
 			chatId,
 			content: `🎁 *Ação: _não encontrada_*\n\nNão encontrei dados de uma ação no link ${link}`,
 			options: {
-				quotedMessageId: message.origin.id._serialized,
+				quotedMessageId: message.origin?.id?._serialized,
 				goReply: message.origin
 			}
 		});
 	}
+}
+
+/**
+ * Handler command para seguir uma rifa (!raffle-seguir <link>)
+ */
+async function raffleSeguirCommand(bot, message, args, group) {
+	const { targetGroup, isPrivate, responseChatId, errorResponse } =
+		await GroupContextHelper.resolveGroupAndAdmin(bot, message, group, {
+			featureName: "o monitoramento de rifas"
+		});
+	if (errorResponse) return errorResponse;
+
+	if (args.length === 0) {
+		return new ReturnMessage({
+			chatId: responseChatId,
+			content:
+				"⚠️ *Atenção:* Use o comando informando o link da rifa que deseja seguir. Exemplo: `!raffle-seguir https://www.narigapremios.com/campanha/fiat-palio-71054`",
+			options: {
+				quotedMessageId: message.origin?.id?._serialized,
+				goReply: message.origin
+			}
+		});
+	}
+
+	let link = args[0].trim();
+	if (!/^https?:\/\//i.test(link)) {
+		link = "https://" + link;
+	}
+
+	try {
+		new URL(link);
+	} catch (e) {
+		return new ReturnMessage({
+			chatId: responseChatId,
+			content: `🎁 *Ação: _link inválido_*\n\nO link informado não é uma URL válida: ${args[0]}`,
+			options: {
+				quotedMessageId: message.origin?.id?._serialized,
+				goReply: message.origin
+			}
+		});
+	}
+
+	try {
+		if (message.origin && typeof message.origin.react === "function") {
+			message.origin.react(process.env.LOADING_EMOJI ?? "⌛️").catch(() => {});
+		}
+
+		// 3. Obter dados da rifa online para validação e cálculo de baseline
+		const data = await getRaffleData(link);
+		if (!data) {
+			return new ReturnMessage({
+				chatId: responseChatId,
+				content: `🎁 *Ação: _não encontrada_*\n\nNão consegui obter os dados da rifa no link ${link}. Verifique se a URL está correta.`,
+				options: {
+					quotedMessageId: message.origin?.id?._serialized,
+					goReply: message.origin
+				}
+			});
+		}
+
+		// 4. Verificar se este grupo já segue esta rifa
+		const raffleMonitor = RaffleMonitor.getInstance();
+		const follows = await raffleMonitor.listFollowed(targetGroup.id);
+		const alreadyFollows = follows.some((f) => f.url === link);
+		if (alreadyFollows) {
+			return new ReturnMessage({
+				chatId: responseChatId,
+				content: `⚠️ O grupo *${targetGroup.name}* já está seguindo esta rifa!\n\nUse \`!raffle ${link}\` para consultar as informações em tempo real.`,
+				options: {
+					quotedMessageId: message.origin?.id?._serialized,
+					goReply: message.origin
+				}
+			});
+		}
+
+		// 5. Calcular porcentagem atual para estabelecer baseline
+		const total = data.total_nums || 0;
+		const available = data.available_nums || 0;
+		const sold = Math.max(0, total - available);
+		const currentPercent = total > 0 ? (sold / total) * 100 : 0;
+
+		// 6. Cadastrar o monitoramento
+		await raffleMonitor.followRaffle(link, targetGroup.id, message.author, bot.id, currentPercent);
+
+		const roundedPercent = Math.round(currentPercent);
+		let responseText = `✅ *Rifa adicionada ao monitoramento com sucesso!*\n\n`;
+		if (isPrivate) {
+			responseText += `👥 *Grupo vinculado:* ${targetGroup.name}\n\n`;
+		}
+		responseText += `🎁 *Ação:* _${data.title}_\n`;
+		responseText += `📊 *Progresso atual:* ${roundedPercent}% (${available.toLocaleString("pt-BR")} cotas restantes)\n\n`;
+		responseText += `🔔 *Metas de notificação:* 10%, 15%, 25%, 50%, 75%, 90%, 99% e 100%.\n`;
+
+		const nextMilestone = [10, 15, 25, 50, 75, 90, 99, 100].find((m) => m > currentPercent);
+		if (nextMilestone) {
+			responseText += `_Próxima notificação prevista na meta de *${nextMilestone}%*._\n\n`;
+		} else {
+			responseText += `_A rifa já atingiu 100% das vendas!_\n\n`;
+		}
+		responseText += `🔗 ${link}`;
+
+		return new ReturnMessage({
+			chatId: responseChatId,
+			content: responseText,
+			options: {
+				quotedMessageId: message.origin?.id?._serialized,
+				goReply: message.origin
+			}
+		});
+	} catch (error) {
+		logger.error("Erro ao registrar seguidor de rifa:", error);
+		return new ReturnMessage({
+			chatId: responseChatId,
+			content: `❌ Ocorreu um erro ao tentar seguir a rifa: ${error.message ?? error}`,
+			options: {
+				quotedMessageId: message.origin?.id?._serialized,
+				goReply: message.origin
+			}
+		});
+	}
+}
+
+/**
+ * Handler command para parar de seguir uma rifa (!raffle-parar <link>)
+ */
+async function rafflePararCommand(bot, message, args, group) {
+	const { targetGroup, responseChatId, errorResponse } =
+		await GroupContextHelper.resolveGroupAndAdmin(bot, message, group, {
+			featureName: "o monitoramento de rifas"
+		});
+	if (errorResponse) return errorResponse;
+
+	if (args.length === 0) {
+		return new ReturnMessage({
+			chatId: responseChatId,
+			content:
+				"⚠️ *Atenção:* Use o comando informando o link da rifa que deseja parar de seguir. Exemplo: `!raffle-parar https://www.narigapremios.com/campanha/fiat-palio-71054`",
+			options: {
+				quotedMessageId: message.origin?.id?._serialized,
+				goReply: message.origin
+			}
+		});
+	}
+
+	let link = args[0].trim();
+	if (!/^https?:\/\//i.test(link)) {
+		link = "https://" + link;
+	}
+
+	const raffleMonitor = RaffleMonitor.getInstance();
+	const removed = await raffleMonitor.unfollowRaffle(link, targetGroup.id);
+
+	if (removed) {
+		return new ReturnMessage({
+			chatId: responseChatId,
+			content: `🛑 O grupo *${targetGroup.name}* parou de seguir a rifa:\n${link}\n\nVocê não receberá mais notificações para esta rifa.`,
+			options: {
+				quotedMessageId: message.origin?.id?._serialized,
+				goReply: message.origin
+			}
+		});
+	} else {
+		return new ReturnMessage({
+			chatId: responseChatId,
+			content: `⚠️ O grupo *${targetGroup.name}* não estava seguindo esta rifa.`,
+			options: {
+				quotedMessageId: message.origin?.id?._serialized,
+				goReply: message.origin
+			}
+		});
+	}
+}
+
+/**
+ * Handler command para listar rifas seguidas pelo grupo (!raffle-listar)
+ */
+async function raffleListarCommand(bot, message, args, group) {
+	const { targetGroup, responseChatId, errorResponse } = await GroupContextHelper.resolveGroup(
+		bot,
+		message,
+		group,
+		{
+			featureName: "listar rifas"
+		}
+	);
+	if (errorResponse) return errorResponse;
+
+	const raffleMonitor = RaffleMonitor.getInstance();
+	const list = await raffleMonitor.listFollowed(targetGroup.id);
+
+	if (!list || list.length === 0) {
+		return new ReturnMessage({
+			chatId: responseChatId,
+			content: `📋 O grupo *${targetGroup.name}* não está seguindo nenhuma rifa no momento.\n\nUse \`!raffle-seguir <link>\` para começar a acompanhar uma rifa.`,
+			options: {
+				quotedMessageId: message.origin?.id?._serialized,
+				goReply: message.origin
+			}
+		});
+	}
+
+	let responseText = `📋 *Rifas monitoradas para o grupo ${targetGroup.name}:*\n\n`;
+	list.forEach((item, index) => {
+		const total = item.total_nums || 0;
+		const available = item.available_nums || 0;
+		const sold = Math.max(0, total - available);
+		const percent = total > 0 ? Math.round((sold / total) * 100) : 0;
+		const title = item.title || "Ação";
+
+		responseText += `*${index + 1}.* _${title}_\n`;
+		responseText += `   📊 ${percent}% vendido (${available.toLocaleString("pt-BR")} cotas restantes)\n`;
+		responseText += `   🔗 ${item.url}\n\n`;
+	});
+
+	responseText += `_Para parar de seguir, use: \`!raffle-parar <link>\`_`;
+
+	return new ReturnMessage({
+		chatId: responseChatId,
+		content: responseText.trim(),
+		options: {
+			quotedMessageId: message.origin?.id?._serialized,
+			goReply: message.origin
+		}
+	});
 }
 
 const commands = [
@@ -573,7 +939,7 @@ const commands = [
 		aliases: ["rifa", "acao"],
 		description: "Busca informações de uma rifa ou ação.",
 		category: "busca",
-		cooldown: 15,
+		cooldown: 5,
 		needsArgs: true,
 		minArgs: 1,
 		method: raffleCommand,
@@ -581,7 +947,89 @@ const commands = [
 			after: "🎁",
 			error: "❌"
 		}
+	}),
+	new Command({
+		name: "raffle-seguir",
+		aliases: ["rifa-seguir", "seguir-rifa", "raffle-follow"],
+		description:
+			"Monitora uma rifa e notifica o grupo ao atingir marcos de vendas (10%, 15%, 25%, 50%, etc).",
+		category: "busca",
+		cooldown: 5,
+		needsArgs: true,
+		minArgs: 1,
+		method: raffleSeguirCommand,
+		reactions: {
+			after: "🔔",
+			error: "❌"
+		}
+	}),
+	new Command({
+		name: "raffle-parar",
+		aliases: ["rifa-parar", "deseguir-rifa", "raffle-unfollow"],
+		description: "Para o monitoramento de uma rifa no grupo.",
+		category: "busca",
+		cooldown: 5,
+		needsArgs: true,
+		minArgs: 1,
+		method: rafflePararCommand,
+		reactions: {
+			after: "🛑",
+			error: "❌"
+		}
+	}),
+	new Command({
+		name: "raffle-listar",
+		aliases: ["rifa-listar", "raffle-seguindo", "rifas-seguindo"],
+		description: "Lista todas as rifas sendo monitoradas para o grupo.",
+		category: "busca",
+		cooldown: 5,
+		needsArgs: false,
+		minArgs: 0,
+		method: raffleListarCommand,
+		reactions: {
+			after: "📋",
+			error: "❌"
+		}
 	})
 ];
 
-module.exports = { commands };
+const helper = {
+	about: "Monitoramento e consulta de rifas e ações entre amigos",
+	implementation:
+		"Faz scraping de plataformas de rifas, armazena em banco de dados SQLite e notifica o grupo automaticamente ao atingir metas percentuais de vendas",
+	tags: "rifa,sorteio,bilhetes,cotas,premios,acao",
+	cmds: [
+		{
+			cmd: "!raffle <link>",
+			desc: "Consulta o status atual de uma rifa ou ação",
+			usage: ["!raffle https://..."],
+			category: "busca"
+		},
+		{
+			cmd: "!raffle-seguir <link>",
+			desc: "Inicia o monitoramento de uma rifa com alertas automáticos em 10%, 15%, 25%, 50%, 75%, 90%, 99% e 100%",
+			usage: ["!raffle-seguir https://..."],
+			category: "busca"
+		},
+		{
+			cmd: "!raffle-parar <link>",
+			desc: "Encerra o monitoramento de uma rifa no grupo",
+			usage: ["!raffle-parar https://..."],
+			category: "busca"
+		},
+		{
+			cmd: "!raffle-listar",
+			desc: "Lista todas as rifas atualmente monitoradas pelo grupo",
+			usage: ["!raffle-listar"],
+			category: "busca"
+		}
+	]
+};
+
+module.exports = {
+	helper,
+	commands,
+	getRaffleData,
+	buildRaffleMessage,
+	getOrDownloadRaffleImage
+};

@@ -27,24 +27,36 @@ database.getSQLiteDb(
         timestamp INTEGER,
         resolution TEXT,
         count INTEGER DEFAULT 1,
-        model TEXT
+        model TEXT,
+        is_success INTEGER DEFAULT 1
     );
     CREATE INDEX IF NOT EXISTS idx_comfy_ts ON comfy_stats(timestamp);
 `
 );
+
+// Migration for existing databases without is_success column
+database
+	.dbRun("media_stats", `ALTER TABLE comfy_stats ADD COLUMN is_success INTEGER DEFAULT 1`)
+	.catch(() => {});
 
 /**
  * Tracks ComfyUI usage stats
  * @param {string} resolution - Image resolution (e.g., "1024x1024")
  * @param {number} count - Number of images generated
  * @param {string} model - Model used
+ * @param {boolean} isSuccess - Whether generation succeeded
  */
-async function trackComfyStats(resolution, count = 1, model = "unknown") {
+async function trackComfyStats(
+	resolution = "1024x1024",
+	count = 1,
+	model = "unknown",
+	isSuccess = true
+) {
 	try {
 		await database.dbRun(
 			"media_stats",
-			`INSERT INTO comfy_stats (timestamp, resolution, count, model) VALUES (?, ?, ?, ?)`,
-			[Date.now(), resolution, count, model]
+			`INSERT INTO comfy_stats (timestamp, resolution, count, model, is_success) VALUES (?, ?, ?, ?, ?)`,
+			[Date.now(), resolution, count, model, isSuccess ? 1 : 0]
 		);
 	} catch (e) {
 		logger.error("Error tracking comfy stats:", e);
@@ -434,7 +446,13 @@ async function generateImage(bot, message, args, group, skipNotify = true, optio
 		});
 	}
 
-	prompt = await translateText(prompt, "pt", "en");
+	if (!options.isProgrammatic) {
+		try {
+			prompt = await translateText(prompt, "pt", "en");
+		} catch (e) {
+			logger.warn(`Erro ao traduzir prompt para ComfyUI (${e.message}), mantendo original.`);
+		}
+	}
 
 	logger.info(`Gerando imagem com prompt: '${prompt}'`);
 
@@ -590,9 +608,13 @@ async function generateImage(bot, message, args, group, skipNotify = true, optio
 				const imageBase64 = imageBuffer.toString("base64");
 				const nsfwResult = await nsfwPredict.detectNSFW(imageBase64);
 				isNSFW = nsfwResult.isNSFW;
-				logger.info(
-					`Imagem analisada: NSFW = ${isNSFW}, Reason: ${JSON.stringify(nsfwResult.reason)}`
-				);
+				if (nsfwResult.skipped) {
+					logger.info(`Verificação NSFW ignorada: ${nsfwResult.reason}`);
+				} else {
+					logger.info(
+						`Imagem analisada: NSFW = ${isNSFW}, Reason: ${JSON.stringify(nsfwResult.reason)}`
+					);
+				}
 			} catch (nsfwError) {
 				logger.error("Erro ao verificar NSFW:", nsfwError);
 			}
@@ -660,6 +682,7 @@ async function generateImage(bot, message, args, group, skipNotify = true, optio
 		return returnMessages.length === 1 ? returnMessages[0] : returnMessages;
 	} catch (error) {
 		logger.error("Erro ao gerar imagem:", error);
+		trackComfyStats("1024x1024", 1, "z-image-turbo-bf16", false);
 
 		let errorMessage = "Erro ao gerar imagem.";
 		if (error.code === "ECONNREFUSED" || error.code === "ETIMEDOUT") {
@@ -700,4 +723,16 @@ const commands = [
 	})
 ];
 
-// module.exports = { commands, generateImage };
+const helper = {
+	about: "Geração de imagens via workflow personalizado ComfyUI (Desativado / Legado)",
+	implementation:
+		"Submete jobs para API ComfyUI, monitora progresso via WebSocket/polling e retorna imagem gerada com controle de métricas",
+	tags: "comfyui,ia,legado",
+	cmds: []
+};
+
+module.exports = {
+	helper,
+	commands: [],
+	generateImage
+};

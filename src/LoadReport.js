@@ -24,6 +24,7 @@ class LoadReport {
 			maxResponseTime: 0, // Valor máximo de tempo de resposta
 			timestamp: Date.now()
 		};
+		this.lastReport = null;
 
 		// Configura intervalo para relatório (a cada 10 minutos)
 		if (process.env.DISABLE_ACTIVITY !== "true") {
@@ -117,39 +118,12 @@ class LoadReport {
 				(report.messages.totalReceived + report.messages.totalSent) / (report.duration / 3600)
 			);
 
-			// Salva relatório no banco de dados
+			// Salva relatório no banco de dados e em memória
+			this.lastReport = report;
 			await this.saveReport(report);
 
-			if (this.bot.updateStatus !== false) {
-				try {
-					// Obtém emoji de carga com base em msgs/h
-					const loadLevels = ["⬜", "🟩", "🟨", "🟧", "🟥", "⬛"];
-					let loadEmoji = loadLevels[0];
-
-					if (report.messages.messagesPerHour > 100) loadEmoji = loadLevels[1];
-					if (report.messages.messagesPerHour > 500) loadEmoji = loadLevels[2];
-					if (report.messages.messagesPerHour > 1000) loadEmoji = loadLevels[3];
-					if (report.messages.messagesPerHour > 1500) loadEmoji = loadLevels[4];
-					if (report.messages.messagesPerHour > 2000) loadEmoji = loadLevels[5];
-
-					// Formata data para status
-					const now = new Date();
-					const dateString = `${now.getDate().toString().padStart(2, "0")}/${(now.getMonth() + 1).toString().padStart(2, "0")}`;
-					const timeString = `${now.getHours().toString().padStart(2, "0")}:${now.getMinutes().toString().padStart(2, "0")}`;
-
-					// Constrói string de status com informação de atraso médio
-					const msgPv = this.bot.ignorePV ? "PV desabilitado" : "Envie !cmd";
-					const status = `${msgPv} | https://ravena.moothz.win | ${dateString} ${timeString}`;
-
-					// Atualiza status do bot
-					if (this.bot.client && this.bot.isConnected) {
-						await this.bot.client.setStatus(status);
-						this.logger.info(`Status do bot atualizado: ${status}`);
-					}
-				} catch (statusError) {
-					this.logger.error("Erro ao atualizar status do bot:", statusError);
-				}
-			}
+			// A atualização de status do perfil agora é gerenciada pelo ProfileStatusScheduler
+			// de forma escalonada (staggered a cada 5 minutos) para evitar requisições simultâneas.
 
 			// Envia relatório para o grupo de logs se configurado
 			if (this.bot.grupoEstabilidade) {
@@ -180,6 +154,32 @@ class LoadReport {
 		} catch (error) {
 			this.logger.error("Erro ao gerar relatório de carga:", error);
 		}
+	}
+
+	/**
+	 * Retorna métricas operacionais ao vivo direto da memória (sem tocar no disco)
+	 */
+	getLiveMetrics() {
+		const currentTime = Date.now();
+		const responseTimeCount = this.stats.responseTimes.length;
+		const avgResponseTime =
+			responseTimeCount > 0 ? this.stats.totalResponseTime / responseTimeCount : 0;
+		const duration = Math.max(1, Math.floor((currentTime - this.stats.timestamp) / 1000));
+		const totalReceived = this.stats.receivedPrivate + this.stats.receivedGroup;
+		const totalSent = this.stats.sentPrivate + this.stats.sentGroup;
+		const currentMsgsHr = Math.floor((totalReceived + totalSent) / (duration / 3600));
+
+		const fallbackAvg = this.lastReport?.responseTime?.average
+			? parseFloat(this.lastReport.responseTime.average)
+			: 0;
+
+		return {
+			msgsHr: currentMsgsHr || (this.lastReport?.messages?.messagesPerHour ?? 0),
+			responseTime: {
+				avg: parseFloat(avgResponseTime.toFixed(2)) || fallbackAvg,
+				max: this.stats.maxResponseTime || (this.lastReport?.responseTime?.max ?? 0)
+			}
+		};
 	}
 
 	/**
@@ -279,6 +279,35 @@ class LoadReport {
 			this.logger.debug("Relatório de carga salvo com sucesso");
 		} catch (error) {
 			this.logger.error("Erro ao salvar relatório de carga:", error);
+		}
+	}
+
+	/**
+	 * Formata a mensagem de status do perfil do bot
+	 * @returns {string}
+	 */
+	formatStatus() {
+		const now = new Date();
+		const dateString = `${now.getDate().toString().padStart(2, "0")}/${(now.getMonth() + 1).toString().padStart(2, "0")}`;
+		const timeString = `${now.getHours().toString().padStart(2, "0")}:${now.getMinutes().toString().padStart(2, "0")}`;
+
+		const msgPv = this.bot.ignorePV ? "PV desabilitado" : "Envie !cmd";
+		return `${msgPv} | https://ravena.moothz.win | ${dateString} ${timeString}`;
+	}
+
+	/**
+	 * Atualiza o status do perfil do bot diretamente (manual ou individual)
+	 */
+	async updateStatus() {
+		if (this.bot.updateStatus === false) return;
+		try {
+			const status = this.formatStatus();
+			if (this.bot.client && this.bot.isConnected) {
+				await this.bot.client.setStatus(status);
+				this.logger.info(`Status do bot atualizado: ${status}`);
+			}
+		} catch (statusError) {
+			this.logger.error("Erro ao atualizar status do bot:", statusError);
 		}
 	}
 

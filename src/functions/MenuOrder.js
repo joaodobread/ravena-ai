@@ -5,24 +5,24 @@
 const CATEGORY_EMOJIS = {
 	geral: "📃",
 	grupo: "👥",
-	midia: "📱",
+	stickers: "🏷️",
 	ia: "🤖",
+	interacao: "🤝",
+	midia: "📱",
+	voz: "🗣️",
 	utilidades: "🛠️",
-	jogos: "🎮",
-	áudio: "🔈",
-	diversao: "🧸",
-	zoeira: "🤪",
 	downloaders: "📤",
-	imagens: "📷",
-	tts: "🗣",
+	jogos: "🎮",
+	streams: "📺",
+	zoeira: "🤪",
+	mudae: "💍",
 	busca: "🔎",
 	cultura: "🍿",
+	audio: "🔈",
 	listas: "📜",
-	saude: "🥗",
-	general: "🖨️",
-	info: "ℹ️",
 	arquivos: "📂",
-	resto: "❓"
+	canais: "📢",
+	outros: "📦"
 };
 
 /**
@@ -30,6 +30,14 @@ const CATEGORY_EMOJIS = {
  * Os comandos não listados aparecem depois na ordem original
  */
 const COMMAND_ORDER = [
+	"canal-seguir",
+	"canal-lista",
+	"canal-ver",
+	"canal-rnd",
+	"canal-midias",
+	"canal-encaminhar",
+	"canais-header",
+	"canal-del",
 	"retrospectiva",
 	"cmd",
 	"ajuda",
@@ -49,6 +57,7 @@ const COMMAND_ORDER = [
 	"faladores",
 	"faladores-limpeza",
 	"faladores-reset",
+	"faladores-atividade",
 	"clima",
 	"news",
 	"stt",
@@ -79,11 +88,13 @@ const COMMAND_ORDER = [
 	"interagir",
 	"yt",
 	"sr",
+	"eventos",
 	"ragnavena",
 	"roletarussa",
 	"roletaranking",
 	"roleta-ranking",
 	"roleta-tempo",
+	"roleta-silenciar",
 	"roleta-reset",
 	"pescar",
 	"pesca-iscas",
@@ -101,6 +112,18 @@ const COMMAND_ORDER = [
 	"pinto-reset",
 	"slots",
 	"slots-premios",
+	"fazenda",
+	"faz-adm",
+	"faz-colher",
+	"faz-plantar",
+	"faz-loja",
+	"faz-comprar",
+	"faz-inventario",
+	"faz-usar",
+	"faz-vender",
+	"faz-decorar",
+	"faz-ranking",
+	"faz-ajuda",
 	"tarot",
 	"anonimo",
 	"roll",
@@ -122,7 +145,17 @@ const COMMAND_ORDER = [
 	"buscar-img",
 	"gif",
 	"wiki",
+	"voo",
+	"voos",
+	"prefixo",
+	"rab",
+	"radar",
+	"aeroporto",
 	"lastfm",
+	"raffle",
+	"raffle-listar",
+	"raffle-seguir",
+	"raffle-parar",
 	"listas",
 	"lc",
 	"lct",
@@ -154,6 +187,7 @@ const COMMAND_ORDER = [
 	"variaveis",
 	"setBemvindo",
 	"setDespedida",
+	"acumularSaudacoes",
 	"setApelido",
 	"ignorar",
 	"mute",
@@ -162,7 +196,11 @@ const COMMAND_ORDER = [
 	"notificar-grupoFechado",
 	"notificar-grupoAberto",
 	"filtro-palavra",
+	"filtro-regex",
 	"filtro-links",
+	"filtro-permitirLink",
+	"filtro-linksConfiaveis",
+	"filtro-permitirAdm",
 	"filtro-nsfw",
 	"filtro-pessoa",
 	"advertir",
@@ -195,4 +233,16 @@ const COMMAND_ORDER = [
 	"youtube-midia-off"
 ];
 
-module.exports = { COMMAND_ORDER, CATEGORY_EMOJIS };
+const helper = {
+	about: "Configuração de ordenação de categorias e prioridade de comandos no menu principal",
+	implementation:
+		"Exporta as constantes COMMAND_ORDER e CATEGORY_EMOJIS utilizadas para formatar a interface de ajuda",
+	tags: "menu,configuracao,ordem,emojis,categorias",
+	cmds: []
+};
+
+module.exports = {
+	helper,
+	COMMAND_ORDER,
+	CATEGORY_EMOJIS
+};

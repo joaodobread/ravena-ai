@@ -202,7 +202,7 @@
 
                 <div class="category-section">
                     <div class="category-header">
-                        <h3><i class="fas fa-chart-line"></i> <span id="stats-header-text">Desempenho na <span id="current-timeframe-label" class="clickable-period" onclick="openTimeframeModal()">Última Hora</span></span> (LLM)</h3>
+                        <h3><i class="fas fa-chart-line"></i> <span id="stats-header-text">Desempenho na <span id="current-timeframe-label" class="clickable-period" onclick="openTimeframeModal()">Última Hora</span></span> (LLM e Mídias)</h3>
                         <span id="stats-last-update" style="font-size: 0.7em; color: #888;"></span>
                     </div>
                     <div class="stats-grid" style="grid-template-columns: repeat(3, 1fr);">
@@ -237,9 +237,31 @@
                                 </tr>
                             </thead>
                             <tbody id="llm-stats-body">
-                                <tr><td colspan="6" class="text-center">Carregando estatísticas...</td></tr>
+                                <tr><td colspan="7" class="text-center">Carregando estatísticas...</td></tr>
                             </tbody>
                         </table>
+                    </div>
+
+                    <!-- Tabela de Usuários de API Externa -->
+                    <div id="external-api-users-container" style="margin-top: 25px;">
+                        <h4 style="margin-bottom: 12px; color: #a29bfe;"><i class="fas fa-key"></i> Requisições de APIs Externas (Por Usuário)</h4>
+                        <div class="table-responsive">
+                            <table class="table" id="external-users-table">
+                                <thead>
+                                    <tr>
+                                        <th>Usuário</th>
+                                        <th>Total de Requisições</th>
+                                        <th>LLM (Chat)</th>
+                                        <th>Imagine (Imagens)</th>
+                                        <th>STT (Transcrição)</th>
+                                        <th>TTS (Voz)</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="external-users-body">
+                                    <tr><td colspan="6" class="text-center" style="color: #888;">Nenhuma requisição de API externa registrada no período.</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
                     </div>
 
                     <div class="cost-pickers-container" style="margin-top: 20px; padding: 15px; background: rgba(255,255,255,0.05); border-radius: 8px;">
@@ -328,6 +350,39 @@
                     <div class="form-group checkbox-group">
                         <input type="checkbox" id="prov-ignore-video">
                         <label for="prov-ignore-video">Ignorar Vídeo (Multimodal)</label>
+                    </div>
+                    <div class="form-group checkbox-group">
+                        <input type="checkbox" id="prov-tool-calling">
+                        <label for="prov-tool-calling">Suporte a Tool Calling (Busca Web / Functions)</label>
+                    </div>
+                    <div class="form-group">
+                        <label>Tamanho do Contexto (contextLength em tokens)</label>
+                        <input type="number" id="prov-context-length" class="form-control" placeholder="Ex: 16384, 32768, 65536" step="1">
+                        <small style="color: #888; font-size: 0.8em;">Janela de contexto máxima do modelo em tokens (ex: 16384, 32768, 65536).</small>
+                    </div>
+                    <div class="form-group">
+                        <label>Máximo de Tokens de Saída (maxTokens)</label>
+                        <input type="number" id="prov-max-tokens" class="form-control" placeholder="Ex: 4096" step="1">
+                        <small style="color: #888; font-size: 0.8em;">Limite padrão de tokens para respostas geradas (padrão: 4096).</small>
+                    </div>
+                </div>
+                <div id="laya-extra-fields" class="hidden">
+                    <div class="form-group">
+                        <label>Modelo do Laya</label>
+                        <input type="text" id="prov-laya-model" class="form-control" placeholder="ravena-bgem3">
+                        <small style="color: #888; font-size: 0.8em;">Identificador do modelo na API (padrão: ravena-bgem3).</small>
+                    </div>
+                    <div class="form-group">
+                        <label>Timeout da Requisição (ms)</label>
+                        <input type="number" id="prov-laya-timeout" class="form-control" placeholder="3000" step="500">
+                        <small style="color: #888; font-size: 0.8em;">Tempo máximo em ms antes do fallback para LLM (padrão: 3000ms).</small>
+                    </div>
+                </div>
+                <div id="nudenet-extra-fields" class="hidden">
+                    <div class="form-group">
+                        <label>Timeout Circuit Breaker (Segundos)</label>
+                        <input type="number" id="prov-circuit-breaker" class="form-control" placeholder="15" min="1" step="1">
+                        <small style="color: #888; font-size: 0.8em;">Tempo de pausa para retentativas se a API ficar offline ou inacessível (padrão: 15s).</small>
                     </div>
                 </div>
 

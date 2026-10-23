@@ -378,6 +378,18 @@ class Database {
 		return this.coreRepo.getGroups();
 	}
 	async getGroup(groupId) {
+		try {
+			const EventHandler = require("../EventHandler");
+			if (
+				EventHandler.instance &&
+				EventHandler.instance.groups &&
+				EventHandler.instance.groups[groupId]
+			) {
+				return EventHandler.instance.groups[groupId];
+			}
+		} catch {
+			// ignore sync error
+		}
 		return this.coreRepo.getGroup(groupId);
 	}
 	async getGroupByName(groupName) {
@@ -389,7 +401,22 @@ class Database {
 			return true;
 		}
 		this.triggerBackupStart();
-		return this.coreRepo.saveGroup(group);
+		const result = await this.coreRepo.saveGroup(group);
+		try {
+			const EventHandler = require("../EventHandler");
+			if (EventHandler.instance && group && group.id) {
+				if (typeof EventHandler.instance.updateGroupCache === "function") {
+					EventHandler.instance.updateGroupCache(group);
+				} else if (EventHandler.instance.groups) {
+					const Group = require("../models/Group");
+					EventHandler.instance.groups[group.id] =
+						group instanceof Group ? group : new Group(group);
+				}
+			}
+		} catch {
+			// ignore sync error
+		}
+		return result;
 	}
 
 	/**
@@ -398,7 +425,20 @@ class Database {
 	 */
 	updateGroupInteract(groupId, interact) {
 		if (this.testMode) return true;
-		return this.coreRepo.updateGroupInteract(groupId, interact);
+		const result = this.coreRepo.updateGroupInteract(groupId, interact);
+		try {
+			const EventHandler = require("../EventHandler");
+			if (
+				EventHandler.instance &&
+				EventHandler.instance.groups &&
+				EventHandler.instance.groups[groupId]
+			) {
+				EventHandler.instance.groups[groupId].interact = interact;
+			}
+		} catch {
+			// ignore sync error
+		}
+		return result;
 	}
 
 	// --- Custom Commands ---
@@ -474,6 +514,18 @@ class Database {
 		return this.coreRepo.getAggregatedLoadReports(since);
 	}
 
+	async archiveOldLoadReports(retentionDays = 30) {
+		return this.coreRepo.archiveOldLoadReports(retentionDays);
+	}
+
+	async getBotsMessageTotals(since, options) {
+		return this.coreRepo.getBotsMessageTotals(since, options);
+	}
+
+	async getBotsWeeklyMessageTotals(since) {
+		return this.coreRepo.getBotsWeeklyMessageTotals(since);
+	}
+
 	async saveLoadReports(reports) {
 		if (this.testMode) {
 			this.logger.debug("[TestMode] saveLoadReports() bloqueado");
@@ -492,10 +544,106 @@ class Database {
 		return this.coreRepo.addLoadReport(report);
 	}
 
+	// --- Manual Group Leaves & Dossiers ---
+
+	ensureSummariesDb() {
+		this.getSQLiteDb(
+			"summaries",
+			`
+			CREATE TABLE IF NOT EXISTS group_dossier_status (
+				group_id TEXT PRIMARY KEY,
+				total_length_recorded INTEGER DEFAULT 0,
+				pending_text TEXT DEFAULT ''
+			);
+			CREATE TABLE IF NOT EXISTS group_dossiers (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				group_id TEXT,
+				dossier_json TEXT,
+				conversation_history TEXT,
+				analyzed_at_length INTEGER,
+				problematic_score REAL DEFAULT 0,
+				is_problematic INTEGER DEFAULT 0,
+				is_underage INTEGER DEFAULT 0,
+				created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+			);
+			CREATE INDEX IF NOT EXISTS idx_group_dossiers_gid ON group_dossiers(group_id);
+			CREATE TABLE IF NOT EXISTS group_manual_leaves (
+				group_id TEXT PRIMARY KEY,
+				group_name TEXT,
+				left_at INTEGER,
+				bot_id TEXT
+			);
+			`,
+			true
+		);
+		this.dbRun(
+			"summaries",
+			`ALTER TABLE group_dossiers ADD COLUMN is_underage INTEGER DEFAULT 0`
+		).catch(() => {});
+	}
+
+	async recordManualGroupLeave(groupId, groupName, botId) {
+		try {
+			this.ensureSummariesDb();
+			await this.dbRun(
+				"summaries",
+				`INSERT INTO group_manual_leaves (group_id, group_name, left_at, bot_id) 
+				 VALUES (?, ?, ?, ?)
+				 ON CONFLICT(group_id) DO UPDATE SET 
+				   group_name = excluded.group_name,
+				   left_at = excluded.left_at,
+				   bot_id = excluded.bot_id`,
+				[groupId, groupName, Date.now(), botId]
+			);
+			return true;
+		} catch (error) {
+			this.logger.error("Erro ao registrar saída manual de grupo:", error);
+			return false;
+		}
+	}
+
+	async getManualGroupLeave(groupId) {
+		try {
+			this.ensureSummariesDb();
+			return await this.dbGet(
+				"summaries",
+				"SELECT group_id, group_name, left_at, bot_id FROM group_manual_leaves WHERE group_id = ?",
+				[groupId]
+			);
+		} catch (error) {
+			this.logger.error("Erro ao buscar saída manual de grupo:", error);
+			return null;
+		}
+	}
+
+	async getLastGroupDossiers(groupId, limit = 3) {
+		try {
+			this.ensureSummariesDb();
+			return await this.dbAll(
+				"summaries",
+				"SELECT dossier_json, conversation_history, problematic_score, is_problematic, is_underage, created_at FROM group_dossiers WHERE group_id = ? ORDER BY created_at DESC LIMIT ?",
+				[groupId, limit]
+			);
+		} catch (error) {
+			this.logger.error("Erro ao buscar últimos dossiês do grupo:", error);
+			return [];
+		}
+	}
+
 	// --- Donations ---
 
 	async getDonations() {
 		return this.coreRepo.getDonations();
+	}
+	async getDonorByName(name) {
+		return this.coreRepo.getDonorByName(name);
+	}
+	getDonorByNumberSync(numero) {
+		return this.coreRepo.getDonorByNumberSync(numero);
+	}
+
+	async getDonorByNumber(numero) {
+		return this.coreRepo.getDonorByNumber(numero);
 	}
 	async saveDonations(donations) {
 		if (this.testMode) {
@@ -505,13 +653,13 @@ class Database {
 		this.triggerBackupStart();
 		return this.coreRepo.saveDonations(donations);
 	}
-	async addDonation(name, amount, numero = undefined) {
+	async addDonation(name, amount, numero = undefined, message = "") {
 		if (this.testMode) {
 			this.logger.debug("[TestMode] addDonation() bloqueado");
 			return true;
 		}
 		this.triggerBackupStart();
-		return this.coreRepo.addDonation(name, amount, numero);
+		return this.coreRepo.addDonation(name, amount, numero, message);
 	}
 	async updateDonorNumber(name, numero) {
 		if (this.testMode) {
@@ -520,6 +668,14 @@ class Database {
 		}
 		this.triggerBackupStart();
 		return this.coreRepo.updateDonorNumber(name, numero);
+	}
+	async updateDonorBonusProcessed(name, amount) {
+		if (this.testMode) {
+			this.logger.debug("[TestMode] updateDonorBonusProcessed() bloqueado");
+			return true;
+		}
+		this.triggerBackupStart();
+		return this.coreRepo.updateDonorBonusProcessed(name, amount);
 	}
 	async updateDonationAmount(name, amount) {
 		if (this.testMode) {
@@ -536,6 +692,27 @@ class Database {
 		}
 		this.triggerBackupStart();
 		return this.coreRepo.mergeDonors(targetName, sourceName);
+	}
+
+	// --- Game Events ---
+	async saveGameEvent(event) {
+		if (this.testMode) {
+			this.logger.debug("[TestMode] saveGameEvent() simulado");
+			return true;
+		}
+		this.triggerBackupStart();
+		return this.coreRepo.saveGameEvent(event);
+	}
+	async deleteGameEvent(game, type) {
+		if (this.testMode) {
+			this.logger.debug("[TestMode] deleteGameEvent() simulado");
+			return true;
+		}
+		this.triggerBackupStart();
+		return this.coreRepo.deleteGameEvent(game, type);
+	}
+	async getActiveGameEvents() {
+		return this.coreRepo.getActiveGameEvents();
 	}
 
 	// --- Pending Joins ---
@@ -629,6 +806,15 @@ class Database {
 		return this.coreRepo.getInviteHistoryByGroup(groupJid, inviteCode);
 	}
 
+	async updateInviteHistoryGroupJid(inviteCode, groupJid) {
+		if (this.testMode) {
+			this.logger.debug("[TestMode] updateInviteHistoryGroupJid() bloqueado");
+			return true;
+		}
+		this.triggerBackupStart();
+		return this.coreRepo.updateInviteHistoryGroupJid(inviteCode, groupJid);
+	}
+
 	async saveInviteHistories(invites) {
 		if (this.testMode) {
 			this.logger.debug("[TestMode] saveInviteHistories() bloqueado");
@@ -640,26 +826,30 @@ class Database {
 
 	// --- Group Membership Periods ---
 
-	async recordGroupJoin(groupJid, groupName, timestamp, responsible) {
+	async recordGroupJoin(groupJid, groupName, timestamp, responsible, botId = null) {
 		if (this.testMode) {
 			this.logger.debug("[TestMode] recordGroupJoin() bloqueado");
 			return true;
 		}
 		this.triggerBackupStart();
-		return this.coreRepo.recordGroupJoin(groupJid, groupName, timestamp, responsible);
+		return this.coreRepo.recordGroupJoin(groupJid, groupName, timestamp, responsible, botId);
 	}
 
-	async recordGroupLeave(groupJid, timestamp, responsible) {
+	async recordGroupLeave(groupJid, timestamp, responsible, botId = null) {
 		if (this.testMode) {
 			this.logger.debug("[TestMode] recordGroupLeave() bloqueado");
 			return true;
 		}
 		this.triggerBackupStart();
-		return this.coreRepo.recordGroupLeave(groupJid, timestamp, responsible);
+		return this.coreRepo.recordGroupLeave(groupJid, timestamp, responsible, botId);
 	}
 
 	async getGroupMembershipPeriods(groupJid) {
 		return this.coreRepo.getGroupMembershipPeriods(groupJid);
+	}
+
+	async getActiveBotIdForGroup(groupJid) {
+		return this.coreRepo.getActiveBotIdForGroup(groupJid);
 	}
 
 	async saveGroupMembershipPeriods(periods) {

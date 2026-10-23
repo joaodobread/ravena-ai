@@ -25,24 +25,40 @@ database.getSQLiteDb(
         timestamp INTEGER,
         resolution TEXT,
         count INTEGER DEFAULT 1,
-        model TEXT
+        model TEXT,
+        is_success INTEGER DEFAULT 1,
+        api_user TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_bonsai_ts ON bonsai_stats(timestamp);
 `
 );
+
+// Migration for existing databases without is_success or api_user column
+database
+	.dbRun("bonsai_stats", `ALTER TABLE bonsai_stats ADD COLUMN is_success INTEGER DEFAULT 1`)
+	.catch(() => {});
+database.dbRun("bonsai_stats", `ALTER TABLE bonsai_stats ADD COLUMN api_user TEXT`).catch(() => {});
 
 /**
  * Tracks Bonsai usage stats
  * @param {string} resolution - Image resolution (e.g., "1024x1024")
  * @param {number} count - Number of images generated
  * @param {string} model - Model used
+ * @param {boolean} isSuccess - Whether generation succeeded
+ * @param {string|null} apiUser - External API user if applicable
  */
-async function trackBonsaiStats(resolution, count = 1, model = "unknown") {
+async function trackBonsaiStats(
+	resolution = "1024x1024",
+	count = 1,
+	model = "bonsai-ternary",
+	isSuccess = true,
+	apiUser = null
+) {
 	try {
 		await database.dbRun(
 			"bonsai_stats",
-			`INSERT INTO bonsai_stats (timestamp, resolution, count, model) VALUES (?, ?, ?, ?)`,
-			[Date.now(), resolution, count, model]
+			`INSERT INTO bonsai_stats (timestamp, resolution, count, model, is_success, api_user) VALUES (?, ?, ?, ?, ?, ?)`,
+			[Date.now(), resolution, count, model, isSuccess ? 1 : 0, apiUser]
 		);
 	} catch (e) {
 		logger.error("Error tracking bonsai stats:", e);
@@ -180,7 +196,13 @@ async function generateImage(bot, message, args, group, skipNotify = true, optio
 
 	const bonsaiUrl = getBonsaiUrl();
 
-	prompt = await translateText(prompt, "pt", "en");
+	if (!options.isProgrammatic) {
+		try {
+			prompt = await translateText(prompt, "pt", "en");
+		} catch (e) {
+			logger.warn(`Erro ao traduzir prompt para Bonsai (${e.message}), mantendo original.`);
+		}
+	}
 
 	logger.info(`Gerando imagem com Bonsai, prompt: '${prompt}'`);
 
@@ -237,38 +259,60 @@ async function generateImage(bot, message, args, group, skipNotify = true, optio
 		})();
 
 		// 2. Promise de Geração de Imagem
+		const targetWidth = Number(options.width) || 768;
+		const targetHeight = Number(options.height) || 768;
+		const targetSteps = Number(options.steps) || 6;
+		const targetGuidance = options.guidance !== undefined ? Number(options.guidance) : 3.5;
+
 		const generationPromise = (async () => {
 			const startTime = Date.now();
-			const response = await axios.post(
-				`${bonsaiUrl}/generate`,
-				{
-					prompt: prompt + aesthetic,
-					width: 1024,
-					height: 1024,
-					seed: Math.floor(Math.random() * 9999999),
-					num_inference_steps: 20,
-					guidance_scale: 7.5
-				},
-				{
+			let response;
+			const requestPayload = {
+				prompt: prompt + aesthetic,
+				width: targetWidth,
+				height: targetHeight,
+				seed: Math.floor(Math.random() * 9999999),
+				steps: targetSteps,
+				guidance: targetGuidance
+			};
+
+			try {
+				response = await axios.post(`${bonsaiUrl}/generate`, requestPayload, {
 					responseType: "arraybuffer",
 					timeout: 60000
+				});
+			} catch (err) {
+				// Se falhar com 500 e a resolução solicitada for maior que 768, tenta fallback para 768x768
+				if (err.response?.status === 500 && (targetWidth > 768 || targetHeight > 768)) {
+					logger.warn(
+						`[BonsaiCommands] Falha com ${targetWidth}x${targetHeight} (500). Tentando fallback para 768x768...`
+					);
+					requestPayload.width = 768;
+					requestPayload.height = 768;
+					response = await axios.post(`${bonsaiUrl}/generate`, requestPayload, {
+						responseType: "arraybuffer",
+						timeout: 60000
+					});
+				} else {
+					throw err;
 				}
-			);
+			}
 
 			const generationTime = ((Date.now() - startTime) / 1000).toFixed(1);
 			return {
 				imageBuffer: Buffer.from(response.data),
-				generationTime
+				generationTime,
+				resolution: `${requestPayload.width}x${requestPayload.height}`
 			};
 		})();
 
 		// Aguarda ambos em paralelo
 		const [safetyMsg, genResult] = await Promise.all([safetyPromise, generationPromise]);
 		let { imageBuffer } = genResult;
-		const { generationTime } = genResult;
+		const { generationTime, resolution: finalResolution } = genResult;
 
 		// Track stats
-		trackBonsaiStats("1024x1024", 1, "bonsai-ternary");
+		trackBonsaiStats(finalResolution || `${targetWidth}x${targetHeight}`, 1, "bonsai-ternary");
 
 		// Add Watermark and compress to JPEG
 		try {
@@ -342,9 +386,13 @@ async function generateImage(bot, message, args, group, skipNotify = true, optio
 				const imageBase64 = imageBuffer.toString("base64");
 				const nsfwResult = await nsfwPredict.detectNSFW(imageBase64);
 				isNSFW = nsfwResult.isNSFW;
-				logger.info(
-					`Imagem analisada: NSFW = ${isNSFW}, Reason: ${JSON.stringify(nsfwResult.reason)}`
-				);
+				if (nsfwResult.skipped) {
+					logger.info(`Verificação NSFW ignorada: ${nsfwResult.reason}`);
+				} else {
+					logger.info(
+						`Imagem analisada: NSFW = ${isNSFW}, Reason: ${JSON.stringify(nsfwResult.reason)}`
+					);
+				}
 			} catch (nsfwError) {
 				logger.error("Erro ao verificar NSFW:", nsfwError);
 			}
@@ -412,6 +460,7 @@ async function generateImage(bot, message, args, group, skipNotify = true, optio
 		return returnMessages.length === 1 ? returnMessages[0] : returnMessages;
 	} catch (error) {
 		logger.error("Erro ao gerar imagem:", error);
+		trackBonsaiStats("error", 1, "bonsai-ternary", false);
 
 		let errorMessage = "Erro ao gerar imagem.";
 		if (error.code === "ECONNREFUSED" || error.code === "ETIMEDOUT") {
@@ -452,4 +501,27 @@ const commands = [
 	})
 ];
 
-module.exports = { commands, generateImage };
+const helper = {
+	about: "Geração de imagens de alta qualidade via Inteligência Artificial usando Bonsai / ComfyUI",
+	implementation:
+		"Comunica com backend Bonsai, traduz prompts para inglês, aplica filtros de segurança NSFW e gera mídias",
+	tags: "ia,imagem,gerar imagem,imagine,bonsai,arte,desenho",
+	cmds: [
+		{
+			cmd: "!imagine",
+			desc: "Gera uma imagem através de descrição textual usando IA",
+			usage: [
+				"!imagine um astronauta andando a cavalo na lua em aquarela",
+				"!imagine cyberpunk city at night"
+			],
+			category: "ia"
+		}
+	]
+};
+
+module.exports = {
+	helper,
+	commands,
+	generateImage,
+	trackBonsaiStats
+};

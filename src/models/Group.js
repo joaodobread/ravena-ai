@@ -15,6 +15,7 @@ class Group {
 			(this.id ? this.id.split("@")[0].toLowerCase().replace(/\s+/g, "").substring(0, 16) : null);
 		this.titulo = data.titulo ?? null;
 		this.descricao = data.descricao ?? null;
+		this.regras = data.regras ?? null;
 		this.prefix = data.prefix ?? "!";
 		this.customIgnoresPrefix = data.customIgnoresPrefix ?? false;
 		this.inviteCode = data.inviteCode ?? null;
@@ -22,12 +23,18 @@ class Group {
 		this.additionalAdmins = data.additionalAdmins ?? [];
 
 		// Filtros
-		this.filters = data.filters ?? {
+		this.filters = {
 			nsfw: false,
 			links: false,
 			words: [],
-			people: []
+			people: [],
+			allowAdmins: false,
+			allowedLinks: [],
+			...(data.filters || {})
 		};
+		if (!Array.isArray(this.filters.allowedLinks)) {
+			this.filters.allowedLinks = [];
+		}
 
 		// Monitoramento de plataformas
 		this.twitch = data.twitch ?? [];
@@ -35,6 +42,9 @@ class Group {
 		this.youtube = data.youtube ?? [];
 		this.botNotInGroup = data.botNotInGroup ?? [];
 		this.webhooks = data.webhooks ?? [];
+
+		// Servidor de Minecraft do grupo: { host, port } | null
+		this.minecraftServer = data.minecraftServer ?? null;
 
 		// Mensagens de boas-vindas e despedida
 		this.greetings = data.greetings ?? {};
@@ -67,6 +77,9 @@ class Group {
 		this.customAIPrompt = data.customAIPrompt ?? [];
 		this.notificaGrupoFechado = data.notificaGrupoFechado ?? false;
 		this.notificaGrupoAberto = data.notificaGrupoAberto ?? false;
+		this.banirSpammers = data.banirSpammers ?? false;
+		this.spammerWhitelist = data.spammerWhitelist ?? data.allowedSpammers ?? [];
+		this.bannedUsers = Array.isArray(data.bannedUsers) ? data.bannedUsers : [];
 
 		// Metadados
 		this.createdAt = data.createdAt ?? Date.now();
@@ -85,6 +98,7 @@ class Group {
 			name: this.name,
 			titulo: this.titulo,
 			descricao: this.descricao,
+			regras: this.regras,
 			prefix: this.prefix,
 			customIgnoresPrefix: this.customIgnoresPrefix,
 			inviteCode: this.inviteCode,
@@ -96,6 +110,7 @@ class Group {
 			youtube: this.youtube,
 			botNotInGroup: this.botNotInGroup,
 			webhooks: this.webhooks,
+			minecraftServer: this.minecraftServer,
 			greetings: this.greetings,
 			farewells: this.farewells,
 			interact: this.interact,
@@ -111,6 +126,9 @@ class Group {
 			customAIPrompt: this.customAIPrompt,
 			notificaGrupoFechado: this.notificaGrupoFechado,
 			notificaGrupoAberto: this.notificaGrupoAberto,
+			banirSpammers: this.banirSpammers,
+			spammerWhitelist: this.spammerWhitelist,
+			bannedUsers: this.bannedUsers,
 			createdAt: this.createdAt,
 			updatedAt: this.updatedAt
 		};
@@ -134,6 +152,7 @@ class Group {
 		if (data.name) this.name = data.name;
 		if (data.titulo !== undefined) this.titulo = data.titulo;
 		if (data.descricao !== undefined) this.descricao = data.descricao;
+		if (data.regras !== undefined) this.regras = data.regras;
 		if (data.prefix) this.prefix = data.prefix;
 		if (data.customIgnoresPrefix) this.customIgnoresPrefix = data.customIgnoresPrefix;
 		if (data.inviteCode) this.inviteCode = data.inviteCode;
@@ -157,6 +176,7 @@ class Group {
 		if (data.botNotInGroup) this.botNotInGroup = data.botNotInGroup;
 
 		if (data.webhooks) this.webhooks = data.webhooks;
+		if (data.minecraftServer !== undefined) this.minecraftServer = data.minecraftServer;
 
 		// Atualiza boas-vindas
 		if (data.greetings) {
@@ -196,6 +216,10 @@ class Group {
 			this.notificaGrupoFechado = data.notificaGrupoFechado;
 		if (typeof data.notificaGrupoAberto === "boolean")
 			this.notificaGrupoAberto = data.notificaGrupoAberto;
+		if (typeof data.banirSpammers === "boolean") this.banirSpammers = data.banirSpammers;
+		if (Array.isArray(data.spammerWhitelist)) this.spammerWhitelist = data.spammerWhitelist;
+		else if (Array.isArray(data.allowedSpammers)) this.spammerWhitelist = data.allowedSpammers;
+		if (Array.isArray(data.bannedUsers)) this.bannedUsers = data.bannedUsers;
 
 		// Atualiza carimbos de data/hora
 		this.updatedAt = Date.now();

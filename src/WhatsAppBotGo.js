@@ -20,22 +20,68 @@ const AdminUtils = require("./utils/AdminUtils");
 const InviteSystem = require("./InviteSystem");
 const StreamSystem = require("./StreamSystem");
 const Database = require("./utils/Database");
+const PhoneUtils = require("./utils/PhoneUtils");
 const LoadReport = require("./LoadReport");
 const Logger = require("./utils/Logger");
 const SkipGroups = require("./utils/SkipGroups");
 const { toOpus, toMp3 } = require("./utils/Conversions");
 const { llmTranslate } = require("./utils/LLMTranslate");
+const ProfileStatusScheduler = require("./services/ProfileStatusScheduler");
+const GrupoAgendamentos = require("./commands/modules/GrupoAgendamentos");
+const MemoryCache = require("./utils/MemoryCache");
 
 // Utils
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const writeFileAsync = promisify(fs.writeFile);
 const readFileAsync = promisify(fs.readFile);
 const unlinkAsync = promisify(fs.unlink);
+const statAsync = promisify(fs.stat);
+const renameAsync = promisify(fs.rename);
 const convertAsync = promisify(imagemagick.convert);
+
+// Eventos da whatsgoapi estritamente necessários para o funcionamento da Ravena
+const WHATSGO_SUBSCRIBED_EVENTS = [
+	"MESSAGE",
+	"SEND_MESSAGE",
+	"GROUP",
+	"CONTACT",
+	"CONNECTION",
+	"CALL",
+	"QRCODE"
+];
+
+/**
+ * Verifica se um erro indica que o bot não participa do grupo ou o grupo não existe
+ * @param {any} err
+ * @returns {boolean}
+ */
+function isNotInGroupError(err) {
+	if (!err) return false;
+	if (err.notInGroup) return true;
+	const errorDetails = [
+		err.message,
+		err.data?.error,
+		err.response?.data?.error,
+		err.response?.data?.message,
+		typeof err === "string" ? err : null
+	]
+		.filter((s) => typeof s === "string")
+		.join(" ")
+		.toLowerCase();
+
+	return (
+		errorDetails.includes("not participating") ||
+		errorDetails.includes("not_participating") ||
+		errorDetails.includes("no longer a participant") ||
+		errorDetails.includes("not in group") ||
+		errorDetails.includes("that group does not exist")
+	);
+}
 
 class WhatsAppBotGo {
 	constructor(options) {
 		this.id = options.id;
+		this.enabled = options.enabled !== undefined ? Boolean(options.enabled) : true;
 		this.nomeExibir = options.nomeExibir;
 		this.sendJoinInfo = options.sendJoinInfo;
 		this.vip = options.vip;
@@ -64,6 +110,7 @@ class WhatsAppBotGo {
 
 		// Acesso pelo painel por terceiros
 		this.privado = options.privado ?? false;
+		this.extras = options.extras || {};
 		this.managementUser = options.managementUser ?? process.env.BOTAPI_USER ?? "admin";
 		this.managementPW = options.managementPW ?? process.env.BOTAPI_PASSWORD ?? "batata123";
 
@@ -77,12 +124,19 @@ class WhatsAppBotGo {
 		this.messageCache = [];
 		this.contactCache = [];
 		this.sentMessagesCache = [];
+		this.lidToPnCache = new Map();
 		this.cacheManager = CacheManager.getInstance(
 			this.redisURL,
 			this.redisDB,
 			this.redisTTL,
 			this.maxCacheSize
 		);
+
+		// Cache em memória de alta performance para metadados de grupos e usuários (mitigação de 429)
+		const groupCacheTtlSec = parseInt(process.env.GROUP_CACHE_TTL_SEC, 10) || 60;
+		const userCacheTtlSec = parseInt(process.env.USER_CACHE_TTL_SEC, 10) || 60;
+		this.groupCache = new MemoryCache(groupCacheTtlSec * 1000, 500);
+		this.userCache = new MemoryCache(userCacheTtlSec * 1000, 5000);
 
 		if (!this.whatsgoApiUrl || !this.whatsgoApiKey || !this.instanceName || !this.webhookHost) {
 			const errMsg =
@@ -110,12 +164,18 @@ class WhatsAppBotGo {
 		this.otherBots = options.otherBots ?? [];
 
 		this.ignorePV = options.ignorePV ?? false;
+		this.deleteMessagesInterval = options.deleteMessagesInterval ?? false;
 		this.updateStatus = options.updateStatus ?? true;
 		this.aiPersonality = options.aiPersonality ?? "";
 		this.autoDownloadPV = options.autoDownloadPV ?? false;
 		this.whitelist = options.whitelistPV ?? [];
 		this.ignoreInvites = options.ignoreInvites ?? false;
 		this.grupoLogs = options.grupoLogs ?? process.env.GRUPO_LOGS;
+		this.dossieGroups =
+			options.dossieGroups ??
+			options.grupoLogs ??
+			process.env.GRUPO_DOSSIES ??
+			process.env.GRUPO_LOGS;
 		this.grupoInvites = options.grupoInvites ?? process.env.GRUPO_INVITES;
 		this.grupoAvisos = options.grupoAvisos ?? process.env.GRUPO_AVISOS;
 		this.grupoAnuncios = options.grupoAnuncios || process.env.GRUPO_ANUNCIOS;
@@ -174,10 +234,15 @@ class WhatsAppBotGo {
 			setProfilePicture: async (arg) => {
 				await this.updateProfilePicture(arg);
 			},
+			getProfilePictureUrl: async (arg, preview = false) =>
+				await this.getProfilePictureUrl(arg, preview),
 			setPrivacySettings: (arg) => {
 				this.updatePrivacySettings(arg);
 			},
 			acceptInvite: async (arg) => await this.acceptInviteCode(arg),
+			acceptNewsletterAdminInvite: async (arg) => await this.acceptNewsletterAdminInvite(arg),
+			setSubject: async (groupId, title) => await this.setGroupName(groupId, title),
+			setGroupSubject: async (groupId, title) => await this.setGroupName(groupId, title),
 			sendPresenceUpdate: async (xxx) => true,
 			info: {
 				wid: {
@@ -187,7 +252,7 @@ class WhatsAppBotGo {
 		};
 
 		this.updateVersions();
-		setInterval(this.updateVersions, 3600000);
+		this.versionUpdateInterval = setInterval(this.updateVersions.bind(this), 3600000);
 
 		this.scheduleGroupInfoUpdate();
 	}
@@ -306,17 +371,7 @@ class WhatsAppBotGo {
 		const payload = {
 			name: this.instanceName,
 			webhookUrl: `${this.webhookHost}:${this.webhookPort}/webhook/${this.instanceName}`,
-			webhookEvents: [
-				"MESSAGE",
-				"PRESENCE",
-				"CALL",
-				"CONNECTION",
-				"QRCODE",
-				"CONNECTION",
-				"CONTACT",
-				"GROUP",
-				"NEWSLETTER"
-			] // Ajustar conforme necessidade da V3
+			webhookEvents: WHATSGO_SUBSCRIBED_EVENTS
 		};
 
 		this.logger.info(`[createInstance] Creating instance ${this.instanceName}`, payload);
@@ -395,6 +450,86 @@ class WhatsAppBotGo {
 		return results;
 	}
 
+	async tryReconnect() {
+		this.logger.info(`[tryReconnect] Starting reconnect process for ${this.instanceName}`);
+		if (this._disconnectTimer) {
+			clearTimeout(this._disconnectTimer);
+			this._disconnectTimer = null;
+		}
+
+		const results = [];
+		let instance = await this.getGoInstance(this.instanceName);
+
+		// 1. Criar a instância via API WhatsGo se não existir
+		if (!instance) {
+			this.logger.info(
+				`[tryReconnect] Instância ${this.instanceName} não encontrada. Criando nova instância...`
+			);
+			try {
+				const createResult = await this.createInstance();
+				results.push({ action: "create", status: "success", result: createResult });
+				await sleep(2000);
+				instance = await this.getGoInstance(this.instanceName);
+			} catch (err) {
+				this.logger.error(`[tryReconnect] Falha ao criar instância:`, err);
+				results.push({ action: "create", status: "error", error: err.message });
+			}
+		}
+
+		// 2. Definir Advanced Settings e restaurar JID caso esteja ausente
+		if (instance) {
+			try {
+				const settingsResult = await this.instanceAdvSettings(true, true, false, false, true);
+				results.push({ action: "advSettings", status: "success", result: settingsResult });
+			} catch (err) {
+				this.logger.warn(`[tryReconnect] Falha ao definir advSettings:`, err);
+				results.push({ action: "advSettings", status: "error", error: err.message });
+			}
+
+			// Se a instância estiver sem JID e tivermos phoneNumber, recuperar do banco whatsmeow
+			if (!instance.jid && this.phoneNumber) {
+				try {
+					this.logger.info(
+						`[tryReconnect] Instância sem JID. Chamando forcereconnect com ${this.phoneNumber}...`
+					);
+					const forceResult = await this.apiClient.post(
+						`/instance/forcereconnect/${instance.id}`,
+						{ number: this.phoneNumber },
+						true
+					);
+					results.push({ action: "forceReconnectJid", status: "success", result: forceResult });
+				} catch (err) {
+					this.logger.warn(`[tryReconnect] Falha no forcereconnect:`, err);
+					results.push({ action: "forceReconnectJid", status: "error", error: err.message });
+				}
+			}
+		}
+
+		// 3. Chamar /instance/connect com webhookUrl e subscribe ALL
+		const webhookUrl = `${this.webhookHost}:${this.webhookPort}/webhook/${this.instanceName}`;
+		try {
+			this.logger.info(
+				`[tryReconnect] Chamando /instance/connect para ${this.instanceName} com webhook ${webhookUrl}...`
+			);
+			const connectResult = await this.apiClient.post(
+				`/instance/connect`,
+				{
+					webhookUrl,
+					subscribe: WHATSGO_SUBSCRIBED_EVENTS
+				},
+				false
+			);
+			results.push({ action: "connect", status: "success", result: connectResult });
+		} catch (err) {
+			this.logger.error(`[tryReconnect] Erro ao conectar instância:`, err);
+			results.push({ action: "connect", status: "error", error: err.message });
+		}
+
+		await sleep(2000);
+		const status = await this._checkInstanceStatusAndConnect(true, false);
+		return { results, status };
+	}
+
 	async instanceAdvSettings(
 		alwaysOnline = true,
 		rejectCall = true,
@@ -444,6 +579,7 @@ class WhatsAppBotGo {
 		const tempDirectory = os.tmpdir();
 		const tempInputPath = path.join(tempDirectory, `${tempId}_input.tmp`);
 		const tempOutputPath = path.join(tempDirectory, `${tempId}_output.webp`);
+		const fnStart = Date.now();
 
 		try {
 			if (!base64ImageContent || typeof base64ImageContent !== "string") {
@@ -456,13 +592,17 @@ class WhatsAppBotGo {
 				throw new Error("Invalid base64ImageContent: Empty data after stripping prefix.");
 
 			const buffer = Buffer.from(base64Data, "base64");
+			// this.logger.info(
+			// 	`[convertToSquareWebPImage] Iniciando FFmpeg para imagem estática (${(buffer.length / 1024).toFixed(1)} KB)...`
+			// );
 			await writeFileAsync(tempInputPath, buffer);
 			inputPath = tempInputPath;
 			isTempInputFile = true;
 
 			const targetSize = 512;
-			const videoFilter = `scale=${targetSize}:${targetSize}:force_original_aspect_ratio=decrease:flags=lanczos,pad=${targetSize}:${targetSize}:(ow-iw)/2:(oh-ih)/2:color=black@0.0`;
+			const videoFilter = `scale=${targetSize}:${targetSize}:force_original_aspect_ratio=decrease:flags=lanczos,format=yuva420p,pad=${targetSize}:${targetSize}:(ow-iw)/2:(oh-ih)/2:color=black@0.0`;
 
+			const ffmpegStart = Date.now();
 			await new Promise((resolve, reject) => {
 				ffmpeg(inputPath)
 					.outputOptions([
@@ -482,6 +622,9 @@ class WhatsAppBotGo {
 					.on("error", (err) => reject(err))
 					.save(tempOutputPath);
 			});
+			// this.logger.info(
+			// 	`[convertToSquareWebPImage] ✓ FFmpeg concluído em ${Date.now() - ffmpegStart}ms (total: ${Date.now() - fnStart}ms)`
+			// );
 
 			const webpBuffer = await readFileAsync(tempOutputPath);
 			return webpBuffer.toString("base64");
@@ -752,6 +895,7 @@ class WhatsAppBotGo {
 		const tempDirectory = os.tmpdir();
 		const tempInputPath = path.join(tempDirectory, `${tempId}_input.tmp`);
 		const tempOutputPath = path.join(tempDirectory, `${tempId}_output.webp`);
+		const fnStart = Date.now();
 
 		try {
 			if (
@@ -779,55 +923,84 @@ class WhatsAppBotGo {
 
 			this.logger.info("[toAnimatedWebP] Starting square animated WebP conversion for:", inputPath);
 
-			// Define the target square dimensions
+			// Define as dimensões e perfis sequenciais de fallback para WhatsApp
 			const targetSize = 512;
+			const profiles = [
+				{ duration: 15, fps: 8, qv: 28, desc: "15s @ 8fps (q:28)" },
+				{ duration: 15, fps: 8, qv: 18, desc: "15s @ 8fps menor q:v (q:18)" },
+				{ duration: 10, fps: 8, qv: 22, desc: "10s @ 8fps (q:22)" },
+				{ duration: 5, fps: 8, qv: 25, desc: "5s @ 8fps (q:25)" },
+				{ duration: 3.5, fps: 8, qv: 20, desc: "3.5s @ 8fps (q:20)" }
+			];
 
-			// Construct the complex video filter string
-			// 1. Set FPS
-			// 2. Scale to fit within targetSize x targetSize, preserving aspect ratio (lanczos for quality)
-			// 3. Pad to targetSize x targetSize, center content, fill with transparent background
-			// 4. Generate and use a palette for better WebP quality and transparency handling
-			const videoFilter = `fps=20,scale=${targetSize}:${targetSize}:force_original_aspect_ratio=decrease:flags=lanczos,pad=${targetSize}:${targetSize}:(ow-iw)/2:(oh-ih)/2:color=black@0.0,split[s0][s1];[s0]palettegen=max_colors=250:reserve_transparent=on[p];[s1][p]paletteuse=dither=bayer:alpha_threshold=128`;
+			let finalOutputCreated = false;
+			for (let i = 0; i < profiles.length; i++) {
+				const p = profiles[i];
+				const videoFilter = `fps=${p.fps},scale=${targetSize}:${targetSize}:force_original_aspect_ratio=decrease:flags=lanczos,format=yuva420p,pad=${targetSize}:${targetSize}:(ow-iw)/2:(oh-ih)/2:color=black@0.0`;
 
-			await new Promise((resolve, reject) => {
-				ffmpeg(inputPath)
-					.outputOptions([
-						"-vf",
-						videoFilter,
-						"-loop",
-						"0",
-						"-c:v",
-						"libwebp",
-						"-lossless",
-						"0",
-						"-q:v",
-						"75", // Quality for lossy WebP (0-100)
-						"-compression_level",
-						"6", // Compression level (0-6)
-						"-preset",
-						"default",
-						"-an", // Remove audio
-						"-vsync",
-						"cfr" // Constant frame rate
-					])
-					.toFormat("webp")
-					.on("end", () => {
-						this.logger.info("[toAnimatedWebP] Square animated WebP conversion finished.");
-						resolve();
-					})
-					.on("error", (err) => {
-						let ffmpegCommand = "";
-						if (err.ffmpegCommand) {
-							ffmpegCommand = `FFmpeg command: ${err.ffmpegCommand}`;
-						}
-						this.logger.error(
-							`[toAnimatedWebP] Error during square WebP conversion: ${err.message}. ${ffmpegCommand}`,
-							err.stack
-						);
-						reject(err);
-					})
-					.save(tempOutputPath);
-			});
+				const attemptStart = Date.now();
+				await new Promise((resolve, reject) => {
+					ffmpeg(inputPath)
+						.outputOptions([
+							"-vf",
+							videoFilter,
+							"-t",
+							String(p.duration),
+							"-loop",
+							"0",
+							"-c:v",
+							"libwebp",
+							"-lossless",
+							"0",
+							"-q:v",
+							String(p.qv),
+							"-compression_level",
+							"6",
+							"-preset",
+							"default",
+							"-an"
+						])
+						.toFormat("webp")
+						.on("end", () => {
+							finalOutputCreated = true;
+							resolve();
+						})
+						.on("error", (err) => {
+							let ffmpegCommand = "";
+							if (err.ffmpegCommand) {
+								ffmpegCommand = `FFmpeg command: ${err.ffmpegCommand}`;
+							}
+							this.logger.error(
+								`[toAnimatedWebP] Error during square WebP conversion (${p.desc}): ${err.message}. ${ffmpegCommand}`
+							);
+							reject(err);
+						})
+						.save(tempOutputPath);
+				});
+
+				// CORREÇÃO: verificação de tamanho DENTRO do loop (antes estava fora)
+				if (!finalOutputCreated) {
+					throw new Error("Falha ao gerar arquivo WebP animado em todas as tentativas de fallback");
+				}
+
+				const stats = await statAsync(tempOutputPath).catch(() => null);
+				if (stats) {
+					// const sizeKb = (stats.size / 1024).toFixed(1);
+					// const attemptMs = Date.now() - attemptStart;
+					// this.logger.info(
+					// 	`[toAnimatedWebP] Tentativa ${i + 1}/${profiles.length} [${p.desc}]: ${sizeKb} KB em ${attemptMs}ms`
+					// );
+					if (stats.size <= 490 * 1024) {
+						// this.logger.info(
+						// 	`[toAnimatedWebP] ✓ Perfil '${p.desc}' aprovado (${sizeKb} KB <= 490 KB). Total: ${Date.now() - fnStart}ms`
+						// );
+						break;
+					}
+					this.logger.warn(
+						`[toAnimatedWebP] Perfil '${p.desc}' excedeu limite (${(stats.size / 1024).toFixed(1)} KB > 490 KB). Tentando próximo fallback...`
+					);
+				}
+			}
 
 			this.logger.info(
 				"[toAnimatedWebP] Square animated WebP saved to temporary file:",
@@ -836,7 +1009,9 @@ class WhatsAppBotGo {
 
 			const webpBuffer = await readFileAsync(tempOutputPath);
 			const base64WebP = webpBuffer.toString("base64");
-			this.logger.info("[toAnimatedWebP] Square animated WebP converted to base64.");
+			// this.logger.info(
+			// 	`[toAnimatedWebP] ✓ Conversão concluída (${(webpBuffer.length / 1024).toFixed(1)} KB). Total: ${Date.now() - fnStart}ms`
+			// );
 
 			return base64WebP;
 		} catch (error) {
@@ -958,9 +1133,84 @@ class WhatsAppBotGo {
 		}
 	}
 
+	/**
+	 * Converte um arquivo ou buffer GIF para MP4 compatível com WhatsApp (H.264 / yuv420p / +faststart)
+	 * @param {string|Buffer} input - Buffer, base64 ou URL/caminho local do arquivo GIF
+	 * @returns {Promise<Buffer>} - Buffer do arquivo MP4 resultante
+	 */
+	async convertGifToMp4(input) {
+		const tempId = randomBytes(16).toString("hex");
+		const tempDir = os.tmpdir();
+		const tempInputPath = path.join(tempDir, `${tempId}_input.gif`);
+		const tempOutputPath = path.join(tempDir, `${tempId}_output.mp4`);
+
+		let isTempFile = false;
+		let inputPath = input;
+
+		try {
+			if (Buffer.isBuffer(input)) {
+				await writeFileAsync(tempInputPath, input);
+				inputPath = tempInputPath;
+				isTempFile = true;
+			} else if (typeof input === "string") {
+				if (input.startsWith("http://") || input.startsWith("https://")) {
+					inputPath = input;
+				} else if (fs.existsSync(input)) {
+					inputPath = input;
+				} else {
+					const base64Data = input.includes(",") ? input.split(",")[1] : input;
+					const buffer = Buffer.from(base64Data, "base64");
+					await writeFileAsync(tempInputPath, buffer);
+					inputPath = tempInputPath;
+					isTempFile = true;
+				}
+			}
+
+			await new Promise((resolve, reject) => {
+				ffmpeg(inputPath)
+					.output(tempOutputPath)
+					.noAudio()
+					.videoCodec("libx264")
+					.outputOptions([
+						"-pix_fmt yuv420p",
+						"-movflags +faststart",
+						"-preset fast",
+						"-crf 23",
+						"-vf",
+						"scale=max(2\\,trunc(iw/2)*2):max(2\\,trunc(ih/2)*2)"
+					])
+					.on("end", resolve)
+					.on("error", (err) => {
+						this.logger.error(`[convertGifToMp4] Erro ffmpeg: ${err.message}`);
+						reject(err);
+					})
+					.run();
+			});
+
+			const mp4Buffer = await readFileAsync(tempOutputPath);
+			return mp4Buffer;
+		} catch (error) {
+			this.logger.error(`[convertGifToMp4] Erro na conversão de GIF para MP4: ${error.message}`);
+			throw error;
+		} finally {
+			if (isTempFile && fs.existsSync(tempInputPath)) {
+				unlinkAsync(tempInputPath).catch(() => {});
+			}
+			if (fs.existsSync(tempOutputPath)) {
+				unlinkAsync(tempOutputPath).catch(() => {});
+			}
+		}
+	}
+
 	async getFileSizeByURL(url) {
 		try {
-			const headResponse = await axios.head(url);
+			const headResponse = await axios.head(url, {
+				headers: {
+					"User-Agent":
+						this.userAgent ||
+						"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0"
+				}
+			});
 			const contentLength = headResponse.headers["content-length"];
 			return contentLength ? parseInt(contentLength, 10) : 0;
 		} catch (error) {
@@ -1010,7 +1260,14 @@ class WhatsAppBotGo {
 
 				const fileUrl = `${process.env.BOT_DOMAIN_LOCAL ?? process.env.BOT_DOMAIN}/attachments/${fileName}`;
 
-				const media = { url: fileUrl, mimetype, filename: fileName, filePath, base64: base64Data };
+				const media = {
+					url: fileUrl,
+					mimetype,
+					filename: fileName,
+					filePath,
+					base64: base64Data,
+					data: base64Data
+				};
 				//this.logger.debug(`[_downloadMediaFromWhatsgo] Res: ${fileUrl}`, media);
 				return media;
 			}
@@ -1052,7 +1309,9 @@ class WhatsAppBotGo {
 	async createMediaFromBase64(base64Data, mimetype, filename) {
 		try {
 			const extension = mime.extension(mimetype) ?? "bin";
-			const buffer = Buffer.from(base64Data, "base64");
+			const cleanBase64 =
+				typeof base64Data === "string" ? base64Data.replace(/^data:[^;]+;base64,/, "") : base64Data;
+			const buffer = Buffer.from(cleanBase64, "base64");
 			const size = buffer.length;
 			const url = this._storeMediaFile(buffer, `.${extension}`);
 
@@ -1063,7 +1322,7 @@ class WhatsAppBotGo {
 
 			const media = {
 				mimetype,
-				data: base64Data,
+				data: cleanBase64,
 				filename: filename ?? `file.${extension}`,
 				source: "base64",
 				url,
@@ -1135,7 +1394,13 @@ class WhatsAppBotGo {
 
 			if (!mimetype && options.unsafeMime) {
 				try {
-					const headResponse = await axios.head(url);
+					const headResponse = await axios.head(url, {
+						headers: {
+							"User-Agent":
+								this.userAgent ||
+								"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0"
+						}
+					});
 					this.logger.info("mimetype do header? ", headResponse);
 					mimetype = options.customMime
 						? options.customMime
@@ -1200,12 +1465,137 @@ class WhatsAppBotGo {
 				await sleep(message.delay);
 			}
 
+			// Se for mensagem para grupo e o bot não participa dele, pula imediatamente
+			if (
+				message.chatId &&
+				message.chatId.includes("@g.us") &&
+				!this.isParticipating(message.chatId)
+			) {
+				this.logger.warn(
+					`[${this.id}] Ignorando envio de ReturnMessage para ${message.chatId}: bot não participa deste grupo.`
+				);
+				results.push({
+					error: new Error(`Bot ${this.id} não participa do grupo ${message.chatId}`),
+					notInGroup: true,
+					skipped: true,
+					messageContent: message.content,
+					getInfo: () => ({ delivery: [], played: [], read: [] })
+				});
+				continue;
+			}
+
 			const contentToSend = message.content;
 			const options = { ...(message.options ?? {}) }; // Clone options
 
 			try {
 				const result = await this.sendMessage(message.chatId, contentToSend, options);
 				results.push(result);
+
+				if (options.sendMediaAsSticker && options.quotedMessageId && result?.id) {
+					const sentStickerId = result.id._serialized || result.id.id || result.id;
+					this.logger.debug(
+						`[sendReturnMessages] Registrando sticker enviado ${sentStickerId} para mensagem original ${options.quotedMessageId}`
+					);
+					this.eventHandler?.registerSentSticker?.(options.quotedMessageId, {
+						chatId: message.chatId,
+						id: sentStickerId
+					});
+				}
+
+				// Registra sticker do Lovecell enviado para rastreamento de denúncias
+				const lovecellStickerId =
+					options.lovecellStickerId ||
+					(typeof contentToSend?.filename === "string" &&
+						contentToSend.filename.match(/^figs_lovecell_(\d+)\.webp$/)?.[1]);
+
+				if (lovecellStickerId && result?.id) {
+					const sentMsgId = result.id._serialized || result.id.id || result.id;
+					try {
+						const StickerScraper = require("./functions/StickerScraper");
+						StickerScraper.recordSentStickerMessage(
+							sentMsgId,
+							lovecellStickerId,
+							message.chatId,
+							this.id
+						);
+					} catch (regErr) {
+						this.logger.warn(
+							`[sendReturnMessages] Erro ao registrar Lovecell sent sticker #${lovecellStickerId}: ${regErr.message}`
+						);
+					}
+				}
+
+				if ((options.waifuCharacterId || options.waifuRolls) && result?.id) {
+					const sentMsgId = result.id._serialized || result.id.id || result.id;
+					try {
+						const WaifuCommands = require("./functions/WaifuCommands");
+						if (typeof WaifuCommands.recordRollMessage === "function") {
+							WaifuCommands.recordRollMessage(
+								sentMsgId,
+								options.waifuRolls || options.waifuCharacterId,
+								message.chatId,
+								options.waifuExpiresAt,
+								options.waifuRollerUserId,
+								options.waifuExclusiveUntil,
+								options.waifuRollerUserName,
+								null,
+								options.waifuGridBase64
+							);
+						}
+					} catch (regErr) {
+						this.logger.warn(
+							`[sendReturnMessages] Erro ao registrar waifu roll message: ${regErr.message}`
+						);
+					}
+				}
+
+				if (options.stickerReportId && result?.id) {
+					const sentMsgId = result.id._serialized || result.id.id || result.id;
+					try {
+						const StickerScraper = require("./functions/StickerScraper");
+						if (typeof StickerScraper.recordReportConfirmationMessage === "function") {
+							StickerScraper.recordReportConfirmationMessage(
+								sentMsgId,
+								options.stickerReportId,
+								message.chatId,
+								this.id,
+								typeof contentToSend === "string" ? contentToSend : message.content
+							);
+						}
+					} catch (regErr) {
+						this.logger.warn(
+							`[sendReturnMessages] Erro ao registrar confirmação de report do sticker #${options.stickerReportId}: ${regErr.message}`
+						);
+					}
+				}
+
+				if ((options.waifuReportCharacterId || options.waifuReportCharacterIds) && result?.id) {
+					const sentMsgId = result.id._serialized || result.id.id || result.id;
+					try {
+						const WaifuCommands = require("./functions/WaifuCommands");
+						if (typeof WaifuCommands.recordWaifuReportConfirmation === "function") {
+							const reportCharIds =
+								options.waifuReportCharacterIds && Array.isArray(options.waifuReportCharacterIds)
+									? options.waifuReportCharacterIds
+									: [options.waifuReportCharacterId];
+							reportCharIds.forEach((charId) => {
+								if (charId) {
+									WaifuCommands.recordWaifuReportConfirmation(
+										sentMsgId,
+										charId,
+										message.chatId,
+										this.id,
+										typeof contentToSend === "string" ? contentToSend : message.content
+									);
+								}
+							});
+						}
+					} catch (regErr) {
+						this.logger.warn(
+							`[sendReturnMessages] Erro ao registrar confirmação de report waifu: ${regErr.message}`
+						);
+					}
+				}
 
 				if (result && result.id?._serialized) {
 					// O bot está reagindo à PRÓPRIA mensagem enviada, isto não é interessante. Deve ser commented out no código.
@@ -1232,12 +1622,21 @@ class WhatsAppBotGo {
 					}
 				}
 			} catch (sendError) {
+				const isNotInGroup = sendError?.notInGroup || isNotInGroupError(sendError);
+				if (isNotInGroup && message.chatId && message.chatId.includes("@g.us")) {
+					this.logger.warn(
+						`[${this.id}] Detectado que o bot não participa do grupo ${message.chatId} ao enviar ReturnMessages. Marcando como fora do grupo.`
+					);
+					await this.markNotInGroup(message.chatId);
+				}
+
 				this.logger.error(
 					`[${this.id}] Falha enviando ReturnMessages pra ${message.chatId}:`,
 					sendError
 				);
 				results.push({
 					error: sendError,
+					notInGroup: isNotInGroup,
 					messageContent: message.content,
 					getInfo: () =>
 						// Usado no StreamSystem pra saber se foi enviada
@@ -1299,6 +1698,8 @@ class WhatsAppBotGo {
 	async initialize() {
 		await this._loadSkipGroupInfo();
 		this.database.registerBotInstance(this);
+		ProfileStatusScheduler.getInstance().registerBot(this);
+		GrupoAgendamentos.inicializarAgendamentos(this).catch(() => {});
 		this.startupTime = Date.now();
 		this.lastMessageReceived = Date.now();
 
@@ -1434,20 +1835,7 @@ class WhatsAppBotGo {
 										`/instance/connect`,
 										{
 											webhookUrl: `${this.webhookHost}:${this.webhookPort}/webhook/${this.instanceName}`,
-											subscribe: [
-												"MESSAGE",
-												"SEND_MESSAGE",
-												"READ_RECEIPT",
-												"PRESENCE",
-												"CHAT_PRESENCE",
-												"CALL",
-												"CONNECTION",
-												"LABEL",
-												"CONTACT",
-												"GROUP",
-												"NEWSLETTER",
-												"QRCODE"
-											]
+											subscribe: WHATSGO_SUBSCRIBED_EVENTS
 										},
 										false
 									);
@@ -1463,20 +1851,7 @@ class WhatsAppBotGo {
 												`/instance/connect`,
 												{
 													webhookUrl: `${this.webhookHost}:${this.webhookPort}/webhook/${this.instanceName}`,
-													subscribe: [
-														"MESSAGE",
-														"SEND_MESSAGE",
-														"READ_RECEIPT",
-														"PRESENCE",
-														"CHAT_PRESENCE",
-														"CALL",
-														"CONNECTION",
-														"LABEL",
-														"CONTACT",
-														"GROUP",
-														"NEWSLETTER",
-														"QRCODE"
-													]
+													subscribe: WHATSGO_SUBSCRIBED_EVENTS
 												},
 												false
 											);
@@ -1569,7 +1944,8 @@ class WhatsAppBotGo {
 		this._sendStartupNotifications();
 		this.fetchAndPrepareBlockedContacts();
 
-		if (this.isConnected) return;
+		if (this._hasEmittedConnected) return;
+		this._hasEmittedConnected = true;
 		this.isConnected = true;
 		this.logger.info(`[${this.id}] Successfully connected to WhatsApp via WhatsgoGO API.`);
 		this.broadcastQRUpdate({ type: "connected", botId: this.id });
@@ -1582,6 +1958,7 @@ class WhatsAppBotGo {
 	_onInstanceDisconnected(reason = "Unknown") {
 		if (!this.isConnected && reason !== "INITIALIZING") return;
 		this.isConnected = false;
+		this._hasEmittedConnected = false;
 		this.disconnectedAt = Date.now();
 		this.logger.info(`[${this.id}] Disconnected from WhatsApp. Reason: ${reason}`);
 		if (this.eventHandler && typeof this.eventHandler.onDisconnected === "function") {
@@ -1687,33 +2064,42 @@ class WhatsAppBotGo {
 							chatToFilter === this.grupoLogs ||
 							chatToFilter === this.grupoAnuncios ||
 							chatToFilter === this.grupoInvites ||
-							chatToFilter === this.grupoEstabilidade
+							chatToFilter === this.grupoEstabilidade ||
+							this.isDossieGroup(chatToFilter)
 						) {
 							break;
 						}
 
 						if (reactionData) {
-							// ravena só processa se VIER uma reaction (campo 'text')
-							if (reactionData.text !== "" && !reactionData.key.fromMe) {
-								//this.logger.debug(`[${this.id}] Received reaction:`, { msgData, reactionData });
-								// reactionData.text -> emoji
-								// reactionData.key.participant -> @lid da pessoa que RECEBEU a reaction
-								// reactionData.key.remoteJID -> chat que veio a reaction
-								this.reactionHandler.processReaction(this, {
+							// ravena só processa se VIER uma reaction (campo 'text') e a reação não for do próprio bot
+							const isSelfReaction = Boolean(info.IsFromMe || info.fromMe);
+							if (reactionData.text !== "" && !isSelfReaction) {
+								const targetChat =
+									info.Chat || reactionData.key?.remoteJID || reactionData.key?.remoteJid;
+								const targetAuthor =
+									reactionData.key?.participant ||
+									(reactionData.key?.fromMe
+										? this.phoneNumber
+											? `${this.phoneNumber}@s.whatsapp.net`
+											: this.id
+										: null);
+								const targetFromMe = Boolean(reactionData.key?.fromMe);
+
+								const reactionPayload = {
 									reaction: reactionData.text,
 									senderId: info.Sender ?? info.SenderAlt,
 									userName: info.PushName,
-									msgId: { _serialized: reactionData.key.ID }
-								});
+									msgId: { _serialized: reactionData.key.ID },
+									chatId: targetChat,
+									targetAuthor,
+									targetFromMe,
+									key: reactionData.key
+								};
+
+								this.reactionHandler.processReaction(this, reactionPayload);
 
 								if (this.eventHandler && typeof this.eventHandler.onReaction === "function") {
-									this.eventHandler.onReaction(this, {
-										reaction: reactionData.text,
-										senderId: info.Sender ?? info.SenderAlt,
-										userName: info.PushName,
-										chatId: info.Chat,
-										msgId: { _serialized: reactionData.key.ID }
-									});
+									this.eventHandler.onReaction(this, reactionPayload);
 								}
 							}
 						} else {
@@ -1981,6 +2367,152 @@ class WhatsAppBotGo {
 		return data;
 	}
 
+	formatQuotedMessageFromContext(contextInfo, chatId, fromMe = false) {
+		if (!contextInfo?.quotedMessage) return null;
+		let quotedContent = contextInfo.quotedMessage;
+
+		// Desembrulha wrappers comuns do WhatsApp (viewOnce, ephemeral, etc.)
+		if (quotedContent.viewOnceMessage?.message) {
+			quotedContent = quotedContent.viewOnceMessage.message;
+		} else if (quotedContent.viewOnceMessageV2?.message) {
+			quotedContent = quotedContent.viewOnceMessageV2.message;
+		} else if (quotedContent.ephemeralMessage?.message) {
+			quotedContent = quotedContent.ephemeralMessage.message;
+		} else if (quotedContent.documentWithCaptionMessage?.message) {
+			quotedContent = quotedContent.documentWithCaptionMessage.message;
+		}
+
+		const stanzaId = contextInfo.stanzaID;
+		const participant = contextInfo.participant;
+		const author = this._normalizeId(participant || chatId);
+		const isGroup = chatId.includes("@g.us");
+
+		let type = "unknown";
+		let content = null;
+		let caption = null;
+		let mediaInfo = null;
+
+		if (quotedContent.conversation) {
+			type = "text";
+			content = quotedContent.conversation;
+		} else if (quotedContent.extendedTextMessage) {
+			type = "text";
+			content = quotedContent.extendedTextMessage.text;
+		} else if (quotedContent.imageMessage) {
+			type = "image";
+			caption = quotedContent.imageMessage.caption;
+			mediaInfo = {
+				mimetype: quotedContent.imageMessage.mimetype,
+				url: quotedContent.imageMessage.url,
+				_mediaDetails: quotedContent.imageMessage
+			};
+			content = mediaInfo;
+		} else if (quotedContent.videoMessage) {
+			type = "video";
+			caption = quotedContent.videoMessage.caption;
+			mediaInfo = {
+				mimetype: quotedContent.videoMessage.mimetype,
+				url: quotedContent.videoMessage.url,
+				seconds: quotedContent.videoMessage.seconds,
+				_mediaDetails: quotedContent.videoMessage
+			};
+			content = mediaInfo;
+		} else if (quotedContent.audioMessage) {
+			type = "audio";
+			mediaInfo = {
+				mimetype: quotedContent.audioMessage.mimetype,
+				url: quotedContent.audioMessage.url,
+				seconds: quotedContent.audioMessage.seconds,
+				_mediaDetails: quotedContent.audioMessage
+			};
+			content = mediaInfo;
+		} else if (quotedContent.stickerMessage) {
+			type = "sticker";
+			mediaInfo = {
+				mimetype: quotedContent.stickerMessage.mimetype,
+				url: quotedContent.stickerMessage.url,
+				_mediaDetails: quotedContent.stickerMessage
+			};
+			content = mediaInfo;
+		} else if (quotedContent.documentMessage) {
+			type = "document";
+			caption = quotedContent.documentMessage.caption;
+			mediaInfo = {
+				mimetype: quotedContent.documentMessage.mimetype,
+				url: quotedContent.documentMessage.url,
+				filename: quotedContent.documentMessage.fileName,
+				title: quotedContent.documentMessage.title,
+				_mediaDetails: quotedContent.documentMessage
+			};
+			content = mediaInfo;
+		}
+
+		const formattedQuoted = {
+			id: stanzaId,
+			fromMe: false,
+			group: isGroup ? chatId : null,
+			from: isGroup ? chatId : author,
+			author,
+			name: "Usuario",
+			pushname: "Usuario",
+			authorName: "Usuario",
+			type,
+			content,
+			body: content,
+			caption,
+			timestamp: Date.now() / 1000,
+			hasMedia: !!mediaInfo,
+			mentions: contextInfo.mentionedJID || [],
+			quotedParticipant: participant,
+			hasQuotedMsg: false,
+			isQuoted: true,
+			downloadMedia: async () => {
+				if (mediaInfo) {
+					try {
+						const downloaded = await this._downloadMediaFromWhatsgo(quotedContent);
+						if (downloaded) {
+							return {
+								mimetype: downloaded.mimetype,
+								url: downloaded.url,
+								data: downloaded.base64,
+								filename: downloaded.filename,
+								isMessageMedia: true
+							};
+						}
+					} catch (e) {
+						this.logger.error(`[downloadMedia quotedFromContext] Falha no download:`, e);
+					}
+				}
+				return null;
+			}
+		};
+
+		formattedQuoted.origin = {
+			mentionedIds: formattedQuoted.mentions,
+			id: {
+				_serialized: `${chatId}_false_${stanzaId}`,
+				fromMe: false,
+				remote: chatId,
+				id: stanzaId,
+				_serialized_v3: stanzaId
+			},
+			key: { remoteJid: chatId, fromMe: false, id: stanzaId },
+			author,
+			from: formattedQuoted.from,
+			react: (emoji) => this.sendReaction(chatId, stanzaId, emoji),
+			delete: async () =>
+				this.deleteMessageByKey({
+					remoteJid: chatId,
+					id: stanzaId,
+					fromMe: false,
+					participant
+				}),
+			body: content
+		};
+
+		return formattedQuoted;
+	}
+
 	async formatMessageFromGo(goMessageData, skipCache = false) {
 		try {
 			if (!goMessageData) {
@@ -2004,6 +2536,22 @@ class WhatsAppBotGo {
 			const sender = info.Sender; // geralmente phoneNumber (JID)
 			const senderAlt = info.SenderAlt; // geralmente LID
 
+			if (sender && senderAlt && this.lidToPnCache) {
+				const isSenderLid = String(sender).includes("@lid");
+				const isAltLid = String(senderAlt).includes("@lid");
+				if (isSenderLid && !isAltLid) {
+					const cleanLid = PhoneUtils.cleanPhone(sender);
+					const cleanPn = PhoneUtils.cleanPhone(senderAlt);
+					this.lidToPnCache.set(cleanLid, cleanPn);
+					this.lidToPnCache.set(`${cleanLid}@lid`, cleanPn);
+				} else if (!isSenderLid && isAltLid) {
+					const cleanPn = PhoneUtils.cleanPhone(sender);
+					const cleanLid = PhoneUtils.cleanPhone(senderAlt);
+					this.lidToPnCache.set(cleanLid, cleanPn);
+					this.lidToPnCache.set(`${cleanLid}@lid`, cleanPn);
+				}
+			}
+
 			if (!pushName || pushName?.length < 1) {
 				const cacheObj = await this.fetchPushNameFromCache(senderAlt || sender);
 				pushName = cacheObj?.pushName ?? cacheObj ?? "Usuario";
@@ -2018,6 +2566,8 @@ class WhatsAppBotGo {
 			else if (messageContent.audioMessage) contextInfo = messageContent.audioMessage.contextInfo;
 			else if (messageContent.stickerMessage)
 				contextInfo = messageContent.stickerMessage.contextInfo;
+			else if (messageContent.documentMessage)
+				contextInfo = messageContent.documentMessage.contextInfo;
 
 			const mentions = contextInfo?.mentionedJID ?? [];
 			const quotedMessageId = contextInfo?.quotedMessage ? contextInfo.stanzaID : null;
@@ -2105,6 +2655,31 @@ class WhatsAppBotGo {
 					displayName: messageContent.contactMessage.displayName,
 					vcard: messageContent.contactMessage.vcard
 				};
+			} else if (
+				messageContent.newsletterAdminInviteMessage ||
+				goMessageData.newsletterAdminInvite
+			) {
+				type = "newsletter_admin_invite";
+				const invite =
+					messageContent.newsletterAdminInviteMessage || goMessageData.newsletterAdminInvite;
+				content = {
+					newsletterJID: invite.newsletterJID || invite.newsletterJid || invite.NewsletterJID,
+					newsletterName: invite.newsletterName || invite.NewsletterName,
+					caption: invite.caption || invite.Caption,
+					inviteExpiration: invite.inviteExpiration || invite.InviteExpiration
+				};
+			}
+
+			let authorJid = sender;
+			if (String(sender).includes("@lid")) {
+				if (senderAlt && !String(senderAlt).includes("@lid")) {
+					authorJid = senderAlt;
+				} else if (this.lidToPnCache) {
+					const cleanLid = PhoneUtils.cleanPhone(sender);
+					const cachedPn =
+						this.lidToPnCache.get(cleanLid) || this.lidToPnCache.get(`${cleanLid}@lid`);
+					if (cachedPn) authorJid = `${cachedPn}@s.whatsapp.net`;
+				}
 			}
 
 			const formattedMessage = {
@@ -2113,7 +2688,7 @@ class WhatsAppBotGo {
 				fromMe,
 				group: isGroup ? chatId : null,
 				from: isGroup ? chatId : sender,
-				author: this._normalizeId(sender),
+				author: this._normalizeId(authorJid),
 				authorAlt: senderAlt,
 				name: pushName,
 				pushname: pushName,
@@ -2128,6 +2703,7 @@ class WhatsAppBotGo {
 				mentions,
 				quotedParticipant,
 				hasQuotedMsg: !!quotedMessageId,
+				quotedMessageId,
 				isQuoted: goMessageData.isQuoted,
 				isNewsletter: chatId.includes("newsletter"),
 
@@ -2177,9 +2753,20 @@ class WhatsAppBotGo {
 				getContact: formattedMessage.getContact,
 				getChat: formattedMessage.getChat,
 				getQuotedMessage: async () => {
-					this.logger.debug(`[getQuotedMessage] ${quotedMessageId}`);
+					// this.logger.debug(`[getQuotedMessage] ${quotedMessageId}`);
 					if (quotedMessageId) {
-						return await this.recoverMsgFromCache(quotedMessageId);
+						const cached = await this.recoverMsgFromCache(quotedMessageId);
+						if (cached) {
+							return cached;
+						}
+					}
+					// Fallback: se a mensagem não estiver no cache (bot reiniciou ou expiração),
+					// reconstrói a partir do contextInfo.quotedMessage enviado pelo WhatsApp
+					if (contextInfo?.quotedMessage) {
+						// this.logger.debug(
+						// 	`[getQuotedMessage] Recuperando mensagem ${quotedMessageId} via contextInfo.quotedMessage (fallback de cache)`
+						// );
+						return this.formatQuotedMessageFromContext(contextInfo, chatId, fromMe);
 					}
 					return null;
 				},
@@ -2229,6 +2816,34 @@ class WhatsAppBotGo {
 				this.cacheManager.putGoMessageInCache(cachedMessage);
 			}
 
+			if (goMessageData.newsletterAdminInvite || messageContent.newsletterAdminInviteMessage) {
+				const invite =
+					goMessageData.newsletterAdminInvite || messageContent.newsletterAdminInviteMessage;
+				const inviteJid = invite.newsletterJID || invite.newsletterJid || invite.NewsletterJID;
+				const inviteName = invite.newsletterName || invite.NewsletterName;
+				if (inviteJid) {
+					this.logger.info(
+						`[NewsletterAdminInvite] Recebido convite de admin para o canal ${inviteJid} (${inviteName}). Tentando aceitar automaticamente...`
+					);
+					this.acceptNewsletterAdminInvite(inviteJid)
+						.then((res) => {
+							this.logger.info(
+								`[NewsletterAdminInvite] Convite de admin para ${inviteJid} aceite com sucesso!`,
+								res
+							);
+							this.logMsgToGrupo(
+								`📢 *Convite de Admin de Canal Aceito!*\n*Canal:* ${inviteName || "Sem Nome"}\n*JID:* ${inviteJid}`
+							);
+						})
+						.catch((err) => {
+							this.logger.error(
+								`[NewsletterAdminInvite] Erro ao aceitar convite de admin para ${inviteJid}:`,
+								err
+							);
+						});
+				}
+			}
+
 			return formattedMessage;
 		} catch (error) {
 			this.logger.error(`[${this.id}] Error formatting message from WhatsgoGO API:`, error);
@@ -2252,10 +2867,88 @@ class WhatsAppBotGo {
 		return actualId;
 	}
 
+	/**
+	 * Limita o conteúdo de texto para evitar mensagens gigantescas ou loops de repetição.
+	 * Respeita o limite máximo de caracteres (padrão 15000), de linhas (padrão 200) e repetições consecutivas (máx 15).
+	 *
+	 * @param {string} text - Texto a ser validado e possivelmente truncado.
+	 * @param {number} [maxChars=15000] - Limite máximo de caracteres.
+	 * @param {number} [maxLines=200] - Limite máximo de linhas.
+	 * @param {number} [maxCharRepeats=15] - Limite máximo de repetições consecutivas do mesmo caractere.
+	 * @returns {string} - Texto original ou truncado com indicador.
+	 */
+	truncateText(text, maxChars = 15000, maxLines = 200, maxCharRepeats = 15) {
+		if (typeof text !== "string" || !text) {
+			return text;
+		}
+
+		let result = text;
+		let modified = false;
+
+		// Limita repetições consecutivas do mesmo caractere para no máximo 15 (ex: "KKK...KKK" -> 15 K's)
+		if (maxCharRepeats > 0) {
+			const repeatRegex =
+				maxCharRepeats === 15 ? /(.)\1{15,}/gu : new RegExp(`(.)\\1{${maxCharRepeats},}`, "gu");
+			if (repeatRegex.test(result)) {
+				result = result.replace(repeatRegex, (match, char) => char.repeat(maxCharRepeats));
+				modified = true;
+			}
+		}
+
+		const lines = result.split(/\r?\n/);
+		const exceedsLines = maxLines > 0 && lines.length > maxLines;
+		const exceedsChars = maxChars > 0 && result.length > maxChars;
+
+		if (exceedsLines || exceedsChars) {
+			modified = true;
+			const suffix = "\n... [truncado]";
+
+			if (exceedsLines) {
+				const targetLines = Math.max(1, maxLines - 1);
+				result = lines.slice(0, targetLines).join("\n") + suffix;
+			}
+
+			if (maxChars > 0 && result.length > maxChars) {
+				const targetChars = Math.max(0, maxChars - suffix.length);
+				let sliced = result.slice(0, targetChars);
+				if (typeof sliced.isWellFormed === "function" && !sliced.isWellFormed()) {
+					sliced = sliced.replace(
+						/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/gu,
+						""
+					);
+				}
+				result = sliced + suffix;
+			}
+		}
+
+		if (modified) {
+			this.logger.warn(
+				`[${this.id}] Mensagem de texto ajustada por filtros de tamanho/repetição (${maxChars} chars / ${maxLines} linhas / máx ${maxCharRepeats} repetições).`
+			);
+		}
+
+		return typeof result.toWellFormed === "function" ? result.toWellFormed() : result;
+	}
+
 	async sendMessage(chatId, content, options = {}) {
 		try {
 			if (!this.isConnected) throw new Error("Not connected");
+
+			if (chatId && chatId.includes("@g.us") && !this.isParticipating(chatId)) {
+				this.logger.warn(
+					`[${this.id}] Ignorando sendMessage para ${chatId}: bot não participa deste grupo.`
+				);
+				const err = new Error(`Bot ${this.id} não participa do grupo ${chatId}`);
+				err.notInGroup = true;
+				err.status = 403;
+				throw err;
+			}
+
 			let isGroup = false;
+
+			const maxChars = options.maxChars !== undefined ? options.maxChars : 15000;
+			const maxLines = options.maxLines !== undefined ? options.maxLines : 200;
+			const maxCharRepeats = options.maxCharRepeats !== undefined ? options.maxCharRepeats : 15;
 
 			const payload = {
 				number: chatId,
@@ -2298,36 +2991,132 @@ class WhatsAppBotGo {
 					// Facilidade pra enviar mídia
 					endpoint = "/send/media";
 					payload.url = content;
-					payload.type = content.endsWith(".gif")
-						? "video"
-						: (mime.lookup(content.split("?")[0]).split("/")[0] ?? "document");
+					const detectedMime = mime.lookup(content.split("?")[0]) || "";
+					const isGifUrl =
+						content.split("?")[0].toLowerCase().endsWith(".gif") || detectedMime === "image/gif";
+					payload.type = isGifUrl ? "gif" : (detectedMime.split("/")[0] ?? "document");
 
-					// Se sendVideoAsGif estiver ativo e o tipo for vídeo, use "gif" para que a API Go
+					// Se sendVideoAsGif estiver ativo ou for arquivo GIF, use "gif" para que a API Go
 					// envie com GifPlayback=true (reprodução automática sem controles de vídeo)
-					if (options.sendVideoAsGif && payload.type === "video") {
+					if (options.sendVideoAsGif || isGifUrl) {
 						payload.type = "gif";
 					}
 
+					if (isGifUrl) {
+						try {
+							const mp4Buffer = await this.convertGifToMp4(content);
+							const media = await this.createMediaFromBase64(
+								mp4Buffer.toString("base64"),
+								"video/mp4",
+								"animation.mp4"
+							);
+							payload.url = media.url;
+						} catch (convErr) {
+							this.logger.error(
+								`[sendMessage] Erro ao converter GIF URL para MP4: ${convErr.message}`
+							);
+						}
+					}
+
 					this.logger.debug(`[sendMessage] Content is URL! `, { endpoint, payload });
+				} else if (options.linkPreview && /(https?:\/\/[^\s]+)/i.test(content)) {
+					endpoint = "/send/link";
+					payload.text = this.truncateText(content, maxChars, maxLines, maxCharRepeats);
 				} else {
 					endpoint = "/send/text";
-					payload.text = content;
+					payload.text = this.truncateText(content, maxChars, maxLines, maxCharRepeats);
 				}
 			} else if (content.isMessageMedia || options.sendMediaAsSticker) {
 				if (options.sendMediaAsSticker) {
 					endpoint = "/send/sticker";
 					if (!content.url && content.data) {
+						let stickerData =
+							typeof content.data === "string"
+								? content.data.replace(/^data:[^;]+;base64,/, "")
+								: content.data;
+						let stickerMime = content.mimetype || "image/webp";
+						if (!stickerMime.includes("webp")) {
+							// ATENÇÃO: Esta conversão só ocorre se o mime NÃO for webp.
+							// Se Stickers.js já processou corretamente, este bloco NÃO deve executar.
+							// this.logger.warn(
+							// 	`[sendMessage] ⚠️ Sticker com mime não-webp detectado (${stickerMime}) — conversão redundante sendo iniciada!`
+							// );
+							// const convStart = Date.now();
+							try {
+								if (stickerMime.startsWith("video/") || stickerMime === "image/gif") {
+									stickerData = await this.convertToAnimatedWebP(content.data);
+									stickerMime = "image/webp";
+								} else {
+									stickerData = await this.convertToSquareWebPImage(content.data);
+									stickerMime = "image/webp";
+								}
+								// this.logger.warn(
+								// 	`[sendMessage] ⚠️ Conversão redundante concluída em ${Date.now() - convStart}ms`
+								// );
+							} catch (convErr) {
+								this.logger.warn(
+									`[sendMessage] Erro ao padronizar mídia para WebP sticker: ${convErr.message}`
+								);
+							}
+						} else {
+							// this.logger.info(
+							// 	`[sendMessage] ✓ Sticker já é WebP (${stickerMime}, ${((content.data.length * 3) / 4 / 1024).toFixed(1)} KB base64) — sem conversão adicional`
+							// );
+						}
+						// const uploadStart = Date.now();
 						const media = await this.createMediaFromBase64(
-							content.data,
-							content.mimetype,
-							content.filename
+							stickerData,
+							stickerMime,
+							content.filename ? content.filename.replace(/\.[^/.]+$/, ".webp") : "sticker.webp"
 						);
+						// this.logger.info(`[sendMessage] Upload do sticker em ${Date.now() - uploadStart}ms`);
 						payload.sticker = media.url;
 					} else {
 						payload.sticker = content.url ?? content.data;
 					}
 				} else {
 					endpoint = "/send/media";
+
+					const rawMime = typeof content.mimetype === "string" ? content.mimetype : "image/jpeg";
+					const isGifFile =
+						rawMime === "image/gif" ||
+						(typeof content.filename === "string" &&
+							content.filename.toLowerCase().endsWith(".gif")) ||
+						(typeof content.data === "string" && content.data.startsWith("R0lGOD"));
+
+					// WhatsApp exige que GIFs sejam transmitidos como MP4 (H.264 / yuv420p) com GifPlayback=true.
+					// Arquivos GIF89a puros enviados como VideoMessage causam placeholder cinza vazio que não carrega no app.
+					if (isGifFile && content.data) {
+						try {
+							const mp4Buffer = await this.convertGifToMp4(content.data);
+							content.data = mp4Buffer.toString("base64");
+							content.mimetype = "video/mp4";
+							content.filename = content.filename
+								? content.filename.replace(/\.gif$/i, ".mp4")
+								: "animation.mp4";
+						} catch (convErr) {
+							this.logger.error(
+								`[sendMessage] Falha ao converter GIF para MP4: ${convErr.message}`
+							);
+						}
+					} else if (isGifFile && content.url) {
+						try {
+							const mp4Buffer = await this.convertGifToMp4(content.url);
+							const media = await this.createMediaFromBase64(
+								mp4Buffer.toString("base64"),
+								"video/mp4",
+								content.filename ? content.filename.replace(/\.gif$/i, ".mp4") : "animation.mp4"
+							);
+							content.url = media.url;
+							content.mimetype = "video/mp4";
+							content.filename = media.filename;
+						} catch (convErr) {
+							this.logger.error(
+								`[sendMessage] Falha ao converter GIF URL para MP4: ${convErr.message}`
+							);
+						}
+					}
+
 					payload.url = content.url;
 					if (!payload.url && content.data) {
 						const media = await this.createMediaFromBase64(
@@ -2339,9 +3128,18 @@ class WhatsAppBotGo {
 						if (options.sendMediaAsSticker) payload.sticker = media.url;
 					}
 
-					payload.caption = options.caption;
+					payload.caption = typeof options.caption === "string" ? options.caption : "";
 
-					let mediaType = content.mimetype ? content.mimetype.split("/")[0] : "image";
+					const currentMime =
+						typeof content.mimetype === "string" ? content.mimetype : "image/jpeg";
+					let mediaType = currentMime ? currentMime.split("/")[0] : "image";
+
+					// Se for GIF ou sendVideoAsGif estiver ativo, use "gif" para que a API Go
+					// envie com GifPlayback=true (reprodução automática sem controles de vídeo)
+					if (isGifFile || options.sendVideoAsGif) {
+						mediaType = "gif";
+					}
+
 					const cttSize = content.size ?? (await this.getFileSizeByURL(content.url)) ?? 0;
 					const urlPublica = process.env.BOT_DOMAIN_LOCAL
 						? payload.url.replace(process.env.BOT_DOMAIN_LOCAL, process.env.BOT_DOMAIN)
@@ -2352,14 +3150,12 @@ class WhatsAppBotGo {
 						payload.caption += `\n\n> Link temporário: ${urlPublica}`;
 					}
 
-					// Se sendVideoAsGif estiver ativo e o tipo for vídeo, use "gif" para que a API Go
-					// envie com GifPlayback=true (reprodução automática sem controles de vídeo)
-					if (options.sendVideoAsGif && mediaType === "video") {
-						mediaType = "gif";
+					let typeStr = mediaType.split("/")[0];
+					if (!["image", "video", "gif", "audio", "document"].includes(typeStr)) {
+						typeStr = "document";
 					}
-
-					payload.type = mediaType.split("/")[0];
-					payload.filename = content.filename;
+					payload.type = typeStr;
+					payload.filename = typeof content.filename === "string" ? content.filename : "file";
 				}
 			} else if (content.isLocation) {
 				endpoint = "/send/location";
@@ -2383,9 +3179,13 @@ class WhatsAppBotGo {
 			if (options.mentionAll) {
 				payload.mentionAll = true;
 			} else if (options.mentions) {
-				payload.mentionedJid = Array.isArray(options.mentions)
-					? options.mentions.join(",")
-					: options.mentions;
+				const mentionsList = Array.isArray(options.mentions)
+					? options.mentions
+					: [options.mentions];
+				const sanitizedMentions = mentionsList.map((m) =>
+					typeof m === "string" && !m.includes("@") && /^\d+$/.test(m) ? `${m}@s.whatsapp.net` : m
+				);
+				payload.mentionedJid = sanitizedMentions.join(",");
 			}
 
 			//this.logger.debug(`[sendMessage] '${endpoint}'`, { contentType: typeof content, content, payload });
@@ -2398,7 +3198,27 @@ class WhatsAppBotGo {
 				});
 			}
 
-			const response = await this.apiClient.post(endpoint, payload);
+			if (typeof payload.text === "string") {
+				payload.text = this.truncateText(payload.text, maxChars, maxLines, maxCharRepeats);
+			}
+			if (typeof payload.caption === "string") {
+				payload.caption = this.truncateText(payload.caption, maxChars, maxLines, maxCharRepeats);
+			}
+
+			let response;
+			try {
+				response = await this.apiClient.post(endpoint, payload);
+			} catch (postErr) {
+				if (endpoint === "/send/link") {
+					this.logger.warn(
+						`[${this.id}] Falha ao enviar com link preview (/send/link), enviando via /send/text:`,
+						postErr.message || postErr
+					);
+					response = await this.apiClient.post("/send/text", payload);
+				} else {
+					throw postErr;
+				}
+			}
 			this.loadReport.trackSentMessage(isGroup);
 
 			return {
@@ -2417,6 +3237,14 @@ class WhatsAppBotGo {
 				}
 			};
 		} catch (error) {
+			if (chatId && chatId.includes("@g.us") && isNotInGroupError(error)) {
+				this.logger.warn(
+					`[${this.id}] Falha enviando mensagem para ${chatId}: bot não participa do grupo. Marcando como fora do grupo.`
+				);
+				await this.markNotInGroup(chatId);
+				error.notInGroup = true;
+			}
+
 			this.logger.error(`[${this.id}] Error sending message:`, error);
 			throw error;
 		}
@@ -2426,6 +3254,9 @@ class WhatsAppBotGo {
 		// groupData: { JID, Join: [], Leave: [], Promote: [], Demote: [] }
 		//this.logger.debug(`[_handleGroupParticipantsUpdate] `, groupData);
 		const groupId = groupData.JID;
+		if (this.groupCache && groupId) {
+			this.groupCache.delete(groupId);
+		}
 
 		// Helper to process actions
 		const processAction = async (groupData, participants, action) => {
@@ -2441,6 +3272,14 @@ class WhatsAppBotGo {
 					(await this.getContactDetails(groupData.Sender)) ??
 					(await this.getContactDetails(groupData.SenderPN));
 
+				let participantPhone = null;
+				if (participant && (participant.endsWith("@lid") || participant.includes("@lid"))) {
+					const resolvedPn = this.getPnFromLid(participant, groupDetails);
+					if (resolvedPn && typeof resolvedPn === "string" && !resolvedPn.includes("@lid")) {
+						participantPhone = resolvedPn;
+					}
+				}
+
 				const eventData = {
 					group: {
 						id: groupId,
@@ -2453,7 +3292,11 @@ class WhatsAppBotGo {
 					isCommunity: groupData.isCommunity ?? groupData.IsParent ?? groupDetails.isCommunity,
 					isAnnounce: groupData.isAnnounce ?? groupData.IsAnnounce ?? groupDetails.isAnnounce,
 					isBotJoining: groupData.isBotJoining ?? groupDetails.isBotJoining,
-					user: { id: participant, name: contact?.name ?? participant.split("@")[0] },
+					user: {
+						id: participant,
+						name: contact?.name ?? participant.split("@")[0],
+						phoneNumber: participantPhone || contact?.number || undefined
+					},
 					responsavel: {
 						id: groupData.SenderPN,
 						name: contactResp?.name ?? groupData.SenderPN?.split("@")[0]
@@ -2491,9 +3334,40 @@ class WhatsAppBotGo {
 		}
 	}
 
+	async clearChat(chatJid, deleteMedia = false) {
+		try {
+			this.logger.info(
+				`[clearChat][${this.instanceName}] Limpando mensagens em '${chatJid}' (deleteMedia: ${deleteMedia})`
+			);
+			return await this.apiClient.post("/chat/clear", {
+				chat: chatJid,
+				deleteMedia: Boolean(deleteMedia)
+			});
+		} catch (e) {
+			this.logger.error(`[clearChat][${this.instanceName}] Erro ao limpar chat '${chatJid}':`, e);
+			throw e;
+		}
+	}
+
+	async deleteChat(chatJid, deleteMedia = false) {
+		try {
+			this.logger.info(
+				`[deleteChat][${this.instanceName}] Apagando conversa '${chatJid}' (deleteMedia: ${deleteMedia})`
+			);
+			return await this.apiClient.post("/chat/delete", {
+				chat: chatJid,
+				deleteMedia: Boolean(deleteMedia)
+			});
+		} catch (e) {
+			this.logger.error(`[deleteChat][${this.instanceName}] Erro ao apagar chat '${chatJid}':`, e);
+			throw e;
+		}
+	}
+
 	leaveGroup(groupJid) {
 		try {
 			this.logger.debug(`[leaveGroup][${this.instanceName}] '${groupJid}'`);
+			if (this.groupCache && groupJid) this.groupCache.delete(groupJid);
 			this.apiClient.post(`/group/leave`, { groupJid });
 		} catch (e) {
 			this.logger.warn(`[leaveGroup] Erro saindo do grupo '${groupJid}'`, e);
@@ -2505,6 +3379,7 @@ class WhatsAppBotGo {
 			this.logger.info(
 				`[removeFromGroup][${this.instanceName}] Removendo ${participants.length} do grupo ${groupJid}`
 			);
+			if (this.groupCache && groupJid) this.groupCache.delete(groupJid);
 			return await this.apiClient.post(`/group/participant`, {
 				groupJid,
 				action: "remove",
@@ -2523,6 +3398,7 @@ class WhatsAppBotGo {
 			this.logger.info(
 				`[addToGroup][${this.instanceName}] Adicionando ${participants.length} ao grupo ${groupJid}`
 			);
+			if (this.groupCache && groupJid) this.groupCache.delete(groupJid);
 			return await this.apiClient.post(`/group/participant`, {
 				groupJid,
 				action: "add",
@@ -2548,6 +3424,59 @@ class WhatsAppBotGo {
 		}
 	}
 
+	async promoteInGroup(groupJid, participants) {
+		try {
+			this.logger.info(
+				`[promoteInGroup][${this.instanceName}] Promovendo ${participants.length} no grupo ${groupJid}`
+			);
+			return await this.apiClient.post(`/group/participant`, {
+				groupJid,
+				action: "promote",
+				participants: Array.isArray(participants) ? participants : [participants]
+			});
+		} catch (e) {
+			this.logger.error(
+				`[promoteInGroup][${this.instanceName}] Erro ao promover participantes:`,
+				e
+			);
+			throw e;
+		}
+	}
+
+	async demoteInGroup(groupJid, participants) {
+		try {
+			this.logger.info(
+				`[demoteInGroup][${this.instanceName}] Rebaixando ${participants.length} no grupo ${groupJid}`
+			);
+			return await this.apiClient.post(`/group/participant`, {
+				groupJid,
+				action: "demote",
+				participants: Array.isArray(participants) ? participants : [participants]
+			});
+		} catch (e) {
+			this.logger.error(`[demoteInGroup][${this.instanceName}] Erro ao rebaixar participantes:`, e);
+			throw e;
+		}
+	}
+
+	async pinMessage(chatId, messageId, participant = null, fromMe = false, type = "pin") {
+		try {
+			this.logger.info(
+				`[pinMessage][${this.instanceName}] Fixando mensagem ${messageId} no chat ${chatId} (type: ${type})`
+			);
+			return await this.apiClient.post(`/message/pin`, {
+				chat: chatId,
+				messageId,
+				fromMe: Boolean(fromMe),
+				participant: participant || undefined,
+				type
+			});
+		} catch (e) {
+			this.logger.error(`[pinMessage][${this.instanceName}] Erro ao fixar mensagem:`, e);
+			throw e;
+		}
+	}
+
 	logMsgToGrupo(msg, extra = false) {
 		if (this.grupoLogs && msg) {
 			this.logger.info(`[logMsgToGrupo] ${msg}`, extra);
@@ -2570,6 +3499,26 @@ class WhatsAppBotGo {
 		}
 	}
 
+	/**
+	 * Aceita um convite de administrador de canal (Newsletter)
+	 * @param {string} canalJid
+	 * @returns {Promise<any>}
+	 */
+	async acceptNewsletterAdminInvite(canalJid) {
+		if (!canalJid) {
+			throw new Error("JID do canal é obrigatório para aceitar o convite de admin.");
+		}
+		let cleanJid = canalJid.trim();
+		if (!cleanJid.endsWith("@newsletter")) {
+			cleanJid = `${cleanJid}@newsletter`;
+		}
+		this.logger.info(
+			`[acceptNewsletterAdminInvite][${this.instanceName}] Aceitando convite de admin para o canal: ${cleanJid}`
+		);
+		const resp = await this.apiClient.post("/newsletter/accept-admin-invite", { jid: cleanJid });
+		return resp;
+	}
+
 	async inviteInfo(inviteCode) {
 		try {
 			this.logger.debug(`[inviteInfo][${this.instanceName}] '${inviteCode}'`);
@@ -2590,10 +3539,32 @@ class WhatsAppBotGo {
 		}
 	}
 
-	async getChatDetails(chatId) {
+	/**
+	 * Altera o nome/título de um grupo no WhatsApp via whatsgoapi
+	 * @param {string} groupId
+	 * @param {string} title
+	 * @returns {Promise<boolean>}
+	 */
+	async setGroupName(groupId, title) {
+		if (!groupId || !title) return false;
+		try {
+			await this.apiClient.post("/group/name", { groupJid: groupId, name: title });
+			if (this.groupCache) this.groupCache.delete(groupId);
+			return true;
+		} catch (err) {
+			this.logger.error(`[setGroupName] Erro ao alterar título de ${groupId}:`, err);
+			throw err;
+		}
+	}
+
+	async setGroupSubject(groupId, title) {
+		return await this.setGroupName(groupId, title);
+	}
+
+	async getChatDetails(chatId, options = {}) {
 		if (!chatId) return null;
 
-		if (this.skipGroupInfo && this.skipGroupInfo.includes(chatId)) {
+		if (chatId.includes("@g.us") && !this.isParticipating(chatId)) {
 			this.logger.info(
 				`[getChatDetails] Skipping fetch for ${chatId} as it is in skipGroupInfo list.`
 			);
@@ -2602,8 +3573,17 @@ class WhatsAppBotGo {
 				name: chatId,
 				isGroup: true,
 				notInGroup: true,
-				participants: []
+				isParticipating: false,
+				participants: [],
+				setSubject: async (title) => await this.setGroupName(chatId, title)
 			};
+		}
+
+		if (chatId.includes("@g.us") && !options?.forceRefresh && this.groupCache) {
+			const cached = this.groupCache.get(chatId);
+			if (cached) {
+				return cached;
+			}
 		}
 
 		try {
@@ -2615,16 +3595,32 @@ class WhatsAppBotGo {
 					// Cache LIDs
 					if (groupInfo.Participants) {
 						groupInfo.Participants.forEach((p) => {
+							const pJid = p.JID || p.id?._serialized;
+							const pLid = p.LID || p.lid;
+							const pPhone = p.PhoneNumber || p.phoneNumber;
+							if (pLid && pPhone) {
+								const cleanPhone = String(pPhone).split("@")[0].replace(/\D/g, "");
+								const cleanLid = String(pLid).split("@")[0].replace(/\D/g, "");
+								if (cleanPhone && cleanLid && this.lidToPnCache) {
+									this.lidToPnCache.set(cleanLid, cleanPhone);
+									this.lidToPnCache.set(`${cleanLid}@lid`, cleanPhone);
+									this.lidToPnCache.set(String(pLid), cleanPhone);
+								}
+							}
 							if (p.LID)
 								this.cacheManager.putContactInCache({ id: { _serialized: p.JID }, lid: p.LID });
 							// Check if it's me to store my LID
-							if (p.JID.includes(this.phoneNumber)) {
-								this.myLid = p.LID;
+							if (
+								this.phoneNumber &&
+								(PhoneUtils.matchesParticipant(p, this.phoneNumber) ||
+									(p.JID && p.JID.includes(this.phoneNumber)))
+							) {
+								this.myLid = p.LID || p.lid;
 							}
 						});
 					}
 
-					return {
+					const chatResult = {
 						id: { _serialized: groupInfo.JID },
 						name: groupInfo.Name ?? chatId,
 						isGroup: true,
@@ -2632,6 +3628,7 @@ class WhatsAppBotGo {
 						isAnnounce: groupInfo.IsAnnounce,
 						linkedParentJid: groupInfo.LinkedParentJID,
 						notInGroup: false,
+						isParticipating: true,
 						groupMetadata: { desc: groupInfo.Topic },
 						participants: groupInfo.Participants.map((p) => ({
 							id: { _serialized: p.JID },
@@ -2643,8 +3640,7 @@ class WhatsAppBotGo {
 						_raw: groupInfo,
 
 						// Métodos do wwebjs
-						setSubject: async (title) =>
-							await this.apiClient.post(`/group/name`, { groupJid: chatId, name: title }),
+						setSubject: async (title) => await this.setGroupName(chatId, title),
 						addParticipants: async (participants) => await this.addToGroup(chatId, participants),
 						removeParticipants: async (participants) =>
 							await this.removeFromGroup(chatId, participants),
@@ -2661,29 +3657,14 @@ class WhatsAppBotGo {
 								throw err;
 							}
 						},
-						setPicture: async (picture) => {
-							this.logger.debug(`[chat] setPicture`, { type: "url", url: picture.url });
-
-							try {
-								// Try with URL first
-								return await this.apiClient.post(`/group/photo`, {
-									groupJid: chatId,
-									image: picture.url
-								});
-							} catch (error) {
-								// Fallback to base64 if URL fails
-								if (picture.data && picture.mimetype) {
-									this.logger.warn(`[chat] setPicture via URL failed, retrying with base64...`);
-									const imageData = `data:${picture.mimetype};base64,${picture.data}`;
-									return await this.apiClient.post(`/group/photo`, {
-										groupJid: chatId,
-										image: imageData
-									});
-								}
-								throw error;
-							}
-						}
+						setPicture: async (picture) => await this.setGroupPhoto(chatId, picture)
 					};
+
+					if (this.groupCache) {
+						this.groupCache.set(chatId, chatResult);
+					}
+
+					return chatResult;
 				}
 			} else {
 				const contact = await this.getContactDetails(chatId);
@@ -2694,49 +3675,52 @@ class WhatsAppBotGo {
 				};
 			}
 		} catch (e) {
+			if (this.groupCache && chatId.includes("@g.us")) {
+				this.groupCache.delete(chatId);
+			}
 			if (e.status === 500 && e.data?.error === "that group does not exist") {
 				this.logger.warn(
 					`[getChatDetails] Group ${chatId} does not exist (status 500). Adding to skip list.`
 				);
-				await this.addSkipGroup(chatId);
+				await this.markNotInGroup(chatId);
 				return {
 					id: { _serialized: chatId },
 					name: chatId,
 					isGroup: true,
 					notInGroup: true,
-					participants: []
+					isParticipating: false,
+					participants: [],
+					setSubject: async (title) => await this.setGroupName(chatId, title)
 				};
 			} else {
-				const errorDetails = [
-					e.message,
-					e.data?.error,
-					e.response?.data?.error,
-					typeof e === "string" ? e : null
-				]
-					.filter((s) => typeof s === "string")
-					.join(" ")
-					.toLowerCase();
-
-				if (
-					errorDetails.includes("not participating") ||
-					errorDetails.includes("not_participating") ||
-					errorDetails.includes("no longer a participant") ||
-					errorDetails.includes("not in group")
-				) {
+				if (isNotInGroupError(e)) {
 					this.logger.info(`[getChatDetails] Error fetching ${chatId}, bot não está no grupo`);
+					await this.markNotInGroup(chatId);
 					return {
 						id: { _serialized: chatId },
 						name: chatId,
 						isGroup: true,
 						notInGroup: true,
-						participants: []
+						isParticipating: false,
+						participants: [],
+						setSubject: async (title) => await this.setGroupName(chatId, title)
 					};
 				}
 
 				this.logger.error(`[getChatDetails] Error fetching ${chatId}`, e);
 			}
 		}
-		return { id: { _serialized: chatId }, isGroup: chatId.includes("@g.us") };
+		return {
+			id: { _serialized: chatId },
+			name: chatId,
+			isGroup: chatId.includes("@g.us"),
+			notInGroup: !this.isParticipating(chatId),
+			isParticipating: this.isParticipating(chatId),
+			participants: [],
+			setSubject: chatId.includes("@g.us")
+				? async (title) => await this.setGroupName(chatId, title)
+				: undefined
+		};
 	}
 
 	async _loadSkipGroupInfo() {
@@ -2769,12 +3753,114 @@ class WhatsAppBotGo {
 			this.logger.info(`[SkipGroups] Removed ${groupId} from skip list.`);
 		}
 	}
+
+	/**
+	 * Verifica se o bot participa do grupo (não está na lista de skip).
+	 * @param {string} groupId
+	 * @returns {boolean}
+	 */
+	isParticipating(groupId) {
+		if (!groupId) return false;
+		if (this.skipGroupInfo && this.skipGroupInfo.includes(groupId)) {
+			return false;
+		}
+		return true;
+	}
+
+	isInGroup(groupId) {
+		return this.isParticipating(groupId);
+	}
+
+	/**
+	 * Marca que este bot não participa do grupo.
+	 * Adiciona à skip list persistente e atualiza group.botNotInGroup no banco.
+	 * @param {string} groupId
+	 */
+	async markNotInGroup(groupId) {
+		if (!groupId) return;
+		await this.addSkipGroup(groupId);
+
+		try {
+			if (this.eventHandler?.groups?.[groupId]) {
+				const grp = this.eventHandler.groups[groupId];
+				if (!grp.botNotInGroup) grp.botNotInGroup = [];
+				if (!grp.botNotInGroup.includes(this.id)) {
+					grp.botNotInGroup.push(this.id);
+				}
+			}
+
+			if (this.database?.getGroup && this.database?.saveGroup) {
+				const group = await this.database.getGroup(groupId);
+				if (group) {
+					if (!group.botNotInGroup) group.botNotInGroup = [];
+					if (!group.botNotInGroup.includes(this.id)) {
+						group.botNotInGroup.push(this.id);
+						await this.database.saveGroup(group);
+						this.logger.info(`[${this.id}] Marcado botNotInGroup no banco para o grupo ${groupId}`);
+					}
+				}
+			}
+		} catch (error) {
+			this.logger.error(
+				`[${this.id}] Erro ao persistir markNotInGroup no banco para ${groupId}:`,
+				error
+			);
+		}
+	}
+
+	/**
+	 * Marca que este bot participa do grupo.
+	 * Remove da skip list persistente e atualiza group.botNotInGroup no banco.
+	 * @param {string} groupId
+	 */
+	async markInGroup(groupId) {
+		if (!groupId) return;
+		await this.removeSkipGroup(groupId);
+
+		try {
+			if (this.eventHandler?.groups?.[groupId]) {
+				const grp = this.eventHandler.groups[groupId];
+				if (grp.botNotInGroup && grp.botNotInGroup.includes(this.id)) {
+					grp.botNotInGroup = grp.botNotInGroup.filter((b) => b !== this.id);
+				}
+			}
+
+			if (this.database?.getGroup && this.database?.saveGroup) {
+				const group = await this.database.getGroup(groupId);
+				if (group && group.botNotInGroup && group.botNotInGroup.includes(this.id)) {
+					group.botNotInGroup = group.botNotInGroup.filter((b) => b !== this.id);
+					await this.database.saveGroup(group);
+					this.logger.info(`[${this.id}] Removido botNotInGroup no banco para o grupo ${groupId}`);
+				}
+			}
+		} catch (error) {
+			this.logger.error(
+				`[${this.id}] Erro ao persistir markInGroup no banco para ${groupId}:`,
+				error
+			);
+		}
+	}
+
 	async fetchPushNameFromCache(id) {
 		return await this.cacheManager.getPushnameFromCache(id);
 	}
 
 	async getContactDetails(id, prefetchedName, cacheDurationHours = 12) {
 		if (!id) return null;
+
+		if (id.endsWith("@g.us")) {
+			if (!this.isParticipating(id)) {
+				return {
+					id: { _serialized: id },
+					name: id,
+					isGroup: true,
+					notInGroup: true,
+					isParticipating: false,
+					participants: []
+				};
+			}
+			return await this.getChatDetails(id);
+		}
 
 		if (id === this.phoneNumber) {
 			return {
@@ -2789,12 +3875,20 @@ class WhatsAppBotGo {
 		const now = Date.now();
 		const expirationMs = cacheDurationHours * 60 * 60 * 1000;
 
-		const jidCom = `${id.split("@")[0]}@s.whatsapp.net`;
+		const isLid = id.endsWith("@lid");
+		const jidCom = isLid ? id : `${id.split("@")[0]}@s.whatsapp.net`;
+
+		if (this.userCache && !isLid) {
+			const cachedUser = this.userCache.get(id);
+			if (cachedUser) {
+				return cachedUser;
+			}
+		}
 
 		const returnData = {
 			id: { _serialized: id },
-			number: id.split("@")[0],
-			lid: id,
+			number: isLid ? null : id.split("@")[0],
+			lid: isLid ? id : null,
 			name: prefetchedName ?? id.split("@")[0],
 			block: async () => await this.setCttBlockStatus(id, "block"),
 			unblock: async () => await this.setCttBlockStatus(id, "unblock"),
@@ -2819,15 +3913,15 @@ class WhatsAppBotGo {
 		}
 
 		try {
-			if (!cacheName) {
-				// Não tem cache
+			if (!cacheName && !isLid) {
+				// Não tem cache e não é LID
 				let numberToFetch = id;
 				if (numberToFetch.includes("@")) {
 					numberToFetch = numberToFetch.split("@")[0] + "@s.whatsapp.net";
 				}
 				const infoResponse = await this.apiClient.post("/user/info", { number: [numberToFetch] });
 				const info = infoResponse.data?.Users?.[numberToFetch];
-				this.logger.debug(`[getContactDetails]`, { numberToFetch, userInfo: info.data ?? "" });
+				// this.logger.debug(`[getContactDetails]`, { numberToFetch, userInfo: info.data ?? "" });
 
 				if (info) {
 					returnData.name = info.VerifiedName ?? returnData.name;
@@ -2839,15 +3933,32 @@ class WhatsAppBotGo {
 				}
 			}
 		} catch (e) {
-			// Ignore
+			// Negative cache temporário (60s) para evitar bombardeio da API após falha/429
+			if (this.userCache) {
+				this.userCache.set(id, returnData, 60000);
+			}
 		}
 
 		//this.logger.debug(`[getChatDetails] ${id}, ${prefetchedName}`, { returnData });
+
+		if (this.userCache) {
+			this.userCache.set(id, returnData);
+			if (returnData.number && returnData.number !== id) {
+				this.userCache.set(returnData.number, returnData);
+			}
+		}
 
 		return returnData;
 	}
 
 	async sendReaction(chatId, messageId, reaction) {
+		if (chatId && chatId.includes("@g.us") && !this.isParticipating(chatId)) {
+			this.logger.warn(
+				`[${this.id}] Ignorando sendReaction para ${chatId}: bot não participa deste grupo.`
+			);
+			return false;
+		}
+
 		try {
 			await this.apiClient.post("/message/react", {
 				number: chatId,
@@ -2857,6 +3968,9 @@ class WhatsAppBotGo {
 			});
 			return true;
 		} catch (e) {
+			if (chatId && chatId.includes("@g.us") && isNotInGroupError(e)) {
+				await this.markNotInGroup(chatId);
+			}
 			this.logger.error(`[sendReaction] Error`, e);
 			return false;
 		}
@@ -2874,18 +3988,78 @@ class WhatsAppBotGo {
 		});
 	}
 
+	/**
+	 * Edita uma mensagem de texto enviada anteriormente pelo bot
+	 * @param {string} chat - JID do chat
+	 * @param {string} messageId - ID da mensagem a ser editada
+	 * @param {string} text - Novo conteúdo de texto da mensagem
+	 * @returns {Promise<any>}
+	 */
+	async editMessage(chat, messageId, text) {
+		const actualId =
+			typeof this.getActualMsgId === "function" ? this.getActualMsgId(messageId) : messageId;
+		this.logger.debug(`[editMessage] ${actualId} in ${chat}`);
+		return await this.apiClient.post("/message/edit", {
+			chat,
+			messageId: actualId,
+			message: text
+		});
+	}
+
+	/**
+	 * Verifica se um chat/grupo é o grupo de dossiês do bot
+	 * @param {string} groupId - ID do grupo a verificar
+	 * @returns {boolean}
+	 */
+	isDossieGroup(groupId) {
+		if (!this.dossieGroups || !groupId) return false;
+		const clean = (id) => String(id).split("@")[0].trim();
+		const targetClean = clean(groupId);
+		const groups = Array.isArray(this.dossieGroups)
+			? this.dossieGroups
+			: typeof this.dossieGroups === "string" && this.dossieGroups.includes(",")
+				? this.dossieGroups.split(",").map((g) => g.trim())
+				: [this.dossieGroups];
+		return groups.some(
+			(g) => clean(g) === targetClean || String(g).trim() === String(groupId).trim()
+		);
+	}
+
 	getLidFromPn(PN, chat) {
+		if (!PN) return "";
 		const participants = chat?.Participants || chat?.participants || [];
 
-		const found = participants.find((p) => {
-			const number = p.PhoneNumber || p.phoneNumber || p.id?._serialized || "";
-			return number.startsWith(PN);
-		});
+		// 1. Tenta achar nos participantes do chat usando PhoneUtils
+		const found = participants.find((p) => PhoneUtils.matchesParticipant(p, PN));
+		if (found) {
+			return found.LID || found.lid || found.phoneNumber || found.PhoneNumber || PN;
+		}
 
-		return found ? found.LID || found.lid || found.phoneNumber : PN;
+		// 2. Fallback: Se for o próprio bot e já temos this.myLid, retorna
+		if (this.myLid && PhoneUtils.isSamePhone(PN, this.phoneNumber)) {
+			return this.myLid;
+		}
+
+		// 3. Fallback no cache reverso lidToPnCache
+		if (this.lidToPnCache) {
+			const variants = PhoneUtils.getPhoneVariants(PN);
+			for (const variant of variants) {
+				for (const [lidKey, phoneVal] of this.lidToPnCache.entries()) {
+					if (PhoneUtils.cleanPhone(phoneVal) === variant) {
+						return lidKey;
+					}
+				}
+			}
+		}
+
+		return PN;
 	}
 
 	getPnFromLid(lid, chat) {
+		if (!lid) return "";
+		const strLid = String(lid);
+		const pure = strLid.split(/[@:]/)[0].replace(/\D/g, "");
+
 		// 1. Normalize the list: Get participants regardless of case
 		const participants = chat?.Participants || chat?.participants || [];
 
@@ -2894,21 +4068,71 @@ class WhatsAppBotGo {
 			(p) =>
 				// We check LID, JID (and their lowercase variants), or the serialized ID
 				// Using ?. prevents errors if a field doesn't exist
-				p.LID?.startsWith(lid) ||
-				p.lid?.startsWith(lid) ||
-				p.JID?.startsWith(lid) ||
-				p.jid?.startsWith(lid) ||
-				p.id?._serialized?.startsWith(lid)
+				p.LID?.startsWith(strLid) ||
+				p.lid?.startsWith(strLid) ||
+				p.JID?.startsWith(strLid) ||
+				p.jid?.startsWith(strLid) ||
+				p.id?._serialized?.startsWith(strLid) ||
+				(pure &&
+					((p.LID && String(p.LID).startsWith(pure)) ||
+						(p.lid && String(p.lid).startsWith(pure)) ||
+						(p.JID && String(p.JID).startsWith(pure)) ||
+						(p.id?._serialized && String(p.id._serialized).startsWith(pure))))
 		);
 
-		// 3. Return: The normalized PhoneNumber, or fallback to the input lid
-		return found ? found.PhoneNumber || found.phoneNumber : lid;
+		if (found) {
+			const res = found.PhoneNumber || found.phoneNumber;
+			if (res) return res;
+		}
+
+		// 3. Fallback to lidToPnCache
+		if (this.lidToPnCache) {
+			if (this.lidToPnCache.has(strLid)) return this.lidToPnCache.get(strLid);
+			if (pure && this.lidToPnCache.has(pure)) return this.lidToPnCache.get(pure);
+			if (pure && this.lidToPnCache.has(`${pure}@lid`)) return this.lidToPnCache.get(`${pure}@lid`);
+		}
+
+		// 4. Return: The normalized PhoneNumber, or fallback to the input lid
+		return lid;
 	}
 
 	notInWhitelist(author) {
-		// author is expected to be a JID string
-		const cleanAuthor = author.replace(/\D/g, ""); // Cleans non-digits from JID user part
-		return !this.whitelist.includes(cleanAuthor);
+		if (!author && author !== 0) return true;
+		let cleanAuthor = PhoneUtils.cleanPhone(author);
+		if (!cleanAuthor) return true;
+
+		// Se o ID for um LID, tenta resolver para PhoneNumber
+		if (String(author).includes("@lid") || (cleanAuthor.length > 13 && this.lidToPnCache)) {
+			const resolved =
+				this.lidToPnCache?.get(cleanAuthor) ||
+				this.lidToPnCache?.get(`${cleanAuthor}@lid`) ||
+				(typeof this.getPnFromLid === "function" ? this.getPnFromLid(author) : null);
+			if (resolved) {
+				const cleanResolved = PhoneUtils.cleanPhone(resolved);
+				if (cleanResolved) cleanAuthor = cleanResolved;
+			}
+		}
+
+		// 1. Checa variantes no array em memória this.whitelist
+		const variants = PhoneUtils.getPhoneVariants(cleanAuthor);
+		const inWhitelist = variants.some((v) => this.whitelist.includes(v));
+		if (inWhitelist) return false;
+
+		// 2. Fallback dinâmico: verifica se consta como doador no banco de dados
+		try {
+			const database = this.database || Database.getInstance();
+			const donor = database?.getDonorByNumberSync?.(cleanAuthor);
+			if (donor) {
+				variants.forEach((v) => {
+					if (!this.whitelist.includes(v)) this.whitelist.push(v);
+				});
+				return false;
+			}
+		} catch (err) {
+			// Não bloqueia em caso de erro na consulta
+		}
+
+		return true;
 	}
 
 	validURL(str) {
@@ -2949,45 +4173,148 @@ class WhatsAppBotGo {
 	}
 
 	async updateProfilePicture(picture) {
-		this.logger.debug(`[updateProfilePicture][${this.instanceName}]`, {
-			type: "url",
-			url: picture.url
-		});
-		try {
-			// Try with URL first
-			return await this.apiClient.post(`/user/photo`, {
-				image: picture.url
-			});
-		} catch (error) {
-			// Fallback to base64 if URL fails
-			if (picture.data && picture.mimetype) {
-				this.logger.warn(`[updateProfilePicture] via URL failed, retrying with base64...`);
-				const imageData = `data:${picture.mimetype};base64,${picture.data}`;
-				return await this.apiClient.post(`/user/photo`, {
-					image: imageData
-				});
+		let imageData = null;
+
+		if (typeof picture === "string") {
+			imageData = picture.trim();
+			try {
+				if (fs.existsSync(imageData)) {
+					const ext = path.extname(imageData).toLowerCase();
+					const mimeType = ext === ".png" ? "image/png" : "image/jpeg";
+					const base64 = fs.readFileSync(imageData).toString("base64");
+					imageData = `data:${mimeType};base64,${base64}`;
+				}
+			} catch (e) {}
+		} else if (picture && typeof picture === "object") {
+			if (picture.data) {
+				const mimeType = picture.mimetype || "image/jpeg";
+				imageData = picture.data.startsWith("data:")
+					? picture.data
+					: `data:${mimeType};base64,${picture.data}`;
+			} else if (picture.base64) {
+				const mimeType = picture.mimetype || "image/jpeg";
+				imageData = `data:${mimeType};base64,${picture.base64}`;
+			} else if (typeof picture.downloadMedia === "function") {
+				const downloaded = await picture.downloadMedia();
+				if (downloaded && downloaded.data) {
+					const mimeType = downloaded.mimetype || "image/jpeg";
+					imageData = `data:${mimeType};base64,${downloaded.data}`;
+				}
+			} else if (picture.url) {
+				imageData = picture.url;
 			}
-			throw error;
 		}
+
+		if (!imageData) {
+			throw new Error("Dados de imagem inválidos para alteração de foto de perfil");
+		}
+
+		this.logger.debug(`[updateProfilePicture][${this.instanceName}] Enviando foto para API`);
+		return await this.apiClient.post(`/user/photo`, {
+			image: imageData
+		});
+	}
+
+	async setProfilePicture(picture) {
+		return await this.updateProfilePicture(picture);
+	}
+
+	async setGroupPhoto(groupJid, picture) {
+		let imageData = null;
+
+		if (typeof picture === "string") {
+			imageData = picture.trim();
+			try {
+				if (fs.existsSync(imageData)) {
+					const ext = path.extname(imageData).toLowerCase();
+					const mimeType = ext === ".png" ? "image/png" : "image/jpeg";
+					const base64 = fs.readFileSync(imageData).toString("base64");
+					imageData = `data:${mimeType};base64,${base64}`;
+				}
+			} catch (e) {}
+		} else if (Buffer.isBuffer(picture)) {
+			imageData = `data:image/jpeg;base64,${picture.toString("base64")}`;
+		} else if (picture && typeof picture === "object") {
+			if (picture.data) {
+				const mimeType = picture.mimetype || "image/jpeg";
+				imageData = picture.data.startsWith("data:")
+					? picture.data
+					: `data:${mimeType};base64,${picture.data}`;
+			} else if (picture.base64) {
+				const mimeType = picture.mimetype || "image/jpeg";
+				imageData = `data:${mimeType};base64,${picture.base64}`;
+			} else if (typeof picture.downloadMedia === "function") {
+				const downloaded = await picture.downloadMedia();
+				if (downloaded && downloaded.data) {
+					const mimeType = downloaded.mimetype || "image/jpeg";
+					imageData = `data:${mimeType};base64,${downloaded.data}`;
+				}
+			} else if (picture.url) {
+				imageData = picture.url;
+			}
+		}
+
+		if (!imageData) {
+			throw new Error("Dados de imagem inválidos para alteração de foto de grupo");
+		}
+
+		let jid = groupJid;
+		if (typeof jid === "object" && jid !== null) {
+			jid = jid._serialized || jid.id?._serialized || jid.id || "";
+		}
+		jid = String(jid || "").trim();
+		if (!jid.includes("@")) {
+			jid = `${jid}@g.us`;
+		}
+
+		this.logger.debug(`[setGroupPhoto][${this.instanceName}] Enviando foto para grupo ${jid}`);
+		return await this.apiClient.post(`/group/photo`, {
+			groupJid: jid,
+			image: imageData
+		});
 	}
 
 	async getProfilePictureUrl(number, preview = false) {
 		try {
+			if (!number) return null;
+
 			let jid = number;
-			if (!jid.includes("@")) {
-				jid = `${jid}@s.whatsapp.net`;
+			if (typeof jid === "object" && jid !== null) {
+				jid = jid._serialized || jid.id?._serialized || jid.id || jid.user || "";
 			}
+			if (typeof jid !== "string") {
+				jid = String(jid || "");
+			}
+			jid = jid.trim();
+			if (!jid) return null;
+
+			if (jid.endsWith("@c.us")) {
+				jid = jid.replace("@c.us", "@s.whatsapp.net");
+			}
+
+			if (!jid.includes("@")) {
+				if (jid.startsWith("3") && jid.length >= 14) {
+					jid = `${jid}@lid`;
+				} else {
+					jid = `${jid}@s.whatsapp.net`;
+				}
+			}
+
 			const response = await this.apiClient.post("/user/avatar", {
 				number: jid,
 				preview
 			});
-			if (response?.data?.data?.url) {
-				return response.data.data.url;
+
+			if (response?.data?.url) {
+				return response.data.url;
+			}
+			if (response?.url) {
+				return response.url;
 			}
 		} catch (error) {
 			this.logger.error(
 				`[getProfilePictureUrl] Erro ao buscar foto de perfil para ${number}:`,
-				error.message
+				error.message || error
 			);
 		}
 		return null;
@@ -3028,6 +4355,8 @@ class WhatsAppBotGo {
 	}
 
 	async destroy() {
+		ProfileStatusScheduler.getInstance().unregisterBot(this);
+		if (this.versionUpdateInterval) clearInterval(this.versionUpdateInterval);
 		if (this.webhookServer) this.webhookServer.close();
 		if (this.loadReport) this.loadReport.destroy();
 	}

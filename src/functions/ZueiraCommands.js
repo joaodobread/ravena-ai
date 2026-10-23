@@ -1,3 +1,4 @@
+const fs = require("fs");
 const { createCanvas, loadImage } = require("canvas");
 const path = require("path");
 const Logger = require("../utils/Logger");
@@ -47,14 +48,38 @@ const gerarCpf = () => {
 	return `${base.substring(0, 3)}.${base.substring(3, 6)}.${base.substring(6, 9)}-${dig1}${dig2}`;
 };
 
+function getNowBrasilia() {
+	const now = new Date();
+	const timeZone = process.env.TZ || "America/Sao_Paulo";
+	const dtf = new Intl.DateTimeFormat("en-US", {
+		timeZone,
+		year: "numeric",
+		month: "2-digit",
+		day: "2-digit",
+		hour: "2-digit",
+		minute: "2-digit",
+		second: "2-digit",
+		hourCycle: "h23"
+	});
+	const parts = dtf.formatToParts(now);
+	const map = {};
+	for (const p of parts) {
+		map[p.type] = p.value;
+	}
+	return {
+		hour: parseInt(map.hour, 10),
+		hourStr: map.hour,
+		minuteStr: map.minute,
+		secondStr: map.second,
+		dayStr: map.day,
+		monthStr: map.month,
+		yearStr: map.year
+	};
+}
+
 const gerarDataHoraAtual = () => {
-	const agora = new Date();
-	const dia = String(agora.getDate()).padStart(2, "0");
-	const mes = String(agora.getMonth() + 1).padStart(2, "0"); // Meses são 0-indexados
-	const ano = agora.getFullYear();
-	const horas = String(agora.getHours()).padStart(2, "0");
-	const minutos = String(agora.getMinutes()).padStart(2, "0");
-	return `${dia}/${mes}/${ano} às ${horas}:${minutos}`;
+	const b = getNowBrasilia();
+	return `${b.dayStr}/${b.monthStr}/${b.yearStr} às ${b.hourStr}:${b.minuteStr}`;
 };
 
 async function gerarTicket(dados) {
@@ -313,6 +338,70 @@ async function presente(bot, message, args, group) {
 	return resposta;
 }
 
+function getSaudacao(hora) {
+	if (hora >= 5 && hora < 12) {
+		return "Tenha um bom dia! ☀️";
+	} else if (hora >= 12 && hora < 18) {
+		return "Tenha uma boa tarde! ☀️";
+	} else if (hora >= 18 && hora < 24) {
+		return "Tenha uma boa noite! 🌙";
+	} else {
+		return "Tenha uma boa madrugada! 🌙";
+	}
+}
+
+async function horaDataCommand(bot, message, args, group) {
+	const chatId = message.group ?? message.author;
+	const { hour, hourStr } = getNowBrasilia();
+	const saudacao = getSaudacao(hour);
+
+	const template = `🕰️ Agora são aproximadamente exatos 🕒 {data-hora}:{data-minuto} do dia {data-dia}/{data-mes}/{data-ano} 🗓\n${saudacao}`;
+
+	const options = {};
+	const textoFinal = await variableProcessor.process(template, {
+		message,
+		group,
+		options,
+		bot
+	});
+
+	const retorno = [
+		new ReturnMessage({
+			chatId,
+			content: textoFinal,
+			options: {
+				quotedMessageId: message.origin?.id?._serialized,
+				goReply: message.origin,
+				...options
+			}
+		})
+	];
+
+	const audioPath = path.join(database.databasePath, "assets", `horacerta_${hourStr}.mp3`);
+
+	if (fs.existsSync(audioPath) && bot && typeof bot.createMedia === "function") {
+		try {
+			const media = await bot.createMedia(audioPath, "audio/mp3");
+			if (media) {
+				retorno.push(
+					new ReturnMessage({
+						chatId,
+						content: media,
+						options: {
+							quotedMessageId: message.origin?.id?._serialized,
+							goReply: message.origin
+						}
+					})
+				);
+			}
+		} catch (err) {
+			logger.error(`Erro ao carregar áudio de hora certa (${audioPath}):`, err);
+		}
+	}
+
+	return retorno;
+}
+
 // Criar array de comandos usando a classe Command
 const commands = [
 	new Command({
@@ -437,7 +526,86 @@ const commands = [
 		},
 		method: async (bot, message, args, group) =>
 			await handleComandoVariavelSimples(bot, message, args, group, "genshin")
+	}),
+	new Command({
+		name: "hora",
+		aliases: ["data"],
+		description: "Informa a data e hora atual com precisão aproximada",
+		category: "zoeira",
+		reactions: {
+			after: "🕒"
+		},
+		method: horaDataCommand
+	}),
+	new Command({
+		name: "data",
+		category: "zoeira",
+		hidden: true,
+		reactions: {
+			after: "🗓"
+		},
+		method: horaDataCommand
 	})
 ];
 
-module.exports = { commands };
+const helper = {
+	about: "Comandos de humor, zoeira e brincadeiras sociais para animar o grupo",
+	implementation:
+		"Sorteia membros do grupo e processa variáveis customizadas para piadas, PIX fictício, clonagem de cartão e aniversário",
+	tags: "zoeira,humor,brincadeiras,memes,pix,aniversario,boleto,violencia,hora,data",
+	cmds: [
+		{
+			cmd: "!violencia",
+			desc: "Pratica um ato cômico de violência contra outro membro",
+			usage: ["!violencia @fulano"],
+			category: "zoeira"
+		},
+		{
+			cmd: "!morreu",
+			desc: "Envia meme de anúncio fúnebre zoeiro",
+			usage: ["!morreu @fulano"],
+			category: "zoeira"
+		},
+		{
+			cmd: "!boleto",
+			desc: "Escolhe um membro do grupo aleatoriamente para pagar um boleto",
+			usage: ["!boleto"],
+			category: "zoeira"
+		},
+		{
+			cmd: "!clonarcartao",
+			desc: "Simula uma clonagem de cartão para pagar o agiota",
+			usage: ["!clonarcartao @fulano"],
+			category: "zoeira"
+		},
+		{
+			cmd: "!presente",
+			desc: "Envia um presente zoeiro da internet para alguém",
+			usage: ["!presente @fulano"],
+			category: "zoeira"
+		},
+		{
+			cmd: "!pix",
+			desc: "Simula uma transferência fictícia pelo Ravenabank",
+			usage: ["!pix 1000 @fulano"],
+			category: "zoeira"
+		},
+		{
+			cmd: "!aniversario",
+			desc: "Parabeniza um aniversariante do grupo em grande estilo",
+			usage: ["!aniversario @fulano"],
+			category: "zoeira"
+		},
+		{
+			cmd: "!hora",
+			desc: "Informa a hora e a data atual com precisão aproximada",
+			usage: ["!hora", "!data"],
+			category: "zoeira"
+		}
+	]
+};
+
+module.exports = {
+	helper,
+	commands
+};

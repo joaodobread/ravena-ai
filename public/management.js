@@ -6,15 +6,57 @@ document.addEventListener('DOMContentLoaded', () => {
     let groupData = null;
     let originalGroupData = null;
     let customCommands = [];
+    let schedules = [];
     let groupId = null;
+    let tokenData = null;
     let expiresAt = null;
     let isDirty = false;
     let currentStream = null; // { platform, index, data }
-    let pickerMode = 'variable'; // 'variable' or 'language'
+    let pickerMode = 'variable'; // 'variable', 'language', 'start-emoji', 'emoji'
     let lastFocusedInput = null;
+    let currentCmdMentions = [];
+    let currentEditingCmd = null;
+    let activeEmojiTarget = 'cmd-emoji'; // 'cmd-emoji' or 'cmd-start-emoji'
 
     // Constants
     const API_BASE = '/api';
+
+    const TRUSTED_DOMAINS = [
+        "youtube.com",
+        "youtu.be",
+        "google.com",
+        "google.com.br",
+        "goo.gl",
+        "olx.com.br",
+        "mercadolivre.com.br",
+        "mercadolivre.com",
+        "mercadopago.com.br",
+        "mercadopago.com",
+        "facebook.com",
+        "fb.watch",
+        "fb.me",
+        "instagram.com",
+        "x.com",
+        "twitter.com",
+        "t.co",
+        "tiktok.com",
+        "vm.tiktok.com",
+        "amazon.com.br",
+        "amazon.com",
+        "amzn.to",
+        "shopee.com.br",
+        "shopee.com",
+        "pinterest.com",
+        "pin.it",
+        "reddit.com",
+        "redd.it",
+        "linkedin.com",
+        "lnkd.in",
+        "github.com",
+        "twitch.tv",
+        "spotify.com",
+        "spoti.fi"
+    ];
 
     const AVAILABLE_LANGUAGES = [
         { code: 'English (EN)', desc: 'Inglês' },
@@ -82,32 +124,17 @@ document.addEventListener('DOMContentLoaded', () => {
         '👈', '👉', '👆', '🖕', '👇', '☝️', '👍', '👎', '✊', '👊', '🤛', '🤜', '👏',
         '🙌', '👐', '🤲', '🤝', '🙏', '✍️', '💅', '🤳', '💪', '🦾', '🦵', '🦶', '👂',
         '🦻', '👃', '🧠', '🫀', '🫁', '🦷', '🦴', '👀', '👁', '👅', '👄', '🫦', '👶',
-        '🧒', '👦', '👧', '🧑', '👱', '👨', '🧔', '👨‍🦰', '👨‍🦱', '👨‍🦳', '👨‍🦲', '👩', '👩‍🦰',
-        '🧑‍🦰', '👩‍🦱', '🧑‍🦱', '👩‍🦳', '🧑‍🦳', '👩‍🦲', '🧑‍🦲', '👱‍♀️', '👱‍♂️', '🧓', '👴', '👵',
-        '❤️', '🧡', '💛', '💚', '💙', '💜', '🖤', '🤍', '🤎', '💔', '❤️‍🔥', '❤️‍🩹', '❣️',
-        '💕', '💞', '💓', '💗', '💖', '💘', '💝', '💟', '☮️', '✝️', '☪️', '🕉', '☸️',
-        '✡️', '🔯', '🕎', '☯️', '☦️', '🛐', '⛎', '♈️', '♉️', '♊️', '♋️', '♋️', '♌️', '♍️',
-        '♎️', '♏️', '♐️', '♑️', '♒️', '♓️', '🆔', '⚛️', '🉑', '☢️', '☣️', '📴', '📳',
-        '🈶', '🈚️', '🈸', '🈺', '🈷️', '✴️', '🆚', '💮', '🉐', '㊙️', '㊗️', '🈴', '🈵',
-        '🈹', '🈲', '🅰️', '🅱️', '🆎', '🆑', '🅾️', '🆘', '❌', '⭕️', '🛑', '⛔️', '📛',
-        '🚫', '💯', '💢', '♨️', '🚷', '🚯', '🚳', '🚱', '🔞', '📵', '🚭', '❗️', '❕',
-        '❓', '❔', '‼️', '⁉️', '🔅', '🔆', '〽️', '⚠️', '🚸', '🔱', '⚜️', '🔰', '♻️',
-        '✅', '🈯️', '💹', '❇️', '✳️', '❎', '🌐', '💠', 'Ⓜ️', '🌀', '💤', '🏧', '🚾',
-        '♿️', '🅿️', '🈳', '🈂️', '🛂', '🛃', '🛄', '🛅', '🚹', '🚺', '🚼', '⚧', '🚻',
-        '🚮', '🎦', '📶', '🈁', '🔣', 'ℹ️', '🔤', '🔡', '🔠', '🆖', '🆗', '🆙', '🆒',
-        '🆕', '🆓', '0️⃣', '1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣', '6️⃣', '7️⃣', '8️⃣', '9️⃣',
-        '🔟', '🔢', '#️⃣', '*️⃣', '⏏️', '▶️', '⏸', '⏯', '⏹', '⏺', '⏭', '⏮', '⏩',
-        '⏪', '⏫', '⏬', '◀️', '🔼', '🔽', '➡️', '⬅️', '⬆️', '⬇️', '↗️', '↘️', '↙️',
-        '↖️', '↕️', '↔️', '↪️', '↩️', '⤴️', '⤵️', '🔀', '🔁', '🔂', '🔄', '🔃', '🎵',
-        '🎶', '➕', '➖', '➗', '✖️', '♾', '💲', '💱', '™️', '©️', '®️', '👁‍🗨', '🔚',
-        '🔙', '🔛', '🔝', '🔜', '〰️', '➰', '➿', '✔️', '☑️', '🔘', '🔴', '🟠', '🟡',
-        '🟢', '🔵', '🟣', '⚫', '⚪', '🟤', '🔺', '🔻', '🔸', '🔹', '🔶', '🔷', '🔳',
-        '🔲', '▪️', '▫️', '◾️', '◽️', '◼️', '◻️', '🟥', '🟧', '🟨', '🟩', '🟦', '🟪',
-        '⬛', '⬜', '🟫', '🔈', '🔇', '🔉', '🔊', '🔔', '🔕', '📣', '📢', '👁‍🗨', '💬',
-        '💭', '🗯', '♠️', '♣️', '♥️', '♦️', '🃏', '🎴', '🀄️', '🕐', '🕑', '🕒', '🕓',
-        '🕔', '🕕', '🕖', '🕗', '🕘', '🕙', '🕚', '🕛', '🕜', '🕝', '🕞', '🕟', '🕠',
-        '🕡', '🕢', '🕣', '🕤', '🕥', '🕦', '🕧'
+        '❤️', '🧡', '💛', '💚', '💙', '💜', '🖤', '🤍', '🤎', '💔', '🔥', '✨', '⭐',
+        '⏳', '⌛', '⏰', '🚀', '🎯', '🎉', '🎊', '🎁', '🔔', '📢', '💬', '👀', '💯'
     ];
+
+    const DEFAULT_MSG = {
+        twitch: "⚠️ ATENÇÃO!⚠️\n\n🌟 *{canal}* está online jogando {jogo}!\nAssista: {link}",
+        kick: "⚠️ ATENÇÃO!⚠️\n\n🌟 *{canal}* iniciou stream na Kick!\nAssista: {link}",
+        youtube: "🎬 Novo vídeo no canal *{author}*!\nAssista agora: {link}",
+        youtube_video: "🎬 Novo vídeo no canal *{author}*!\n*{title}*\nAssista agora: {link}",
+        youtube_live: "🔴 *{canal}* está AO VIVO no YouTube!\n*{titulo}*\nAssista: {link}"
+    };
 
     // UI Elements
     const els = {
@@ -122,6 +149,12 @@ document.addEventListener('DOMContentLoaded', () => {
         accordions: document.querySelectorAll('.accordion-item'),
         subAccordions: document.querySelectorAll('.sub-accordion'),
         
+        // Hero Status
+        heroPauseCard: document.getElementById('hero-pause-card'),
+        groupPausedToggle: document.getElementById('group-paused-toggle'),
+        heroStatusPill: document.getElementById('hero-status-pill'),
+        heroStatusDesc: document.getElementById('hero-status-desc'),
+
         // Modals
         cmdModal: document.getElementById('command-modal'),
         streamModal: document.getElementById('stream-modal'),
@@ -130,9 +163,25 @@ document.addEventListener('DOMContentLoaded', () => {
         emojiModal: document.getElementById('emoji-modal'),
         customDialogModal: document.getElementById('custom-dialog-modal'),
         memberModal: document.getElementById('member-modal'),
+        webhookModal: document.getElementById('webhook-modal'),
+        scheduleModal: document.getElementById('schedule-modal'),
         
-        closeModalBtns: document.querySelectorAll('.close-modal, .close-modal-btn, .close-stream-modal, .close-variable-modal, .close-emoji-modal, .close-dialog, .close-member-modal'),
+        closeModalBtns: document.querySelectorAll('.close-modal, .close-modal-btn, .close-stream-modal, .close-variable-modal, .close-emoji-modal, .close-dialog, .close-member-modal, .close-webhook-modal, .close-schedule-modal'),
         closeUploadBtns: document.querySelectorAll('.close-upload'),
+
+        // Schedules
+        btnAddSchedule: document.getElementById('btn-add-schedule'),
+        btnSaveScheduleConfirm: document.getElementById('btn-save-schedule-confirm'),
+        schedulesOnetimeContainer: document.getElementById('schedules-onetime-container'),
+        noSchedulesOnetimeMsg: document.getElementById('no-schedules-onetime-msg'),
+        schedulesWeeklyContainer: document.getElementById('schedules-weekly-container'),
+        noSchedulesWeeklyMsg: document.getElementById('no-schedules-weekly-msg'),
+        scheduleModalTitle: document.getElementById('schedule-modal-title'),
+        scheduleEditId: document.getElementById('schedule-edit-id'),
+        scheduleTipo: document.getElementById('schedule-tipo'),
+        scheduleHora: document.getElementById('schedule-hora'),
+        scheduleDia: document.getElementById('schedule-dia'),
+        scheduleFrase: document.getElementById('schedule-frase'),
         
         // Sticky Footer
         stickySaveBar: document.getElementById('sticky-save-bar'),
@@ -148,8 +197,14 @@ document.addEventListener('DOMContentLoaded', () => {
         cmdReplyQuote: document.getElementById('cmd-reply-quote'),
         cmdSendAll: document.getElementById('cmd-send-all'),
         cmdAdminOnly: document.getElementById('cmd-admin-only'),
+        cmdReplyPrivate: document.getElementById('cmd-reply-private'),
         cmdEmoji: document.getElementById('cmd-emoji'),
+        btnEmojiPicker: document.getElementById('btn-emoji-picker'),
+        cmdStartEmoji: document.getElementById('cmd-start-emoji'),
+        btnStartEmojiPicker: document.getElementById('btn-start-emoji-picker'),
         cmdCooldown: document.getElementById('cmd-cooldown'),
+        cmdTimeStart: document.getElementById('cmd-time-start'),
+        cmdTimeEnd: document.getElementById('cmd-time-end'),
         cmdResponsesList: document.getElementById('cmd-responses-list'),
         btnSaveCmd: document.getElementById('btn-save-cmd'),
         btnDeleteCmd: document.getElementById('btn-delete-cmd'),
@@ -157,7 +212,12 @@ document.addEventListener('DOMContentLoaded', () => {
         modalTitle: document.getElementById('modal-title'),
         btnAddTag: document.getElementById('btn-add-tag'),
         cmdTagsList: document.getElementById('cmd-tags-list'),
-        cmdTagsHelper: document.getElementById('cmd-tags-helper'),
+
+        // Command Simulator
+        cmdWaBubble: document.getElementById('cmd-wa-bubble'),
+        cmdWaMedia: document.getElementById('cmd-wa-media'),
+        cmdWaText: document.getElementById('cmd-wa-text'),
+        cmdWaTime: document.getElementById('cmd-wa-time'),
 
         // Member Modal
         memberModalTitle: document.getElementById('member-modal-title'),
@@ -169,7 +229,9 @@ document.addEventListener('DOMContentLoaded', () => {
         streamChannel: document.getElementById('stream-channel'),
         streamMention: document.getElementById('stream-mention'),
         streamChangeTitle: document.getElementById('stream-change-title'),
+        streamChangePhoto: document.getElementById('stream-change-photo'),
         streamAI: document.getElementById('stream-ai'),
+        streamUseThumbnail: document.getElementById('stream-use-thumbnail'),
         streamTitlesGroup: document.getElementById('stream-titles-group'),
         streamTitleOn: document.getElementById('stream-title-on'),
         streamTitleOff: document.getElementById('stream-title-off'),
@@ -178,18 +240,8 @@ document.addEventListener('DOMContentLoaded', () => {
         btnSaveStream: document.getElementById('btn-save-stream'),
         btnDeleteStream: document.getElementById('btn-delete-stream'),
         streamHint: document.getElementById('stream-hint'),
-
-        // Stream Photos
-        streamChangePhoto: document.getElementById('stream-change-photo'),
-        streamPhotosGroup: document.getElementById('stream-photos-group'),
-        streamPhotoOnDisplay: document.getElementById('stream-photo-on-display'),
-        streamPhotoOffDisplay: document.getElementById('stream-photo-off-display'),
-        btnViewPhotoOn: document.getElementById('btn-view-photo-on'),
-        btnViewPhotoOff: document.getElementById('btn-view-photo-off'),
-        btnUploadPhotoOn: document.getElementById('btn-upload-photo-on'),
-        btnUploadPhotoOff: document.getElementById('btn-upload-photo-off'),
-        btnRemovePhotoOn: document.getElementById('btn-remove-photo-on'),
-        btnRemovePhotoOff: document.getElementById('btn-remove-photo-off'),
+        streamWaThumbnail: document.getElementById('stream-wa-thumbnail'),
+        streamWaText: document.getElementById('stream-wa-text'),
 
         // Upload Form
         mediaFileInput: document.getElementById('media-file-input'),
@@ -208,7 +260,24 @@ document.addEventListener('DOMContentLoaded', () => {
         dialogInput: document.getElementById('dialog-input'),
         dialogBtnCancel: document.getElementById('dialog-btn-cancel'),
         dialogBtnOk: document.getElementById('dialog-btn-ok'),
-        dossiesHistoryList: document.getElementById('dossies-history-list')
+        dossiesHistoryList: document.getElementById('dossies-history-list'),
+
+        // Warnings & Webhooks
+        warningsTableBody: document.getElementById('warnings-table-body'),
+        noWarningsMsg: document.getElementById('no-warnings-msg'),
+        btnClearAllWarnings: document.getElementById('btn-clear-all-warnings'),
+        webhooksEndpointUrl: document.getElementById('webhooks-endpoint-url'),
+        btnCopyWebhookUrl: document.getElementById('btn-copy-webhook-url'),
+        webhooksTableBody: document.getElementById('webhooks-table-body'),
+        noWebhooksMsg: document.getElementById('no-webhooks-msg'),
+        btnAddWebhook: document.getElementById('btn-add-webhook'),
+        btnSaveWebhookConfirm: document.getElementById('btn-save-webhook-confirm'),
+
+        // Backups
+        btnExportCmdsZip: document.getElementById('btn-export-cmds-zip'),
+        fileImportCmdsZip: document.getElementById('file-import-cmds-zip'),
+        btnExportConfigJson: document.getElementById('btn-export-config-json'),
+        fileImportConfigJson: document.getElementById('file-import-config-json')
     };
 
     // --- Custom Dialogs ---
@@ -248,111 +317,115 @@ document.addEventListener('DOMContentLoaded', () => {
                 cleanup();
                 resolve(true);
             };
-            
+
             const handleCancel = () => {
                 els.customDialogModal.classList.add('hidden');
                 cleanup();
                 resolve(false);
             };
 
-            const cleanup = () => {
+            function cleanup() {
                 els.dialogBtnOk.removeEventListener('click', handleOk);
                 els.dialogBtnCancel.removeEventListener('click', handleCancel);
-            };
-            
+            }
+
             els.dialogBtnOk.onclick = handleOk;
             els.dialogBtnCancel.onclick = handleCancel;
         });
     }
 
-    function showCustomPrompt(message, defaultValue = '', title = 'Entrada') {
+    function showCustomPrompt(message, defaultValue = '', title = 'Entrada de Texto') {
         return new Promise((resolve) => {
             els.dialogTitle.textContent = title;
-            els.dialogMessage.textContent = message;
+            els.dialogMessage.innerHTML = message;
             els.dialogInput.value = defaultValue;
             els.dialogInput.classList.remove('hidden');
             els.dialogBtnCancel.classList.remove('hidden');
-            els.dialogBtnOk.textContent = 'OK';
+            els.dialogBtnOk.textContent = 'Salvar';
             
             els.customDialogModal.classList.remove('hidden');
             els.dialogInput.focus();
-            
+
             const handleOk = () => {
                 const val = els.dialogInput.value;
                 els.customDialogModal.classList.add('hidden');
                 cleanup();
                 resolve(val);
             };
-            
+
             const handleCancel = () => {
                 els.customDialogModal.classList.add('hidden');
                 cleanup();
                 resolve(null);
             };
 
-            const cleanup = () => {
+            function cleanup() {
                 els.dialogBtnOk.removeEventListener('click', handleOk);
                 els.dialogBtnCancel.removeEventListener('click', handleCancel);
-            };
-            
+            }
+
             els.dialogBtnOk.onclick = handleOk;
             els.dialogBtnCancel.onclick = handleCancel;
         });
     }
 
-    // --- Initialization ---
+    // --- Init & Data Loading ---
 
     async function init() {
+        if (!token) {
+            showError('Token de acesso não fornecido na URL.');
+            return;
+        }
+
         try {
             const validation = await fetch(`${API_BASE}/validate-token?token=${token}`).then(r => r.json());
-            
             if (!validation.valid) {
-                showError(validation.message || 'Sessão inválida ou expirada');
+                showError('Token inválido ou expirado. Por favor, gere um novo link usando !g-painel.');
                 return;
             }
 
+            tokenData = validation;
             groupId = validation.groupId;
-            els.userName.textContent = validation.authorName;
-            els.groupName.textContent = (validation.groupName || '').trim();
             expiresAt = new Date(validation.expiresAt);
-            startTimer();
-
-            await loadData();
             
+            els.userName.textContent = validation.requestNumber || 'Admin';
+            startTimer();
+            await loadData();
+            setupEventListeners();
+            loadDossierHistory();
+
             els.loading.classList.add('hidden');
             els.dashboard.classList.remove('hidden');
 
-            setupEventListeners();
-            setupDirtyTracking();
-
-        } catch (e) {
-            console.error(e);
-            showError('Erro de conexão ao inicializar');
+        } catch (err) {
+            showError('Erro de conexão ao validar sessão: ' + err.message);
         }
     }
 
     async function loadData() {
         try {
             const resGroup = await fetch(`${API_BASE}/group?id=${groupId}&token=${token}`);
-            if (!resGroup.ok) throw new Error('Falha ao carregar grupo');
+            if (!resGroup.ok) throw new Error('Não foi possível carregar dados do grupo.');
             groupData = await resGroup.json();
-            originalGroupData = JSON.parse(JSON.stringify(groupData)); 
-            
+            if (!groupData.greetingAccumulation) {
+                groupData.greetingAccumulation = { enabled: false, intervalMinutes: 30 };
+            }
+            originalGroupData = JSON.parse(JSON.stringify(groupData));
+
             const resCmds = await fetch(`${API_BASE}/custom-commands/${groupId}?token=${token}`);
             if (resCmds.ok) {
                 customCommands = await resCmds.json();
-            } else {
-                console.warn('Falha ao carregar comandos personalizados');
-                customCommands = [];
             }
 
+            els.groupName.textContent = groupData.name || 'Sem nome';
             populateFields();
             renderCommandsTable();
-            loadDossierHistory();
-            setDirty(false);
+            renderWarnings();
+            renderWebhooks();
+            await loadSchedules();
+            setupDirtyTracking();
 
         } catch (e) {
-            console.error(e);
             showError('Erro ao carregar dados: ' + e.message);
         }
     }
@@ -365,25 +438,30 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function startTimer() {
-        setInterval(() => {
+        const update = () => {
             const now = new Date();
             const diff = expiresAt - now;
             if (diff <= 0) {
                 els.expirationTime.textContent = 'Expirado';
-                window.location.reload();
-            } else {
-                const min = Math.floor(diff / 60000);
-                const sec = Math.floor((diff % 60000) / 1000);
-                els.expirationTime.textContent = `${min}:${sec.toString().padStart(2, '0')}`;
+                clearInterval(interval);
+                showCustomAlert('Sua sessão expirou. O painel será recarregado.', 'Sessão Expirada').then(() => {
+                    window.location.reload();
+                });
+                return;
             }
-        }, 1000);
+            const mins = Math.floor(diff / 60000);
+            const secs = Math.floor((diff % 60000) / 1000);
+            els.expirationTime.textContent = `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+        };
+        update();
+        const interval = setInterval(update, 1000);
     }
 
-    // --- Dirty State & Save Logic ---
+    // --- Dirty State & Global Save ---
 
     function setDirty(state) {
         isDirty = state;
-        if (isDirty) {
+        if (state) {
             els.stickySaveBar.classList.remove('hidden');
         } else {
             els.stickySaveBar.classList.add('hidden');
@@ -392,85 +470,83 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function calculateChanges(original, current) {
         const changes = {};
-        
-        const isDifferent = (a, b) => {
-            if (Array.isArray(a) && Array.isArray(b)) {
-                return JSON.stringify(a) !== JSON.stringify(b);
-            }
-            if (typeof a === 'object' && a !== null && typeof b === 'object' && b !== null) {
-                return JSON.stringify(a) !== JSON.stringify(b);
-            }
-            return a !== b;
-        };
-
-        for (const [key, value] of Object.entries(current)) {
-            if (['id', 'createdAt', 'addedBy', 'removedBy', 'lastUpdated'].includes(key)) continue;
-            if (!original.hasOwnProperty(key) || isDifferent(original[key], value)) {
-                changes[key] = value;
+        const allKeys = new Set([...Object.keys(original || {}), ...Object.keys(current || {})]);
+        for (const key of allKeys) {
+            if (key === 'participants') continue;
+            const origVal = original ? original[key] : undefined;
+            const currVal = current ? current[key] : undefined;
+            if ((typeof currVal === 'object' && currVal !== null) || (typeof origVal === 'object' && origVal !== null)) {
+                if (JSON.stringify(origVal) !== JSON.stringify(currVal)) {
+                    changes[key] = currVal;
+                }
+            } else {
+                if (origVal !== currVal) {
+                    changes[key] = currVal;
+                }
             }
         }
-        
         return changes;
     }
 
     function formatChanges(changes) {
-        let html = '<ul style="text-align: left; max-height: 300px; overflow-y: auto;">';
-        for (const [key, value] of Object.entries(changes)) {
-            let valDisplay = '';
-            if (typeof value === 'object') {
-                if (['greetings', 'farewells', 'twitch', 'kick', 'youtube'].includes(key)) {
-                    valDisplay = '<em>(Mídia/Configuração Complexa Atualizada)</em>';
-                } else {
-                    valDisplay = JSON.stringify(value).substring(0, 100) + (JSON.stringify(value).length > 100 ? '...' : '');
-                }
-            } else {
-                valDisplay = String(value).substring(0, 100);
-            }
-            
-            const keyMap = {
-                'name': 'Nome do Grupo', 'prefix': 'Prefixo', 'paused': 'Bot Pausado',
-                'customAIPrompt': 'Personalidade IA', 'customIgnoresPrefix': 'Ignorar Prefixo',
-                'ignoredNumbers': 'Números Ignorados', 'filters': 'Filtros',
-                'autoStt': 'Auto Transcrição', 'interact': 'Interação Automática',
-                'autoTranslateTo': 'Auto Tradução', 'greetings': 'Boas Vindas', 'farewells': 'Despedidas',
-                'mutedCommands': 'Comandos Silenciados', 'additionalAdmins': 'Admins Adicionais',
-                'twitch': 'Config Twitch', 'kick': 'Config Kick', 'youtube': 'Config YouTube'
-            };
-            
-            html += `<li><strong>${keyMap[key] || key}:</strong> ${valDisplay}</li>`;
+        const list = [];
+        const labels = {
+            name: 'Nome do Grupo',
+            prefix: 'Prefixo',
+            paused: 'Status do Bot (Pausado/Ativo)',
+            customAIPrompt: 'Personalidade da IA',
+            customIgnoresPrefix: 'Comandos sem Prefixo',
+            filters: 'Filtros (Links / NSFW / Palavras / Regex)',
+            ignoredNumbers: 'Números Ignorados',
+            mutedCategories: 'Categorias Silenciadas',
+            mutedCommands: 'Comandos Silenciados',
+            additionalAdmins: 'Admins Adicionais',
+            autoStt: 'Transcrever Áudios',
+            notificaGrupoFechado: 'Notificar Grupo Fechado',
+            notificaGrupoAberto: 'Notificar Grupo Aberto',
+            interact: 'Interações Automáticas',
+            greetings: 'Mensagens de Boas-Vindas',
+            farewells: 'Mensagens de Despedida',
+            autoTranslateTo: 'Traduzir Respostas',
+            twitch: 'Twitch',
+            kick: 'Kick',
+            youtube: 'YouTube',
+            nicks: 'Apelidos dos Membros',
+            warnings: 'Advertências do Grupo',
+            webhooks: 'Webhooks Externos',
+            banirSpammers: 'Banir Spammers Automaticamente',
+            greetingAccumulation: 'Acúmulo de Saudações',
+            regras: 'Regras do Grupo',
+            minecraftServer: 'Servidor Minecraft',
+            roleta: 'Configurações da Roleta Russa'
+        };
+
+        for (let key in changes) {
+            list.push(`<li><b>${labels[key] || key}</b></li>`);
         }
-        html += '</ul>';
-        return html;
+        return `<ul>${list.join('')}</ul>`;
     }
 
     function setupDirtyTracking() {
-        document.querySelectorAll('#dashboard-content input, #dashboard-content textarea').forEach(el => {
-            el.addEventListener('input', () => setDirty(true));
-            el.addEventListener('change', () => setDirty(true));
+        const inputs = els.dashboard.querySelectorAll('input:not([id^="new-"]):not(#variable-search):not(#member-search):not([id^="file-"]):not(.regex-test-input), textarea, select');
+        inputs.forEach(input => {
+            input.addEventListener('change', () => setDirty(true));
+            if (input.tagName === 'TEXTAREA' || input.type === 'text' || input.type === 'number' || input.type === 'range') {
+                input.addEventListener('input', () => setDirty(true));
+            }
         });
 
-        window.onbeforeunload = function(e) {
+        window.onbeforeunload = (e) => {
             if (isDirty) {
-                const msg = 'Você tem alterações não salvas. Deseja sair?';
-                e.returnValue = msg;
-                return msg;
+                e.preventDefault();
+                e.returnValue = '';
             }
         };
-        
-        window.onkeyup = function(e) {
-            if (e.key === 'Escape') {
-                els.cmdModal.classList.add('hidden');
-                els.streamModal.classList.add('hidden');
-                els.uploadModal.classList.add('hidden');
-                els.variableModal.classList.add('hidden');
-                els.emojiModal.classList.add('hidden');
-                els.customDialogModal.classList.add('hidden');
-            }
-        };
-        
-        els.btnGlobalSave.onclick = async () => {
-            await saveAllChanges();
-        };
+
+        els.btnGlobalSave.onclick = saveAllChanges;
+        document.querySelectorAll('.btn-save-section').forEach(btn => {
+            btn.onclick = saveAllChanges;
+        });
     }
 
     async function saveAllChanges() {
@@ -479,30 +555,18 @@ document.addEventListener('DOMContentLoaded', () => {
             const changes = calculateChanges(originalGroupData, groupData);
             
             if (Object.keys(changes).length === 0) {
-                await showCustomAlert('Nenhuma alteração detectada.');
                 setDirty(false);
-                return;
-            }
-
-            // Prefix warning logic
-            if (changes.hasOwnProperty('prefix')) {
-                const newPrefix = changes.prefix || '';
-                const prefixMsg = newPrefix 
-                    ? `ATENÇÃO: você está alterando o prefixo dos comandos do grupo. Preste atenção, pois os comandos agora serão com ${newPrefix} (ex.: ${newPrefix}ping)`
-                    : `ATENÇÃO: você está alterando o prefixo dos comandos do grupo. Preste atenção, pois os comandos agora serão sem prefixo, não recomendado!`;
-                
-                const confirmedPrefix = await showCustomConfirm(prefixMsg, 'Aviso de Prefixo');
-                if (!confirmedPrefix) return;
+                return await showCustomAlert('Nenhuma alteração detectada para salvar.');
             }
 
             const confirmed = await showCustomConfirm(
-                `As seguintes alterações serão salvas:<br><br>${formatChanges(changes)}`,
+                `Deseja salvar as seguintes alterações?<br>${formatChanges(changes)}`,
                 'Confirmar Alterações'
             );
 
             if (!confirmed) return;
 
-            els.btnGlobalSave.textContent = 'Salvando...';
+            els.btnGlobalSave.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Salvando...';
             els.btnGlobalSave.disabled = true;
 
             const res = await fetch(`${API_BASE}/update-group`, {
@@ -522,24 +586,23 @@ document.addEventListener('DOMContentLoaded', () => {
 
             originalGroupData = JSON.parse(JSON.stringify(groupData));
             setDirty(false);
-            await showCustomAlert('Todas as alterações foram salvas!', 'Sucesso');
+            await showCustomAlert('Todas as alterações foram salvas com sucesso!', 'Sucesso');
             
         } catch(e) {
             await showCustomAlert('Erro ao salvar: ' + e.message, 'Erro');
         } finally {
-            els.btnGlobalSave.innerHTML = '<i class="fas fa-save"></i> Salvar Tudo';
+            els.btnGlobalSave.innerHTML = '<i class="fas fa-check"></i> Salvar Tudo';
             els.btnGlobalSave.disabled = false;
         }
     }
 
     function updateGroupDataFromForm() {
         const nameInput = document.getElementById('group-name-input');
-        const nameValue = nameInput.value.trim();
+        const nameValue = nameInput.value.trim().toLowerCase();
         nameInput.value = nameValue;
         
-        // Validation for group name: alphanumeric, no whitespace, 1-30 chars, allowing -, _, .
         if (!/^[a-zA-Z0-9_\-.]{1,30}$/.test(nameValue)) {
-            throw new Error('O nome do grupo deve ser alfanumérico (letras e números), sem espaços, com no máximo 30 caracteres e podendo conter apenas _, - e .');
+            throw new Error('O nome do grupo deve ser alfanumérico, sem espaços, com no máximo 30 caracteres e podendo conter apenas _, - e .');
         }
 
         const prefixInput = document.getElementById('group-prefix');
@@ -550,21 +613,51 @@ document.addEventListener('DOMContentLoaded', () => {
 
         groupData.name = nameValue;
         groupData.prefix = prefixValue;
-        groupData.paused = !document.getElementById('bot-enabled').checked;
+        
+        // Paused logic
+        const isPaused = !els.groupPausedToggle.checked;
+        groupData.paused = isPaused;
+        document.getElementById('bot-enabled').checked = !isPaused;
+
         groupData.customAIPrompt = document.getElementById('bot-personality').value;
         groupData.customIgnoresPrefix = document.getElementById('custom-ignores-prefix').checked;
 
+        const groupRulesEl = document.getElementById('group-rules');
+        if (groupRulesEl) {
+            groupData.regras = groupRulesEl.value.trim() ? groupRulesEl.value : null;
+        }
+
         if(!groupData.filters) groupData.filters = {};
         groupData.filters.links = document.getElementById('delete-links').checked;
+        const allowAdminsEl = document.getElementById('filters-allow-admins');
+        if (allowAdminsEl) {
+            groupData.filters.allowAdmins = allowAdminsEl.checked;
+        }
         groupData.filters.nsfw = document.getElementById('delete-nsfw').checked;
+        const nsfwSlider = document.getElementById('nsfw-intensity');
+        if (nsfwSlider) {
+            const intensity = parseInt(nsfwSlider.value, 10);
+            groupData.filters.nsfwIntensity = intensity;
+            groupData.filters.nsfwThreshold = parseFloat((0.95 - (intensity / 100) * 0.75).toFixed(4));
+        }
 
         groupData.autoStt = document.getElementById('auto-stt').checked;
         groupData.notificaGrupoFechado = document.getElementById('notifica-grupo-fechado').checked;
         groupData.notificaGrupoAberto = document.getElementById('notifica-grupo-aberto').checked;
+        groupData.banirSpammers = document.getElementById('banir-spammers').checked;
+        groupData.greetingAccumulation = {
+            ...(groupData.greetingAccumulation || {}),
+            enabled: document.getElementById('greeting-accumulation').checked,
+            intervalMinutes: Math.max(1, parseInt(document.getElementById('greeting-interval').value, 10) || 30)
+        };
+
         if(!groupData.interact) groupData.interact = {};
         groupData.interact.enabled = document.getElementById('auto-interaction').checked;
-        groupData.interact.chance = parseInt(document.getElementById('interaction-chance').value);
-        groupData.interact.cooldown = parseInt(document.getElementById('interaction-cooldown').value);
+        groupData.interact.useCmds = document.getElementById('interact-use-cmds').checked;
+        const percentVal = parseInt(document.getElementById('interaction-chance').value, 10) || 1;
+        groupData.interact.chance = Math.min(100, Math.max(1, percentVal)) * 100;
+        const cdVal = parseInt(document.getElementById('interaction-cooldown').value, 10) || 30;
+        groupData.interact.cooldown = Math.min(720, Math.max(1, cdVal));
         const proporcaoSlider = document.getElementById('interaction-proporcao');
         if (proporcaoSlider) {
             groupData.interact.proporcao = parseInt(proporcaoSlider.value);
@@ -578,26 +671,162 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         
         groupData.autoTranslateTo = autoTranslate ? translateLang : false;
+
+        const mcServerEl = document.getElementById('minecraft-server');
+        if (mcServerEl) {
+            groupData.minecraftServer = parseMinecraftServerInput(mcServerEl.value);
+        }
+
+        const roletaTempoEl = document.getElementById('roleta-tempo');
+        const roletaSilenciarEl = document.getElementById('roleta-silenciar');
+        if (roletaTempoEl && roletaSilenciarEl) {
+            const roletaTempoInput = (roletaTempoEl.value || '').trim();
+            const roletaTempo = roletaTempoInput !== '' ? Number(roletaTempoInput) : 300;
+            if (isNaN(roletaTempo) || roletaTempo < 10 || roletaTempo > 259200) {
+                throw new Error('Tempo de timeout da roleta deve ser entre 10 e 259200 segundos (72 horas).');
+            }
+            groupData.roleta = {
+                timeoutTime: roletaTempo,
+                silenciar: roletaSilenciarEl.checked
+            };
+        }
+    }
+
+    // Mesmas regras do MinecraftServerService.parseServerAddress (porta padrão 25565)
+    function parseMinecraftServerInput(rawValue) {
+        const address = (rawValue || '').trim().toLowerCase();
+        if (!address) return null;
+
+        const invalid = () => new Error('Endereço do servidor de Minecraft inválido. Use ip ou ip:porta (ex: play.exemplo.com:25300).');
+        const ipv6Match = address.match(/^\[([0-9a-f:]+)\](?::(.*))?$/);
+        let host;
+        let rawPort;
+        if (ipv6Match) {
+            [, host, rawPort] = ipv6Match;
+        } else {
+            const parts = address.split(':');
+            if (parts.length > 2) throw invalid();
+            [host, rawPort] = parts;
+            if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$/.test(host) || host.length > 253) throw invalid();
+        }
+
+        if (rawPort === undefined) return { host, port: 25565 };
+        const port = /^\d{1,5}$/.test(rawPort) ? Number(rawPort) : 0;
+        if (port < 1 || port > 65535) throw invalid();
+        return { host, port };
+    }
+
+    function formatMinecraftServer(server) {
+        if (!server || !server.host) return '';
+        const host = server.host.includes(':') ? `[${server.host}]` : server.host;
+        if (server.port && Number(server.port) !== 25565) {
+            return `${host}:${server.port}`;
+        }
+        return host;
+    }
+
+    function updateHeroStatusVisuals(isPaused) {
+        if (isPaused) {
+            els.heroPauseCard.classList.add('paused');
+            els.heroStatusPill.className = 'status-pill status-pill-paused';
+            els.heroStatusPill.textContent = 'Pausado';
+            els.heroStatusDesc.textContent = 'O bot está pausado neste grupo e responderá apenas a comandos de reativação por administradores.';
+            els.groupPausedToggle.checked = false;
+        } else {
+            els.heroPauseCard.classList.remove('paused');
+            els.heroStatusPill.className = 'status-pill status-pill-active';
+            els.heroStatusPill.textContent = 'Ativo';
+            els.heroStatusDesc.textContent = 'O bot está funcionando normalmente e respondendo comandos neste grupo.';
+            els.groupPausedToggle.checked = true;
+        }
+    }
+
+    function formatCooldownText(val) {
+        const minutes = parseInt(val, 10) || 1;
+        if (minutes < 60) {
+            return `${minutes} min`;
+        }
+        const h = Math.floor(minutes / 60);
+        const m = minutes % 60;
+        if (m === 0) {
+            return `${h}h (${minutes} min)`;
+        }
+        return `${h}h ${m}min (${minutes} min)`;
     }
 
     function populateFields() {
         document.getElementById('group-id').value = groupData.id;
-        document.getElementById('group-created-at').value = new Date(groupData.createdAt).toLocaleDateString();
+        document.getElementById('group-created-at').value = new Date(groupData.createdAt || Date.now()).toLocaleDateString('pt-BR');
         document.getElementById('group-name-input').value = (groupData.name || '').trim();
         document.getElementById('group-prefix').value = groupData.prefix || '';
-        document.getElementById('bot-enabled').checked = !groupData.paused;
+        document.getElementById('greeting-accumulation').checked = !!groupData.greetingAccumulation?.enabled;
+        document.getElementById('greeting-interval').value = groupData.greetingAccumulation?.intervalMinutes || 30;
+        
+        const isPaused = !!groupData.paused;
+        updateHeroStatusVisuals(isPaused);
+        document.getElementById('bot-enabled').checked = !isPaused;
+
         document.getElementById('bot-personality').value = groupData.customAIPrompt || '';
         document.getElementById('personality-count').textContent = (groupData.customAIPrompt || '').length;
         document.getElementById('custom-ignores-prefix').checked = !!groupData.customIgnoresPrefix;
 
+        const rulesVal = groupData.regras || '';
+        const groupRulesEl = document.getElementById('group-rules');
+        if (groupRulesEl) {
+            groupRulesEl.value = rulesVal;
+            const rulesCountEl = document.getElementById('rules-count');
+            if (rulesCountEl) rulesCountEl.textContent = rulesVal.length;
+        }
+
+        const mcServerInput = document.getElementById('minecraft-server');
+        if (mcServerInput) {
+            mcServerInput.value = formatMinecraftServer(groupData.minecraftServer);
+        }
+        const roletaTempoInput = document.getElementById('roleta-tempo');
+        if (roletaTempoInput) {
+            roletaTempoInput.value = groupData.roleta?.timeoutTime ?? 300;
+        }
+        const roletaSilenciarInput = document.getElementById('roleta-silenciar');
+        if (roletaSilenciarInput) {
+            roletaSilenciarInput.checked = !!groupData.roleta?.silenciar;
+        }
         renderTags('ignored-numbers-list', groupData.ignoredNumbers || [], (list) => { groupData.ignoredNumbers = list; setDirty(true); });
         
         document.getElementById('delete-links').checked = groupData.filters?.links || false;
-        document.getElementById('delete-nsfw').checked = groupData.filters?.nsfw || false;
+        const allowAdminsEl = document.getElementById('filters-allow-admins');
+        if (allowAdminsEl) {
+            allowAdminsEl.checked = !!groupData.filters?.allowAdmins;
+        }
+        renderTags('allowed-links-list', groupData.filters?.allowedLinks || [], (list) => {
+            if(!groupData.filters) groupData.filters = {};
+            groupData.filters.allowedLinks = list; setDirty(true);
+        });
+        const nsfwActive = !!groupData.filters?.nsfw;
+        document.getElementById('delete-nsfw').checked = nsfwActive;
+
+        let nsfwIntensity = 20;
+        if (groupData.filters?.nsfwIntensity !== undefined && !isNaN(groupData.filters.nsfwIntensity)) {
+            nsfwIntensity = parseInt(groupData.filters.nsfwIntensity, 10);
+        } else if (groupData.filters?.nsfwThreshold !== undefined && !isNaN(groupData.filters.nsfwThreshold)) {
+            nsfwIntensity = Math.round(((0.95 - groupData.filters.nsfwThreshold) / 0.75) * 100);
+            nsfwIntensity = Math.max(0, Math.min(100, nsfwIntensity));
+        }
+
+        const nsfwSliderEl = document.getElementById('nsfw-intensity');
+        if (nsfwSliderEl) {
+            nsfwSliderEl.value = nsfwIntensity;
+            document.getElementById('nsfw-intensity-val').textContent = nsfwIntensity;
+        }
+        toggleNsfwSettings(nsfwActive);
 
         renderTags('forbidden-words-list', groupData.filters?.words || [], (list) => { 
             if(!groupData.filters) groupData.filters = {};
             groupData.filters.words = list; setDirty(true);
+        });
+
+        renderRegexList('forbidden-regexes-list', groupData.filters?.regexes || [], (list) => {
+            if(!groupData.filters) groupData.filters = {};
+            groupData.filters.regexes = list; setDirty(true);
         });
 
         renderTags('forbidden-users-list', groupData.filters?.people || [], (list) => { 
@@ -608,43 +837,76 @@ document.addEventListener('DOMContentLoaded', () => {
         renderTags('muted-commands-list', groupData.mutedCommands || [], (list) => { groupData.mutedCommands = list; setDirty(true); });
         renderTags('additional-admins-list', groupData.additionalAdmins || [], (list) => { groupData.additionalAdmins = list; setDirty(true); });
 
-        const categories = ["geral","grupo","utilidades","saude","midia","ia","downloaders","jogos","cultura","áudio","tts","busca","listas","arquivos","general","diversao","info","imagens","zoeira"];
+        const categories = [
+            "geral", "grupo", "stickers", "ia", "interacao", "midia", "voz",
+            "utilidades", "downloaders", "jogos", "streams", "zoeira", "mudae",
+            "busca", "cultura", "audio", "listas", "arquivos", "canais", "outros"
+        ];
         const mutedList = document.getElementById('muted-categories-list');
-        mutedList.innerHTML = '';
-        const muted = groupData.mutedCategories || [];
-        categories.forEach(cat => {
-            const div = document.createElement('div');
-            div.className = 'checkbox-group';
-            div.innerHTML = `
-                <input type="checkbox" id="mute-cat-${cat}" ${muted.includes(cat) ? 'checked' : ''}>
-                <label for="mute-cat-${cat}">${cat}</label>
-            `;
-            div.querySelector('input').addEventListener('change', (e) => {
-                if(e.target.checked) {
-                    if(!groupData.mutedCategories) groupData.mutedCategories = [];
-                    if(!groupData.mutedCategories.includes(cat)) groupData.mutedCategories.push(cat);
-                } else {
-                    if(groupData.mutedCategories) groupData.mutedCategories = groupData.mutedCategories.filter(c => c !== cat);
-                }
-                setDirty(true);
+        if (mutedList) {
+            mutedList.innerHTML = '';
+            const muted = groupData.mutedCategories || [];
+            categories.forEach(cat => {
+                const div = document.createElement('div');
+                div.className = 'checkbox-group toggle-row-compact';
+                div.innerHTML = `
+                    <span class="toggle-label">${cat}</span>
+                    <label class="switch-toggle">
+                        <input type="checkbox" id="mute-cat-${cat}" ${muted.includes(cat) ? 'checked' : ''}>
+                        <span class="slider-round"></span>
+                    </label>
+                `;
+                div.querySelector('input').addEventListener('change', (e) => {
+                    if(e.target.checked) {
+                        if(!groupData.mutedCategories) groupData.mutedCategories = [];
+                        if(!groupData.mutedCategories.includes(cat)) groupData.mutedCategories.push(cat);
+                    } else {
+                        if(groupData.mutedCategories) groupData.mutedCategories = groupData.mutedCategories.filter(c => c !== cat);
+                    }
+                    setDirty(true);
+                });
+                mutedList.appendChild(div);
             });
-            mutedList.appendChild(div);
-        });
+        }
 
         document.getElementById('auto-stt').checked = !!groupData.autoStt;
         document.getElementById('notifica-grupo-fechado').checked = !!groupData.notificaGrupoFechado;
         document.getElementById('notifica-grupo-aberto').checked = !!groupData.notificaGrupoAberto;
+        document.getElementById('banir-spammers').checked = !!groupData.banirSpammers;
         
         const interact = groupData.interact || {};
         document.getElementById('auto-interaction').checked = !!interact.enabled;
+        document.getElementById('interact-use-cmds').checked = interact.useCmds !== false;
         
-        const chanceVal = interact.chance || 1;
-        document.getElementById('interaction-chance').value = chanceVal; 
-        document.getElementById('chance-val').textContent = (chanceVal / 100).toFixed(2);
-        document.getElementById('interaction-chance').max = 1000;
+        const chanceRaw = interact.chance !== undefined ? interact.chance : 100;
+        let percentVal = 1;
+        if (chanceRaw >= 100) {
+            percentVal = Math.round(chanceRaw / 100);
+        } else if (chanceRaw > 0) {
+            percentVal = chanceRaw;
+        }
+        percentVal = Math.min(100, Math.max(1, percentVal));
 
-        document.getElementById('interaction-cooldown').value = interact.cooldown || 5;
-        document.getElementById('cooldown-val').textContent = interact.cooldown || 5;
+        const chanceInputEl = document.getElementById('interaction-chance');
+        if (chanceInputEl) {
+            chanceInputEl.min = 1;
+            chanceInputEl.max = 100;
+            chanceInputEl.value = percentVal;
+        }
+        const chanceValEl = document.getElementById('chance-val');
+        if (chanceValEl) chanceValEl.textContent = percentVal;
+        const chanceDescEl = document.getElementById('chance-desc-val');
+        if (chanceDescEl) chanceDescEl.textContent = percentVal + '%';
+
+        const cooldownVal = Math.min(720, Math.max(1, parseInt(interact.cooldown, 10) || 30));
+        const cooldownInputEl = document.getElementById('interaction-cooldown');
+        if (cooldownInputEl) {
+            cooldownInputEl.min = 1;
+            cooldownInputEl.max = 720;
+            cooldownInputEl.value = cooldownVal;
+        }
+        const cooldownValEl = document.getElementById('cooldown-val');
+        if (cooldownValEl) cooldownValEl.textContent = formatCooldownText(cooldownVal);
 
         const proporcaoVal = interact.proporcao !== undefined ? interact.proporcao : 50;
         const proporcaoSlider = document.getElementById('interaction-proporcao');
@@ -660,7 +922,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 } else if (iaChance === 0) {
                     descEl.innerHTML = "Usando apenas <b>comandos</b> para interagir";
                 } else {
-                    descEl.textContent = `${cmdChance}% de chance de usar algum comando, ${iaChance}% de chance de usar IA para interagir`;
+                    descEl.textContent = `${cmdChance}% de chance de usar comandos, ${iaChance}% de chance de usar IA`;
                 }
             }
         }
@@ -676,11 +938,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
         renderStreamSection('twitch');
         renderStreamSection('kick');
-        renderStreamSection('youtube');
+        renderStreamSection('youtube_video');
+        renderStreamSection('youtube_live');
     }
 
     function renderTags(containerId, dataList, updateCallback) {
         const container = document.getElementById(containerId);
+        if (!container) return;
         container.innerHTML = '';
         dataList.forEach(item => {
             const tag = document.createElement('span');
@@ -695,59 +959,300 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
+    function buildRegexClient(input) {
+        if (!input || typeof input !== 'string') return null;
+        const match = input.match(/^\/(.+)\/([gimsuyvd]*)$/);
+        if (match) {
+            return new RegExp(match[1], match[2]);
+        }
+        return new RegExp(input, 'i');
+    }
+
+    function validateRegexClient(patternStr) {
+        if (!patternStr || typeof patternStr !== 'string') {
+            return { valid: false, error: 'O padrão regex não pode estar vazio.' };
+        }
+        const trimmed = patternStr.trim();
+        if (trimmed.length < 2) {
+            return { valid: false, error: 'O regex deve ter pelo menos 2 caracteres.' };
+        }
+        let regex;
+        try {
+            regex = buildRegexClient(trimmed);
+        } catch (err) {
+            return { valid: false, error: `Sintaxe inválida: ${err.message}` };
+        }
+        if (!regex) return { valid: false, error: 'Expressão regular inválida.' };
+
+        try {
+            if (regex.test('')) {
+                return { valid: false, error: 'Regex muito abrangente: casa com texto vazio e apagaria todas as mensagens.' };
+            }
+            if (regex.test(' ')) {
+                return { valid: false, error: 'Regex muito abrangente: casa com espaço e apagaria mensagens com espaços.' };
+            }
+            const neutralSamples = [
+                'olá',
+                'tudo bem?',
+                'bom dia',
+                'boa tarde',
+                'ok, obrigado',
+                'sim, entendi',
+                'não posso agora',
+                'reunião amanhã'
+            ];
+            let neutralMatchCount = 0;
+            for (const sample of neutralSamples) {
+                if (regex.test(sample)) neutralMatchCount++;
+            }
+            if (neutralMatchCount >= 4) {
+                return { valid: false, error: 'Regex muito abrangente: coincide com frases normais do dia a dia.' };
+            }
+        } catch (err) {
+            return { valid: false, error: `Erro ao testar regex: ${err.message}` };
+        }
+
+        return { valid: true, regex };
+    }
+
+    function renderRegexList(containerId, regexList, updateCallback) {
+        const container = document.getElementById(containerId);
+        if (!container) return;
+        container.innerHTML = '';
+
+        if (!regexList || regexList.length === 0) {
+            const empty = document.createElement('div');
+            empty.className = 'regex-empty-msg';
+            empty.textContent = 'Nenhum regex configurado.';
+            container.appendChild(empty);
+            return;
+        }
+
+        regexList.forEach((pattern, index) => {
+            const row = document.createElement('div');
+            row.className = 'regex-row-item';
+
+            const patternEl = document.createElement('div');
+            patternEl.className = 'regex-pattern-display';
+            const code = document.createElement('code');
+            code.textContent = pattern;
+            patternEl.appendChild(code);
+
+            const testContainer = document.createElement('div');
+            testContainer.className = 'regex-test-container';
+
+            const testInput = document.createElement('input');
+            testInput.type = 'text';
+            testInput.className = 'form-control regex-test-input';
+            testInput.placeholder = 'Testar se regex detecta...';
+
+            const testBadge = document.createElement('span');
+            testBadge.className = 'regex-test-badge regex-test-idle';
+            testBadge.innerHTML = '<i class="fas fa-vial"></i> Testar';
+
+            let compiled = null;
+            try {
+                compiled = buildRegexClient(pattern);
+            } catch (e) {
+                // error compiling
+            }
+
+            const runTest = () => {
+                const text = testInput.value;
+                if (!text) {
+                    testBadge.className = 'regex-test-badge regex-test-idle';
+                    testBadge.innerHTML = '<i class="fas fa-vial"></i> Testar';
+                    testInput.classList.remove('input-match-success', 'input-match-none');
+                    return;
+                }
+                if (!compiled) {
+                    testBadge.className = 'regex-test-badge regex-test-error';
+                    testBadge.innerHTML = '<i class="fas fa-exclamation-triangle"></i> Regex inválido';
+                    return;
+                }
+                try {
+                    const matched = compiled.test(text);
+                    if (matched) {
+                        testBadge.className = 'regex-test-badge regex-test-match';
+                        testBadge.innerHTML = '<i class="fas fa-check-circle"></i> Detectou!';
+                        testInput.classList.add('input-match-success');
+                        testInput.classList.remove('input-match-none');
+                    } else {
+                        testBadge.className = 'regex-test-badge regex-test-nomatch';
+                        testBadge.innerHTML = '<i class="fas fa-times-circle"></i> Não detectou';
+                        testInput.classList.add('input-match-none');
+                        testInput.classList.remove('input-match-success');
+                    }
+                } catch (err) {
+                    testBadge.className = 'regex-test-badge regex-test-error';
+                    testBadge.innerHTML = '<i class="fas fa-exclamation-triangle"></i> Erro';
+                }
+            };
+
+            testInput.addEventListener('input', runTest);
+
+            testContainer.appendChild(testInput);
+            testContainer.appendChild(testBadge);
+
+            const deleteBtn = document.createElement('button');
+            deleteBtn.type = 'button';
+            deleteBtn.className = 'btn btn-danger btn-xs btn-remove-regex';
+            deleteBtn.title = 'Remover este regex';
+            deleteBtn.innerHTML = '<i class="fas fa-trash-alt"></i>';
+            deleteBtn.onclick = () => {
+                const newList = regexList.filter((_, i) => i !== index);
+                updateCallback(newList);
+                renderRegexList(containerId, newList, updateCallback);
+            };
+
+            row.appendChild(patternEl);
+            row.appendChild(testContainer);
+            row.appendChild(deleteBtn);
+
+            container.appendChild(row);
+        });
+    }
+
+    // --- WhatsApp Markdown & Variable Formatter ---
+
+    function formatWhatsAppMarkdown(text) {
+        if (!text) return '';
+        let escaped = text
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;');
+
+        // Bold: *text*
+        escaped = escaped.replace(/\*([^*\n]+)\*/g, '<strong>$1</strong>');
+        // Italic: _text_
+        escaped = escaped.replace(/_([^_\n]+)_/g, '<em>$1</em>');
+        // Strike: ~text~
+        escaped = escaped.replace(/~([^~\n]+)~/g, '<del>$1</del>');
+        // Code: `code`
+        escaped = escaped.replace(/`([^`\n]+)`/g, '<code class="wa-code">$1</code>');
+        // Variables: {var}
+        escaped = escaped.replace(/\{([a-zA-Z0-9_\-]+)\}/g, '<span class="wa-var-pill">{$1}</span>');
+        // Newlines
+        escaped = escaped.replace(/\n/g, '<br>');
+
+        return escaped;
+    }
+
+    // --- Inline Media List (Boas-Vindas & Despedidas) ---
+
     function renderMediaList(containerId, mediaObj, type) {
         const container = document.getElementById(containerId);
+        if (!container) return;
         container.innerHTML = '';
-        Object.entries(mediaObj).forEach(([key, value]) => {
-            if(!value) return;
+
+        const entries = Object.entries(mediaObj).filter(([k, v]) => !!v);
+
+        if (entries.length === 0) {
+            container.innerHTML = '<div class="text-muted text-sm p-2 text-center">Nenhuma mídia ou mensagem cadastrada.</div>';
+            return;
+        }
+
+        entries.forEach(([key, value]) => {
             const div = document.createElement('div');
-            div.className = 'media-item';
+            div.className = 'inline-media-card';
             
-            let display = key;
-            if(key === 'text') {
+            if (key === 'text') {
                 const textVal = typeof value === 'string' ? value : String(value || '');
-                display = `📝 Texto: ${textVal.substring(0, 30)}...`;
+                div.innerHTML = `
+                    <div class="inline-media-info">
+                        <span class="inline-media-badge"><i class="fas fa-font"></i> Mensagem de Texto</span>
+                        <div class="inline-media-caption">${formatWhatsAppMarkdown(textVal)}</div>
+                    </div>
+                    <div class="inline-media-actions">
+                        <button type="button" class="btn btn-xs btn-outline btn-edit-text" title="Editar Mensagem"><i class="fas fa-pen"></i></button>
+                        <button type="button" class="btn btn-xs btn-danger btn-del-item" title="Remover"><i class="fas fa-trash"></i></button>
+                    </div>
+                `;
+
+                div.querySelector('.btn-edit-text').onclick = async () => {
+                    const newText = await showCustomPrompt('Editar mensagem de texto:', textVal);
+                    if (newText !== null && newText.trim()) {
+                        mediaObj.text = newText.trim();
+                        setDirty(true);
+                        renderMediaList(containerId, mediaObj, type);
+                    }
+                };
+
             } else {
                 const mediaLink = `/media-direct/${value.file}?token=${token}`;
                 const captionVal = typeof value.caption === 'string' ? value.caption : '';
-                const captionDisplay = captionVal ? `(${captionVal.substring(0, 10)}...)` : '';
-                display = `${getIcon(key)} ${key}: <a href="${mediaLink}" target="_blank" class="media-link">Clique para Visualizar</a> ${captionDisplay}`;
+                
+                let thumbHtml = '';
+                if (key === 'image' || key === 'sticker') {
+                    thumbHtml = `<img src="${mediaLink}" class="inline-media-thumb" alt="${key}" onerror="this.src='/android-chrome-192x192.png'">`;
+                } else if (key === 'video' || key === 'gif') {
+                    thumbHtml = `<div class="inline-media-thumb-video"><i class="fas fa-play-circle"></i></div>`;
+                } else if (key === 'audio') {
+                    thumbHtml = `<div class="inline-media-thumb-video" style="color: #25d366;"><i class="fas fa-microphone"></i></div>`;
+                }
+
+                div.innerHTML = `
+                    ${thumbHtml}
+                    <div class="inline-media-info">
+                        <span class="inline-media-badge">${getIcon(key)} ${key}</span>
+                        <div class="inline-media-caption">${captionVal ? formatWhatsAppMarkdown(captionVal) : '<span class="text-muted">(Sem legenda)</span>'}</div>
+                    </div>
+                    <div class="inline-media-actions">
+                        ${key === 'image' || key === 'video' || key === 'gif' ? `<button type="button" class="btn btn-xs btn-outline btn-edit-caption" title="Editar Legenda"><i class="fas fa-comment"></i></button>` : ''}
+                        <button type="button" class="btn btn-xs btn-danger btn-del-item" title="Remover"><i class="fas fa-trash"></i></button>
+                    </div>
+                `;
+
+                const editCaptionBtn = div.querySelector('.btn-edit-caption');
+                if (editCaptionBtn) {
+                    editCaptionBtn.onclick = async () => {
+                        const newCap = await showCustomPrompt('Editar legenda da mídia:', captionVal);
+                        if (newCap !== null) {
+                            value.caption = newCap.trim();
+                            setDirty(true);
+                            renderMediaList(containerId, mediaObj, type);
+                        }
+                    };
+                }
             }
 
-            div.innerHTML = `
-                <div class="media-item-content">${display}</div>
-                <button class="btn btn-xs btn-danger"><i class="fas fa-trash"></i></button>
-            `;
-            div.querySelector('button').onclick = async () => {
-                if(await showCustomConfirm('Remover este item?')) {
+            div.querySelector('.btn-del-item').onclick = async () => {
+                if (await showCustomConfirm(`Remover este item de ${type === 'greetings' ? 'boas-vindas' : 'despedida'}?`)) {
                     delete mediaObj[key];
                     setDirty(true);
                     renderMediaList(containerId, mediaObj, type);
                 }
             };
+
             container.appendChild(div);
         });
     }
 
     function getIcon(type) {
-        const map = { image: '🖼️', video: '📹', gif: '🎬', audio: '🎵', sticker: '🏷️', text: '📝' };
-        return map[type] || '📁';
+        const icons = {
+            text: '📝',
+            image: '🖼️',
+            video: '🎥',
+            audio: '🎵',
+            sticker: '🏷️',
+            gif: '🎞️'
+        };
+        return icons[type] || '📎';
     }
 
-    // --- Accordion Logic ---
+    // --- Accordions & Settings Toggles ---
 
-    els.accordions.forEach(acc => {
-        acc.querySelector('.accordion-header').addEventListener('click', () => {
-            const currentActive = document.querySelector('.accordion-item.active');
-            if(currentActive && currentActive !== acc) {
-                currentActive.classList.remove('active');
-            }
-            acc.classList.toggle('active');
+    els.accordions.forEach(item => {
+        const header = item.querySelector('.accordion-header');
+        header.addEventListener('click', () => {
+            const isActive = item.classList.contains('active');
+            item.classList.toggle('active', !isActive);
         });
     });
 
     els.subAccordions.forEach(sub => {
-        sub.querySelector('.sub-accordion-header').addEventListener('click', () => {
+        const subHeader = sub.querySelector('.sub-accordion-header');
+        subHeader.addEventListener('click', () => {
             sub.classList.toggle('active');
         });
     });
@@ -760,71 +1265,182 @@ document.addEventListener('DOMContentLoaded', () => {
         document.getElementById('translate-settings').classList.toggle('hidden', !show);
     }
 
+    function toggleNsfwSettings(show) {
+        const panel = document.getElementById('nsfw-settings');
+        if (panel) panel.classList.toggle('hidden', !show);
+    }
+
     function setupListAdder(btnId, inputId, dataPath) {
-        document.getElementById(btnId).addEventListener('click', () => {
-            const input = document.getElementById(inputId);
-            const val = input.value.trim();
-            if(!val) return;
+        const btn = document.getElementById(btnId);
+        const input = document.getElementById(inputId);
+        if (!btn || !input) return;
+
+        btn.addEventListener('click', () => {
+            let val = input.value.trim();
+            if (!val) return;
+            input.value = '';
 
             const parts = dataPath.split('.');
             let target = groupData;
-            for(let i=0; i<parts.length-1; i++) {
-                if(!target[parts[i]]) target[parts[i]] = {};
+            for (let i = 0; i < parts.length - 1; i++) {
+                if (!target[parts[i]]) target[parts[i]] = {};
                 target = target[parts[i]];
             }
-            const lastKey = parts[parts.length-1];
-            if(!target[lastKey]) target[lastKey] = [];
-            
-            if(!target[lastKey].includes(val)) {
+            const lastKey = parts[parts.length - 1];
+
+            if (btnId === 'add-ignored-number' || btnId === 'add-forbidden-user' || btnId === 'add-additional-admin') {
+                val = val.replace(/\D/g, '');
+                if (!val) return;
+            }
+
+            if (btnId === 'add-allowed-link') {
+                if (!val.includes('*')) {
+                    val = val.replace(/^https?:\/\//i, '').split(/[/?#]/)[0];
+                    if (val.toLowerCase().startsWith('www.')) {
+                        val = val.substring(4);
+                    }
+                    val = val.toLowerCase().trim();
+                } else {
+                    val = val.toLowerCase().trim();
+                }
+                if (!val) return;
+            }
+
+            if (!target[lastKey]) target[lastKey] = [];
+
+            if (!target[lastKey].includes(val)) {
                 target[lastKey].push(val);
                 setDirty(true);
-                if(inputId.includes('number')) renderTags('ignored-numbers-list', groupData.ignoredNumbers, (l)=>groupData.ignoredNumbers=l);
-                else if(inputId.includes('word')) renderTags('forbidden-words-list', groupData.filters.words, (l)=>groupData.filters.words=l);
-                else if(inputId.includes('forbidden-user')) renderTags('forbidden-users-list', groupData.filters.people, (l)=>groupData.filters.people=l);
-                else if(inputId.includes('muted-command')) renderTags('muted-commands-list', groupData.mutedCommands, (l)=>groupData.mutedCommands=l);
-                else if(inputId.includes('admin')) renderTags('additional-admins-list', groupData.additionalAdmins, (l)=>groupData.additionalAdmins=l);
+                const listId = inputId.replace('new-', '') + 's-list';
+                renderTags(listId, target[lastKey], (newList) => {
+                    target[lastKey] = newList;
+                    setDirty(true);
+                });
             }
-            input.value = '';
+        });
+
+        input.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                btn.click();
+            }
         });
     }
 
-    document.querySelectorAll('.btn-save-section').forEach(btn => {
-        btn.addEventListener('click', () => saveAllChanges());
-    });
+    function setupRegexAdder(btnId, inputId, errorId, containerId) {
+        const btn = document.getElementById(btnId);
+        const input = document.getElementById(inputId);
+        const errorEl = document.getElementById(errorId);
+        if (!btn || !input) return;
 
+        const handleAdd = () => {
+            const val = input.value.trim();
+            if (!val) return;
 
-    // --- Stream Logic ---
+            if (errorEl) {
+                errorEl.style.display = 'none';
+                errorEl.textContent = '';
+            }
 
-    const DEFAULT_MSG = {
-        twitch: "⚠️ ATENÇÃO!⚠️\n\n🌟 *{nomeCanal}* ✨ está *online* streamando *{jogo}*!\n_{titulo}_\n\nhttps://twitch.tv/{nomeCanal}",
-        kick: "⚠️ ATENÇÃO!⚠️\n\n🌟 *{nomeCanal}* ✨ está *online* streamando *{jogo}*!\n_{titulo}_\n\nhttps://kick.com/{nomeCanal}",
-        youtube: "*⚠️ Vídeo novo! ⚠️*\n\n*{author}:* *{title}* \n{link}"
-    };
+            const validation = validateRegexClient(val);
+            if (!validation.valid) {
+                if (errorEl) {
+                    errorEl.textContent = validation.error;
+                    errorEl.style.display = 'block';
+                } else {
+                    showCustomAlert(validation.error, 'Regex Inválido');
+                }
+                return;
+            }
+
+            if (!groupData.filters) groupData.filters = {};
+            if (!Array.isArray(groupData.filters.regexes)) groupData.filters.regexes = [];
+
+            if (groupData.filters.regexes.includes(val)) {
+                if (errorEl) {
+                    errorEl.textContent = 'Este regex já está na lista.';
+                    errorEl.style.display = 'block';
+                }
+                return;
+            }
+
+            groupData.filters.regexes.push(val);
+            input.value = '';
+            if (errorEl) errorEl.style.display = 'none';
+            setDirty(true);
+
+            renderRegexList(containerId, groupData.filters.regexes, (newList) => {
+                groupData.filters.regexes = newList;
+                setDirty(true);
+            });
+        };
+
+        btn.addEventListener('click', handleAdd);
+        input.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                handleAdd();
+            }
+        });
+        input.addEventListener('input', () => {
+            if (errorEl && errorEl.style.display !== 'none') {
+                errorEl.style.display = 'none';
+            }
+        });
+    }
+
+    // --- Streams (Twitch, Kick, YouTube) ---
 
     function renderStreamSection(platform) {
+        if (platform === 'youtube') {
+            renderStreamSection('youtube_video');
+            renderStreamSection('youtube_live');
+            const legacyTbody = document.querySelector('#youtube-table tbody');
+            const legacyNoMsg = document.querySelector('#no-youtube-msg');
+            if (legacyTbody) legacyTbody.innerHTML = '';
+            if (legacyNoMsg) legacyNoMsg.classList.add('hidden');
+            return;
+        }
+
         const tbody = document.querySelector(`#${platform}-table tbody`);
-        const noMsg = document.getElementById(`no-${platform}-msg`);
+        const noMsg = document.querySelector(`#no-${platform}-msg`);
+        if (!tbody) return;
         tbody.innerHTML = '';
-        
-        const list = groupData[platform] || [];
-        
-        if (list.length === 0) {
-            noMsg.classList.remove('hidden');
+
+        let streams = [];
+        if (platform === 'youtube_video') {
+            streams = (groupData.youtube || [])
+                .map((s, idx) => ({ ...s, _originalIndex: idx }))
+                .filter(s => s.notifyVideos !== false);
+        } else if (platform === 'youtube_live') {
+            streams = (groupData.youtube || [])
+                .map((s, idx) => ({ ...s, _originalIndex: idx }))
+                .filter(s => s.notifyLives !== false);
         } else {
-            noMsg.classList.add('hidden');
-            list.forEach((item, index) => {
+            streams = (groupData[platform] || []).map((s, idx) => ({ ...s, _originalIndex: idx }));
+        }
+
+        if (streams.length === 0) {
+            if (noMsg) noMsg.classList.remove('hidden');
+        } else {
+            if (noMsg) noMsg.classList.add('hidden');
+            streams.forEach((stream) => {
+                const index = stream._originalIndex;
                 const tr = document.createElement('tr');
                 tr.innerHTML = `
-                    <td>${item.channel}</td>
                     <td>
-                        <button class="btn btn-xs btn-primary btn-edit-stream" data-platform="${platform}" data-index="${index}"><i class="fas fa-edit"></i></button>
+                        <strong>${stream.channel}</strong>
+                        ${stream.useThumbnail ? ' <span class="badge-soon" style="color: #25d366; border-color: rgba(37,211,102,0.4); background: rgba(37,211,102,0.1);">Thumb</span>' : ''}
+                    </td>
+                    <td>
+                        <button class="btn btn-xs btn-primary btn-edit-stream" data-platform="${platform}" data-index="${index}"><i class="fas fa-edit"></i> Editar</button>
                     </td>
                 `;
                 tbody.appendChild(tr);
             });
             
             document.querySelectorAll(`.btn-edit-stream[data-platform="${platform}"]`).forEach(btn => {
-                btn.addEventListener('click', () => openStreamModal(platform, btn.dataset.index));
+                btn.addEventListener('click', () => openStreamModal(platform, parseInt(btn.dataset.index, 10)));
             });
         }
     }
@@ -835,61 +1451,114 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function openStreamModal(platform, index) {
         currentStream = { platform, index, data: null };
-        const isEdit = index !== null;
+        const isEdit = index !== null && !isNaN(index);
+        const isYtVideo = platform === 'youtube_video';
+        const isYtLive = platform === 'youtube_live';
+        const isYoutube = isYtVideo || isYtLive;
         
-        els.streamModalTitle.textContent = isEdit ? `Editar ${platform.charAt(0).toUpperCase() + platform.slice(1)}` : `Adicionar ${platform.charAt(0).toUpperCase() + platform.slice(1)}`;
+        let platformLabel = platform.toUpperCase();
+        if (isYtVideo) platformLabel = "YOUTUBE (VÍDEOS)";
+        if (isYtLive) platformLabel = "YOUTUBE (LIVES)";
+
+        els.streamModalTitle.textContent = isEdit ? `Editar ${platformLabel}` : `Adicionar Canal ${platformLabel}`;
         els.btnDeleteStream.classList.toggle('hidden', !isEdit);
-        els.streamHint.textContent = platform === 'youtube' ? 'ID do canal ou Handle (@nome).' : 'Apenas o nome de usuário, sem URL.';
+        els.streamHint.textContent = isYoutube ? 'ID do canal ou Handle (@nome).' : 'Apenas o nome de usuário, sem URL.';
         
+        const simLabel = document.getElementById('wa-sim-title-label');
+        const onTitle = document.getElementById('stream-on-title');
+        const offAcc = document.getElementById('stream-off-accordion');
+        const offDiv = document.getElementById('stream-off-divider');
+        const titleRow = document.getElementById('stream-change-title-row');
+
+        if (isYtVideo) {
+            if (simLabel) simLabel.innerHTML = '<i class="fab fa-whatsapp"></i> Prévia da Notificação de Vídeo Novo';
+            if (onTitle) onTitle.innerHTML = '<i class="fab fa-youtube text-danger"></i> <h4>Mídia & Mensagem de Novo Vídeo</h4>';
+            if (offAcc) offAcc.classList.add('hidden');
+            if (offDiv) offDiv.classList.add('hidden');
+            if (titleRow) titleRow.classList.add('hidden');
+        } else {
+            if (simLabel) simLabel.innerHTML = '<i class="fab fa-whatsapp"></i> Prévia da Notificação da Live';
+            if (onTitle) onTitle.innerHTML = '<i class="fas fa-satellite-dish text-success"></i> <h4>Mídia & Mensagem quando Online</h4>';
+            if (offAcc) offAcc.classList.remove('hidden');
+            if (offDiv) offDiv.classList.remove('hidden');
+            if (titleRow) titleRow.classList.remove('hidden');
+        }
+
         if (isEdit) {
-            const data = groupData[platform][index];
-            currentStream.data = JSON.parse(JSON.stringify(data));
+            const rawData = (isYoutube ? groupData.youtube : groupData[platform])[index];
+            currentStream.data = JSON.parse(JSON.stringify(rawData));
         } else {
             currentStream.data = {
                 channel: '',
                 mentionAllMembers: false,
-                changeTitleOnEvent: false,
-                changePhotoOnEvent: false,
+                changeTitleOnEvent: isYtLive || platform === 'twitch' || platform === 'kick',
                 onlineTitle: '',
                 offlineTitle: '',
-                groupPhotoOnline: null,
-                groupPhotoOffline: null,
+                useThumbnail: true,
                 useAI: false,
-                onConfig: { media: [{ type: 'text', content: DEFAULT_MSG[platform] }] },
+                notifyVideos: true,
+                notifyLives: true,
+                videoConfig: { media: [{ type: 'text', content: DEFAULT_MSG.youtube_video }] },
+                onConfig: { media: [{ type: 'text', content: DEFAULT_MSG[platform] || DEFAULT_MSG.youtube_live }] },
                 offConfig: { media: [] }
             };
         }
 
         const d = currentStream.data;
+        if (!d.videoConfig) {
+            d.videoConfig = d.onConfig ? JSON.parse(JSON.stringify(d.onConfig)) : { media: [{ type: 'text', content: DEFAULT_MSG.youtube_video }] };
+        }
+        if (!d.onConfig) {
+            d.onConfig = { media: [{ type: 'text', content: DEFAULT_MSG.youtube_live }] };
+        }
+        if (!d.offConfig) {
+            d.offConfig = { media: [] };
+        }
+
         els.streamChannel.value = d.channel;
-        els.streamMention.checked = d.mentionAllMembers;
-        els.streamChangeTitle.checked = d.changeTitleOnEvent;
-        els.streamChangePhoto.checked = d.changePhotoOnEvent || false;
-        els.streamAI.checked = d.useAI;
+        els.streamMention.checked = !!d.mentionAllMembers;
+        els.streamChangeTitle.checked = !!d.changeTitleOnEvent;
+        if (els.streamChangePhoto) els.streamChangePhoto.checked = d.changePhotoOnEvent === true;
+        els.streamAI.checked = !!d.useAI;
+        els.streamUseThumbnail.checked = d.useThumbnail !== false;
         els.streamTitleOn.value = d.onlineTitle || '';
         els.streamTitleOff.value = d.offlineTitle || '';
         
-        const getPhotoDisplay = (val) => {
-            if (!val) return 'Nenhuma Imagem definida';
-            if (typeof val === 'string') return val;
-            if (typeof val === 'object' && val.data) return '[Imagem Base64]';
-            return 'Imagem configurada';
-        };
+        toggleStreamTitles(!isYtVideo && d.changeTitleOnEvent);
 
-        els.streamPhotoOnDisplay.value = getPhotoDisplay(d.groupPhotoOnline);
-        els.streamPhotoOffDisplay.value = getPhotoDisplay(d.groupPhotoOffline);
-        
-        els.btnRemovePhotoOn.classList.toggle('hidden', !d.groupPhotoOnline);
-        els.btnRemovePhotoOff.classList.toggle('hidden', !d.groupPhotoOffline);
+        if (isYtVideo) {
+            renderStreamMediaList('stream-on-media-list', d.videoConfig?.media || []);
+        } else {
+            renderStreamMediaList('stream-on-media-list', d.onConfig?.media || []);
+            renderStreamMediaList('stream-off-media-list', d.offConfig?.media || []);
+        }
 
-        els.btnViewPhotoOn.classList.toggle('hidden', !d.groupPhotoOnline || typeof d.groupPhotoOnline !== 'string');
-        els.btnViewPhotoOff.classList.toggle('hidden', !d.groupPhotoOffline || typeof d.groupPhotoOffline !== 'string');
-        
-        toggleStreamTitles(d.changeTitleOnEvent);
-        toggleStreamPhotos(d.changePhotoOnEvent || false);
-        
-        renderStreamMediaList('stream-on-media-list', d.onConfig?.media || []);
-        renderStreamMediaList('stream-off-media-list', d.offConfig?.media || []);
+        // Renderiza canais do WhatsApp seguidos para encaminhamento
+        const forwardContainer = document.getElementById('stream-forward-channels-container');
+        if (forwardContainer) {
+            forwardContainer.innerHTML = '';
+            const followed = groupData.followedChannels || [];
+            if (!followed || followed.length === 0) {
+                forwardContainer.innerHTML = '<div class="text-muted small">Este grupo não segue nenhum canal ainda para poder encaminhar mensagens</div>';
+            } else {
+                const currentForwards = Array.isArray(d.forwardToChannels) ? d.forwardToChannels : [];
+                followed.forEach((ch) => {
+                    const isChecked = currentForwards.includes(ch.canal_jid);
+                    const itemDiv = document.createElement('div');
+                    itemDiv.className = 'form-group toggle-row-compact mb-2';
+                    itemDiv.innerHTML = `
+                        <span class="toggle-label"><i class="fas fa-bullhorn text-secondary"></i> ${ch.apelido}</span>
+                        <label class="switch-toggle">
+                            <input type="checkbox" class="stream-forward-ch-checkbox" data-jid="${ch.canal_jid}" ${isChecked ? 'checked' : ''}>
+                            <span class="slider-round"></span>
+                        </label>
+                    `;
+                    forwardContainer.appendChild(itemDiv);
+                });
+            }
+        }
+
+        updateStreamPreview();
 
         els.streamModal.classList.remove('hidden');
     }
@@ -898,113 +1567,93 @@ document.addEventListener('DOMContentLoaded', () => {
         els.streamTitlesGroup.classList.toggle('hidden', !show);
     }
 
-    function toggleStreamPhotos(show) {
-        els.streamPhotosGroup.classList.toggle('hidden', !show);
-    }
-    
     if(els.streamChangeTitle) {
         els.streamChangeTitle.addEventListener('change', (e) => toggleStreamTitles(e.target.checked));
     }
-    
-    if(els.streamChangePhoto) {
-        els.streamChangePhoto.addEventListener('change', (e) => toggleStreamPhotos(e.target.checked));
+
+    if(els.streamUseThumbnail) {
+        els.streamUseThumbnail.addEventListener('change', () => updateStreamPreview());
     }
 
-    // Photo View Handlers
-    if(els.btnViewPhotoOn) {
-        els.btnViewPhotoOn.onclick = () => {
-            if (currentStream.data.groupPhotoOnline && typeof currentStream.data.groupPhotoOnline === 'string') {
-                window.open(`/media-direct/${currentStream.data.groupPhotoOnline}?token=${token}`, '_blank');
-            }
-        };
+    if(els.streamChannel) {
+        els.streamChannel.addEventListener('input', () => updateStreamPreview());
     }
 
-    if(els.btnViewPhotoOff) {
-        els.btnViewPhotoOff.onclick = () => {
-            if (currentStream.data.groupPhotoOffline && typeof currentStream.data.groupPhotoOffline === 'string') {
-                window.open(`/media-direct/${currentStream.data.groupPhotoOffline}?token=${token}`, '_blank');
-            }
-        };
-    }
-
-    // Photo Upload Handlers
-    if(els.btnUploadPhotoOn) {
-        els.btnUploadPhotoOn.onclick = () => {
-             // Reusing openMediaUpload logic but manually setting context/type
-            els.uploadType.value = 'image';
-            els.uploadContext.value = 'stream-photo-on';
-            els.mediaFileInput.value = '';
-            els.mediaCaption.value = '';
-            
-            els.captionGroup.classList.add('hidden'); // No caption for group photo
-            els.asStickerGroup.classList.add('hidden'); // No sticker conversion
-            
-            els.uploadModal.classList.remove('hidden');
-        };
-    }
-
-    if(els.btnUploadPhotoOff) {
-        els.btnUploadPhotoOff.onclick = () => {
-            els.uploadType.value = 'image';
-            els.uploadContext.value = 'stream-photo-off';
-            els.mediaFileInput.value = '';
-            els.mediaCaption.value = '';
-            
-            els.captionGroup.classList.add('hidden'); 
-            els.asStickerGroup.classList.add('hidden');
-            
-            els.uploadModal.classList.remove('hidden');
-        };
-    }
-
-    if(els.btnRemovePhotoOn) {
-        els.btnRemovePhotoOn.onclick = () => {
-            currentStream.data.groupPhotoOnline = null;
-            els.streamPhotoOnDisplay.value = 'Nenhuma Imagem definida';
-            els.btnRemovePhotoOn.classList.add('hidden');
-            els.btnViewPhotoOn.classList.add('hidden');
-        };
-    }
-
-    if(els.btnRemovePhotoOff) {
-        els.btnRemovePhotoOff.onclick = () => {
-            currentStream.data.groupPhotoOffline = null;
-            els.streamPhotoOffDisplay.value = 'Nenhuma Imagem definida';
-            els.btnRemovePhotoOff.classList.add('hidden');
-            els.btnViewPhotoOff.classList.add('hidden');
-        };
+    function updateStreamPreview() {
+        const channelName = els.streamChannel.value.trim() || 'streamer';
+        const showThumb = els.streamUseThumbnail.checked;
+        
+        els.streamWaThumbnail.classList.toggle('hidden', !showThumb);
+        
+        const isYtVideo = currentStream?.platform === 'youtube_video';
+        const mediaSource = isYtVideo ? currentStream?.data?.videoConfig?.media : currentStream?.data?.onConfig?.media;
+        const firstMedia = mediaSource?.[0];
+        
+        let textContent = firstMedia?.type === 'text' ? firstMedia.content : DEFAULT_MSG[currentStream?.platform || 'twitch'];
+        if (isYtVideo) {
+            textContent = textContent.replace(/\{author\}/gi, channelName).replace(/\{canal\}/gi, channelName).replace(/\{title\}/gi, 'Título do Vídeo').replace(/\{link\}/gi, `https://youtube.com/watch?v=exemplo`);
+        } else if (currentStream?.platform === 'youtube_live') {
+            textContent = textContent.replace(/\{canal\}/gi, channelName).replace(/\{titulo\}/gi, 'Título da Live').replace(/\{link\}/gi, `https://youtube.com/watch?v=live`);
+        } else {
+            textContent = textContent.replace(/\{canal\}/gi, channelName).replace(/\{link\}/gi, `https://${currentStream?.platform || 'twitch'}.tv/${channelName}`);
+        }
+        
+        if (els.streamWaText) {
+            els.streamWaText.innerHTML = formatWhatsAppMarkdown(textContent);
+        }
     }
 
     function renderStreamMediaList(containerId, mediaArray) {
         const container = document.getElementById(containerId);
+        if (!container) return;
         container.innerHTML = '';
         
         mediaArray.forEach((media, index) => {
             const div = document.createElement('div');
-            div.className = 'media-item';
+            div.className = 'inline-media-card';
             
-            let display = media.type;
-            if(media.type === 'text') {
+            if (media.type === 'text') {
                 const textVal = typeof media.content === 'string' ? media.content : String(media.content || '');
-                display = `📝 Texto: ${textVal.substring(0, 30)}...`;
+                div.innerHTML = `
+                    <div class="inline-media-info">
+                        <span class="inline-media-badge"><i class="fas fa-font"></i> Mensagem</span>
+                        <div class="inline-media-caption">${formatWhatsAppMarkdown(textVal)}</div>
+                    </div>
+                    <div class="inline-media-actions">
+                        <button type="button" class="btn btn-xs btn-outline btn-edit-stream-txt" title="Editar"><i class="fas fa-pen"></i></button>
+                        <button type="button" class="btn btn-xs btn-danger btn-remove-media-item" title="Remover"><i class="fas fa-trash"></i></button>
+                    </div>
+                `;
+                div.querySelector('.btn-edit-stream-txt').onclick = async () => {
+                    const promptTitle = currentStream?.platform === 'youtube_video' ? "Digite a mensagem do vídeo:" : "Digite a mensagem da stream:";
+                    const newText = await showCustomPrompt(promptTitle, textVal);
+                    if (newText !== null && newText.trim()) {
+                        media.content = newText.trim();
+                        renderStreamMediaList(containerId, mediaArray);
+                        updateStreamPreview();
+                    }
+                };
             } else {
                 const mediaLink = `/media-direct/${media.content}?token=${token}`;
                 const captionVal = typeof media.caption === 'string' ? media.caption : '';
-                const captionDisplay = captionVal ? `(${captionVal.substring(0, 10)}...)` : '';
-                display = `${getIcon(media.type)} ${media.type}: <a href="${mediaLink}" target="_blank" class="media-link">Clique para Visualizar</a> ${captionDisplay}`;
+                
+                div.innerHTML = `
+                    <img src="${mediaLink}" class="inline-media-thumb" alt="${media.type}" onerror="this.src='/android-chrome-192x192.png'">
+                    <div class="inline-media-info">
+                        <span class="inline-media-badge">${getIcon(media.type)} ${media.type}</span>
+                        <div class="inline-media-caption">${captionVal ? formatWhatsAppMarkdown(captionVal) : '<span class="text-muted">(Sem legenda)</span>'}</div>
+                    </div>
+                    <div class="inline-media-actions">
+                        <button type="button" class="btn btn-xs btn-danger btn-remove-media-item" title="Remover"><i class="fas fa-trash"></i></button>
+                    </div>
+                `;
             }
 
-            div.innerHTML = `
-                <div class="media-item-content">${display}</div>
-                <div class="btn-group">
-                    <button class="btn btn-xs btn-danger btn-remove-media-item"><i class="fas fa-trash"></i></button>
-                </div>
-            `;
-            
             div.querySelector('.btn-remove-media-item').onclick = async () => {
                 if(await showCustomConfirm('Remover este item?')) {
                     mediaArray.splice(index, 1);
                     renderStreamMediaList(containerId, mediaArray);
+                    updateStreamPreview();
                 }
             };
 
@@ -1013,55 +1662,49 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     window.addStreamMedia = async function(context, type) {
-        const targetArray = context === 'on' ? currentStream.data.onConfig.media : currentStream.data.offConfig.media;
+        const isYtVideo = currentStream?.platform === 'youtube_video';
+        let targetArray;
+        if (isYtVideo) {
+            if (!currentStream.data.videoConfig) currentStream.data.videoConfig = { media: [] };
+            targetArray = currentStream.data.videoConfig.media;
+        } else {
+            targetArray = context === 'on' ? currentStream.data.onConfig.media : currentStream.data.offConfig.media;
+        }
         
         if (type === 'text') {
-            const text = await showCustomPrompt("Digite o texto:");
+            const promptTitle = isYtVideo ? "Digite o texto da notificação de novo vídeo:" : "Digite o texto da notificação:";
+            const text = await showCustomPrompt(promptTitle);
             if (text) {
                 const existingIdx = targetArray.findIndex(m => m.type === 'text');
                 if(existingIdx !== -1) targetArray.splice(existingIdx, 1);
                 
                 targetArray.push({ type: 'text', content: text });
                 renderStreamMediaList(`stream-${context}-media-list`, targetArray);
+                updateStreamPreview();
             }
         } else {
             els.uploadType.value = type;
             els.uploadContext.value = `stream-${context}`;
             els.mediaFileInput.value = '';
             els.mediaCaption.value = '';
-            
+
             els.captionGroup.classList.remove('hidden');
             els.asStickerGroup.classList.add('hidden');
-            if(type === 'image' || type === 'video' || type === 'gif') els.asStickerGroup.classList.remove('hidden');
             
             const existingVarBtn = els.captionGroup.querySelector('.btn-insert-var');
             if(existingVarBtn) existingVarBtn.remove();
-            if(type === 'image' || type === 'video' || type === 'gif') {
-                const varBtn = document.createElement('button');
-                varBtn.type = 'button';
-                varBtn.className = 'btn-insert-var';
-                varBtn.innerHTML = '<i class="fas fa-plus-circle"></i> Variável';
-                varBtn.onclick = () => openVariableModal(els.mediaCaption);
-                els.captionGroup.appendChild(varBtn);
-            }
+            
+            const varBtn = document.createElement('button');
+            varBtn.type = 'button';
+            varBtn.className = 'btn btn-xs btn-outline mt-1';
+            varBtn.innerHTML = '<i class="fas fa-plus-circle"></i> Inserir Variável';
+            varBtn.onclick = () => openVariableModal(els.mediaCaption);
+            els.captionGroup.appendChild(varBtn);
 
-            if(type === 'image') {
-                els.mediaFileInput.setAttribute('accept', 'image/*');
-            } else if(type === 'video') {
-                els.mediaFileInput.setAttribute('accept', 'video/*');
-            } else if(type === 'audio') {
-                els.mediaFileInput.setAttribute('accept', 'audio/*');
-            } else if(type === 'sticker') {
-                els.mediaFileInput.setAttribute('accept', 'image/*,video/*,image/webp');
-            } else if(type === 'gif') {
-                els.mediaFileInput.setAttribute('accept', 'image/gif,image/webp,video/mp4,video/*');
-            } else {
-                els.mediaFileInput.removeAttribute('accept');
-            }
-
+            setupMediaAccept(type);
             els.uploadModal.classList.remove('hidden');
         }
-    }
+    };
 
     window.addDirectMedia = async function(context, type) {
         if (type === 'text') {
@@ -1085,38 +1728,40 @@ document.addEventListener('DOMContentLoaded', () => {
             
             const existingVarBtn = els.captionGroup.querySelector('.btn-insert-var');
             if(existingVarBtn) existingVarBtn.remove();
+            
             if(type === 'image' || type === 'video' || type === 'gif') {
                 const varBtn = document.createElement('button');
                 varBtn.type = 'button';
-                varBtn.className = 'btn-insert-var';
-                varBtn.innerHTML = '<i class="fas fa-plus-circle"></i> Variável';
+                varBtn.className = 'btn btn-xs btn-outline mt-1';
+                varBtn.innerHTML = '<i class="fas fa-plus-circle"></i> Inserir Variável';
                 varBtn.onclick = () => openVariableModal(els.mediaCaption);
                 els.captionGroup.appendChild(varBtn);
             }
 
-            if(type === 'image') {
-                els.mediaFileInput.setAttribute('accept', 'image/*');
-            } else if(type === 'video') {
-                els.mediaFileInput.setAttribute('accept', 'video/*');
-            } else if(type === 'audio') {
-                els.mediaFileInput.setAttribute('accept', 'audio/*');
-            } else if(type === 'sticker') {
-                els.mediaFileInput.setAttribute('accept', 'image/*,video/*,image/webp');
-            } else if(type === 'gif') {
-                els.mediaFileInput.setAttribute('accept', 'image/gif,image/webp,video/mp4,video/*');
-            } else {
-                els.mediaFileInput.removeAttribute('accept');
-            }
-
+            setupMediaAccept(type);
             els.uploadModal.classList.remove('hidden');
         }
     };
+
+    function setupMediaAccept(type) {
+        if(type === 'image') els.mediaFileInput.setAttribute('accept', 'image/*');
+        else if(type === 'video') els.mediaFileInput.setAttribute('accept', 'video/*');
+        else if(type === 'audio') els.mediaFileInput.setAttribute('accept', 'audio/*');
+        else if(type === 'sticker') els.mediaFileInput.setAttribute('accept', 'image/*,video/*,image/webp');
+        else if(type === 'gif') els.mediaFileInput.setAttribute('accept', 'image/gif,image/webp,video/mp4,video/*');
+        else els.mediaFileInput.removeAttribute('accept');
+    }
 
     els.btnSaveStream.onclick = async () => {
         const channel = els.streamChannel.value.trim();
         if (!channel) return await showCustomAlert('Nome do canal obrigatório.');
         
         const platform = currentStream.platform;
+        const isYtVideo = platform === 'youtube_video';
+        const isYtLive = platform === 'youtube_live';
+        const isYoutube = isYtVideo || isYtLive;
+        const storeKey = isYoutube ? 'youtube' : platform;
+
         if (platform === 'twitch' || platform === 'kick') {
             if (channel.includes('/') || channel.includes('http')) return await showCustomAlert('Digite apenas o usuário, não a URL.');
             if (!/^[a-zA-Z0-9_]{2,50}$/.test(channel)) return await showCustomAlert('Nome de usuário inválido.');
@@ -1125,49 +1770,136 @@ document.addEventListener('DOMContentLoaded', () => {
         const d = currentStream.data;
         d.channel = channel;
         d.mentionAllMembers = els.streamMention.checked;
-        d.changeTitleOnEvent = els.streamChangeTitle.checked;
-        d.changePhotoOnEvent = els.streamChangePhoto.checked;
         d.useAI = els.streamAI.checked;
-        d.onlineTitle = els.streamTitleOn.value;
-        d.offlineTitle = els.streamTitleOff.value;
-        d.groupPhotoOnline = currentStream.data.groupPhotoOnline;
-        d.groupPhotoOffline = currentStream.data.groupPhotoOffline;
+        d.useThumbnail = els.streamUseThumbnail.checked;
 
-        if (!groupData[platform]) groupData[platform] = [];
+        // Coleta canais do WhatsApp marcados para encaminhamento
+        const forwardCheckboxes = document.querySelectorAll('.stream-forward-ch-checkbox');
+        const forwardJids = [];
+        forwardCheckboxes.forEach(cb => {
+            if (cb.checked && cb.dataset.jid) {
+                forwardJids.push(cb.dataset.jid);
+            }
+        });
+        d.forwardToChannels = forwardJids;
+
+        if (!isYtVideo) {
+            d.changeTitleOnEvent = els.streamChangeTitle.checked;
+            d.changePhotoOnEvent = els.streamChangePhoto ? els.streamChangePhoto.checked : false;
+            d.onlineTitle = els.streamTitleOn.value;
+            d.offlineTitle = els.streamTitleOff.value;
+        }
+
+        if (isYtVideo) {
+            d.notifyVideos = true;
+        } else if (isYtLive) {
+            d.notifyLives = true;
+        }
+
+        if (!groupData[storeKey]) groupData[storeKey] = [];
         
-        if (currentStream.index !== null) {
-            groupData[platform][currentStream.index] = d;
+        if (currentStream.index !== null && !isNaN(currentStream.index)) {
+            groupData[storeKey][currentStream.index] = d;
         } else {
-            groupData[platform].push(d);
+            if (isYoutube) {
+                const existingIdx = groupData.youtube.findIndex(
+                    s => s.channel.toLowerCase() === channel.toLowerCase()
+                );
+                if (existingIdx !== -1) {
+                    groupData.youtube[existingIdx].forwardToChannels = forwardJids;
+                    if (isYtVideo) {
+                        groupData.youtube[existingIdx].notifyVideos = true;
+                        groupData.youtube[existingIdx].videoConfig = d.videoConfig;
+                    } else {
+                        groupData.youtube[existingIdx].notifyLives = true;
+                        groupData.youtube[existingIdx].onConfig = d.onConfig;
+                        groupData.youtube[existingIdx].offConfig = d.offConfig;
+                        groupData.youtube[existingIdx].changeTitleOnEvent = d.changeTitleOnEvent;
+                        groupData.youtube[existingIdx].changePhotoOnEvent = d.changePhotoOnEvent;
+                        groupData.youtube[existingIdx].onlineTitle = d.onlineTitle;
+                        groupData.youtube[existingIdx].offlineTitle = d.offlineTitle;
+                    }
+                } else {
+                    groupData.youtube.push(d);
+                }
+            } else {
+                groupData[storeKey].push(d);
+            }
         }
 
         setDirty(true);
-        renderStreamSection(platform);
+        if (isYoutube) {
+            renderStreamSection('youtube_video');
+            renderStreamSection('youtube_live');
+        } else {
+            renderStreamSection(platform);
+        }
         els.streamModal.classList.add('hidden');
     };
 
     els.btnDeleteStream.onclick = async () => {
         if(!await showCustomConfirm('Tem certeza que deseja remover este canal?')) return;
         const { platform, index } = currentStream;
-        groupData[platform].splice(index, 1);
+        const isYtVideo = platform === 'youtube_video';
+        const isYtLive = platform === 'youtube_live';
+        const isYoutube = isYtVideo || isYtLive;
+
+        if (isYoutube) {
+            const stream = groupData.youtube[index];
+            if (stream) {
+                if (isYtVideo) {
+                    stream.notifyVideos = false;
+                } else if (isYtLive) {
+                    stream.notifyLives = false;
+                }
+                if (stream.notifyVideos === false && stream.notifyLives === false) {
+                    groupData.youtube.splice(index, 1);
+                }
+            }
+            renderStreamSection('youtube_video');
+            renderStreamSection('youtube_live');
+        } else {
+            groupData[platform].splice(index, 1);
+            renderStreamSection(platform);
+        }
+
         setDirty(true);
-        renderStreamSection(platform);
         els.streamModal.classList.add('hidden');
     };
 
+    // --- Custom Commands & Live WhatsApp Simulator ---
 
-    // --- Custom Commands CRUD ---
+    async function deleteCustomCommand(trigger) {
+        if (!trigger) return;
+        if (!await showCustomConfirm(`Tem certeza que deseja apagar o comando "${escapeHtml(trigger)}"?`, 'Excluir Comando')) return;
+        try {
+            const url = `${API_BASE}/custom-commands/${groupId}/${encodeURIComponent(trigger)}?token=${token}`;
+            const res = await fetch(url, { method: 'DELETE' });
+            if (res.ok) {
+                await loadData();
+                if (els.cmdModal && !els.cmdModal.classList.contains('hidden')) {
+                    els.cmdModal.classList.add('hidden');
+                }
+            } else {
+                await showCustomAlert('Erro ao deletar comando.');
+            }
+        } catch (e) {
+            await showCustomAlert('Erro: ' + e.message);
+        }
+    }
 
     function renderCommandsTable() {
         const tbody = document.querySelector('#commands-table tbody');
+        if (!tbody) return;
         tbody.innerHTML = '';
         const activeCmds = customCommands.filter(c => !c.deleted);
         
+        const noCmdsMsg = document.getElementById('no-commands-msg');
         if (activeCmds.length === 0) {
-            document.getElementById('no-commands-msg').classList.remove('hidden');
+            if (noCmdsMsg) noCmdsMsg.classList.remove('hidden');
             return;
         } else {
-            document.getElementById('no-commands-msg').classList.add('hidden');
+            if (noCmdsMsg) noCmdsMsg.classList.add('hidden');
         }
 
         activeCmds.forEach(cmd => {
@@ -1188,44 +1920,62 @@ document.addEventListener('DOMContentLoaded', () => {
             if (responsesCount > 1) respPreview += ` (+${responsesCount-1})`;
 
             tr.innerHTML = `
-                <td>
-                    <button class="btn btn-xs btn-primary btn-edit-cmd"><i class="fas fa-edit"></i></button>
+                <td style="white-space: nowrap;">
+                    <div class="table-actions">
+                        <button type="button" class="btn btn-xs btn-primary btn-edit-cmd" title="Editar comando"><i class="fas fa-edit"></i></button>
+                        <button type="button" class="btn btn-xs btn-danger btn-delete-cmd-row" title="Excluir comando"><i class="fas fa-trash"></i></button>
+                    </div>
                 </td>
-                <td>${cmd.startsWith} ${!cmd.active ? '(Desativado)' : ''}</td>
+                <td>
+                    <strong>${cmd.startsWith}</strong>
+                    ${!cmd.active ? ' <span class="text-danger text-sm">(Desativado)</span>' : ''}
+                    ${cmd.replyInPvivate ? ' <span class="badge-soon" style="color:#04a9f0; border-color:#04a9f0;">PV</span>' : ''}
+                </td>
                 <td>${respPreview}</td>
             `;
             
             tr.querySelector('.btn-edit-cmd').onclick = () => openCommandModal(cmd);
+            tr.querySelector('.btn-delete-cmd-row').onclick = () => deleteCustomCommand(cmd.startsWith);
             tbody.appendChild(tr);
         });
     }
 
     document.getElementById('btn-add-command').onclick = () => openCommandModal(null);
 
-    let currentEditingCmd = null;
-
     function openCommandModal(cmd) {
         currentEditingCmd = cmd;
         els.modalTitle.textContent = cmd ? 'Editar Comando' : 'Novo Comando';
         els.btnDeleteCmd.classList.toggle('hidden', !cmd);
-        els.cmdResponsesList.innerHTML = '';
+        if (els.cmdResponsesList) els.cmdResponsesList.innerHTML = '';
 
         if (cmd) {
             els.cmdTrigger.value = cmd.startsWith;
-            els.cmdActive.checked = cmd.active;
+            els.cmdActive.checked = cmd.active !== false;
             els.cmdInteract.checked = !cmd.ignoreInteract;
             els.cmdReplyQuote.checked = cmd.reply !== false; 
             els.cmdSendAll.checked = !!cmd.sendAllResponses;
             els.cmdAdminOnly.checked = !!cmd.adminOnly;
+            els.cmdReplyPrivate.checked = !!cmd.replyInPvivate;
             els.cmdEmoji.value = cmd.react || '';
+            els.cmdStartEmoji.value = cmd.reactions?.before || '';
             els.cmdCooldown.value = cmd.cooldown || 0;
             currentCmdMentions = cmd.mentions || [];
             
-            if (cmd.responses) {
+            els.cmdTimeStart.value = cmd.allowedTimes?.start || '';
+            els.cmdTimeEnd.value = cmd.allowedTimes?.end || '';
+
+            const allowedDays = cmd.allowedDays || [];
+            document.querySelectorAll('.btn-day-pill').forEach(btn => {
+                btn.classList.toggle('active', allowedDays.includes(btn.dataset.day));
+            });
+
+            if (cmd.responses && cmd.responses.length > 0) {
                 cmd.responses.forEach(r => addResponseInput('text', r));
+            } else {
+                addResponseInput('text', '');
             }
             
-            els.cmdMetadata.innerHTML = `Criado por: ${cmd.metadata?.createdBy || '?'} em ${new Date(cmd.metadata?.createdAt || Date.now()).toLocaleString()}<br>Usado ${cmd.count || 0} vezes.`;
+            els.cmdMetadata.innerHTML = `Criado por: ${cmd.metadata?.createdBy || '?'} em ${new Date(cmd.metadata?.createdAt || Date.now()).toLocaleString('pt-BR')}<br>Usado ${cmd.count || 0} vezes.`;
         } else {
             els.cmdTrigger.value = '';
             els.cmdActive.checked = true;
@@ -1233,19 +1983,98 @@ document.addEventListener('DOMContentLoaded', () => {
             els.cmdReplyQuote.checked = true;
             els.cmdSendAll.checked = false;
             els.cmdAdminOnly.checked = false;
+            els.cmdReplyPrivate.checked = false;
             els.cmdEmoji.value = '';
+            els.cmdStartEmoji.value = '';
             els.cmdCooldown.value = 0;
+            els.cmdTimeStart.value = '';
+            els.cmdTimeEnd.value = '';
+            document.querySelectorAll('.btn-day-pill').forEach(btn => btn.classList.remove('active'));
             currentCmdMentions = [];
             addResponseInput('text', '');
             els.cmdMetadata.innerHTML = '';
         }
 
         renderCmdTags();
+        updateWhatsAppCmdPreview();
         els.cmdModal.classList.remove('hidden');
     }
 
+    // Days pill toggles
+    document.querySelectorAll('.btn-day-pill').forEach(btn => {
+        btn.onclick = () => {
+            btn.classList.toggle('active');
+        };
+    });
+
+    // Update WhatsApp Live Preview
+    function updateWhatsAppCmdPreview() {
+        const inputs = document.querySelectorAll('.cmd-response-input');
+        const firstVal = inputs.length > 0 ? inputs[0].value.trim() : '';
+        
+        const now = new Date();
+        const timeStr = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
+        els.cmdWaTime.textContent = timeStr;
+
+        if (!firstVal) {
+            els.cmdWaMedia.classList.add('hidden');
+            els.cmdWaMedia.innerHTML = '';
+            els.cmdWaText.innerHTML = '<em>Digite uma resposta abaixo para ver a simulação...</em>';
+            return;
+        }
+
+        if (firstVal.startsWith('{') && firstVal.includes('}')) {
+            const end = firstVal.indexOf('}');
+            const meta = firstVal.substring(1, end).split('-');
+            const type = meta[0];
+            const filename = meta[1];
+            const caption = firstVal.substring(end + 1).trim();
+
+            els.cmdWaMedia.classList.remove('hidden');
+            
+            if (type === 'image' || type === 'sticker') {
+                els.cmdWaMedia.innerHTML = `<img src="/media-direct/${filename}?token=${token}" onerror="this.src='/android-chrome-192x192.png'">`;
+            } else if (type === 'video' || type === 'gif') {
+                els.cmdWaMedia.innerHTML = `<div class="wa-thumb-placeholder"><i class="fas fa-play"></i> Vídeo / GIF</div>`;
+            } else if (type === 'audio') {
+                els.cmdWaMedia.innerHTML = `
+                    <div class="wa-audio-mock">
+                        <div class="wa-audio-btn"><i class="fas fa-play"></i></div>
+                        <div class="wa-audio-waveform-container">
+                            <div class="wa-waveform">
+                                <div class="wa-waveform-bar" style="height: 6px;"></div>
+                                <div class="wa-waveform-bar" style="height: 12px;"></div>
+                                <div class="wa-waveform-bar" style="height: 18px;"></div>
+                                <div class="wa-waveform-bar" style="height: 10px;"></div>
+                                <div class="wa-waveform-bar" style="height: 14px;"></div>
+                                <div class="wa-waveform-bar" style="height: 8px;"></div>
+                                <div class="wa-waveform-bar" style="height: 16px;"></div>
+                                <div class="wa-waveform-bar" style="height: 12px;"></div>
+                            </div>
+                            <div class="wa-audio-info"><span>0:15</span><span><i class="fas fa-microphone"></i></span></div>
+                        </div>
+                    </div>
+                `;
+            } else {
+                els.cmdWaMedia.innerHTML = `<div class="wa-thumb-placeholder">[Mídia ${type}]</div>`;
+            }
+
+            els.cmdWaText.innerHTML = caption ? formatWhatsAppMarkdown(caption) : '';
+            if (!caption) els.cmdWaText.classList.add('hidden');
+            else els.cmdWaText.classList.remove('hidden');
+
+        } else {
+            els.cmdWaMedia.classList.add('hidden');
+            els.cmdWaMedia.innerHTML = '';
+            els.cmdWaText.classList.remove('hidden');
+            els.cmdWaText.innerHTML = formatWhatsAppMarkdown(firstVal);
+        }
+    }
+
+    // Emoji Grid
     function renderEmojiGrid() {
         const container = document.getElementById('emoji-list');
+        if (!container) return;
         container.innerHTML = '';
         COMMON_EMOJIS.forEach(emoji => {
             const span = document.createElement('span');
@@ -1257,13 +2086,35 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function insertEmoji(emoji) {
-        els.cmdEmoji.value = emoji;
+        if (activeEmojiTarget === 'cmd-start-emoji') {
+            els.cmdStartEmoji.value = emoji;
+        } else {
+            els.cmdEmoji.value = emoji;
+        }
         setDirty(true);
         els.emojiModal.classList.add('hidden');
     }
 
+    if (els.btnEmojiPicker) {
+        els.btnEmojiPicker.onclick = () => {
+            activeEmojiTarget = 'cmd-emoji';
+            renderEmojiGrid();
+            els.emojiModal.classList.remove('hidden');
+        };
+    }
+
+    if (els.btnStartEmojiPicker) {
+        els.btnStartEmojiPicker.onclick = () => {
+            activeEmojiTarget = 'cmd-start-emoji';
+            renderEmojiGrid();
+            els.emojiModal.classList.remove('hidden');
+        };
+    }
+
+    // Variables Picker
     function renderVariables(filter = '') {
         const container = document.getElementById('variable-list');
+        if (!container) return;
         container.innerHTML = '';
         
         const filtered = AVAILABLE_VARIABLES.filter(v => 
@@ -1279,6 +2130,40 @@ document.addEventListener('DOMContentLoaded', () => {
                 <div class="variable-desc">${v.desc}</div>
             `;
             div.onclick = () => insertVariable(v.code);
+            container.appendChild(div);
+        });
+    }
+
+    function renderLanguages(filter = '') {
+        const container = document.getElementById('variable-list');
+        if (!container) return;
+        container.innerHTML = '';
+        
+        const filtered = AVAILABLE_LANGUAGES.filter(l =>
+            l.code.toLowerCase().includes(filter.toLowerCase()) ||
+            l.desc.toLowerCase().includes(filter.toLowerCase())
+        );
+
+        if (filtered.length === 0) {
+            container.innerHTML = '<div class="p-3 text-center text-muted">Nenhum idioma encontrado.</div>';
+            return;
+        }
+
+        filtered.forEach(lang => {
+            const div = document.createElement('div');
+            div.className = 'variable-item';
+            div.innerHTML = `
+                <div class="variable-code">${lang.code}</div>
+                <div class="variable-desc">${lang.desc}</div>
+            `;
+            div.onclick = () => {
+                const translateLangInput = document.getElementById('translate-lang');
+                if (translateLangInput) {
+                    translateLangInput.value = lang.code;
+                    setDirty(true);
+                }
+                els.variableModal.classList.add('hidden');
+            };
             container.appendChild(div);
         });
     }
@@ -1305,6 +2190,7 @@ document.addEventListener('DOMContentLoaded', () => {
             lastFocusedInput.selectionStart = lastFocusedInput.selectionEnd = start + code.length;
             lastFocusedInput.focus();
             lastFocusedInput.dispatchEvent(new Event('input')); 
+            updateWhatsAppCmdPreview();
         }
         els.variableModal.classList.add('hidden');
     }
@@ -1320,30 +2206,32 @@ document.addEventListener('DOMContentLoaded', () => {
 
         if (isMedia) {
             const end = value.indexOf('}');
-            const meta = value.substring(1, end).split('-');
-            mediaType = meta[0]; 
-            mediaContent = meta[1]; 
-            mediaCaption = value.substring(end+1).trim();
+            const inside = value.substring(1, end);
+            const firstDash = inside.indexOf('-');
+            mediaType = firstDash !== -1 ? inside.substring(0, firstDash) : inside;
+            mediaContent = firstDash !== -1 ? inside.substring(firstDash + 1) : '';
+            mediaCaption = value.substring(end + 1).trim();
         }
 
         if (mediaType === 'text') {
              div.innerHTML = `
                 <div style="flex: 1; display: flex; flex-direction: column;">
-                    <textarea class="form-control cmd-response-input" rows="2" placeholder="Texto da resposta"></textarea>
-                    <button type="button" class="btn-insert-var"><i class="fas fa-plus-circle"></i> Variável</button>
+                    <textarea class="form-control cmd-response-input" rows="2" placeholder="Texto da resposta..."></textarea>
+                    <button type="button" class="btn btn-xs btn-outline btn-insert-var mt-1"><i class="fas fa-plus-circle"></i> Inserir Variável</button>
                 </div>
                 <button type="button" class="btn btn-xs btn-danger remove-resp" style="align-self: flex-start; margin-top: 5px;"><i class="fas fa-trash"></i></button>
             `;
             const textarea = div.querySelector('textarea');
             textarea.value = value && !isMedia ? value : '';
+            textarea.addEventListener('input', () => updateWhatsAppCmdPreview());
             div.querySelector('.btn-insert-var').onclick = () => openVariableModal(textarea);
         } else {
             const isVideo = mediaType === 'video';
             const convertLinkHtml = isVideo ? ` | <a href="#" class="media-link btn-convert-gif">Converter pra GIF</a>` : '';
             const mediaLink = `/media-direct/${mediaContent}?token=${token}`;
             div.innerHTML = `
-                <div class="media-preview form-control">
-                    ${getIcon(mediaType)} <span class="media-type-lbl">${mediaType}</span>: <a href="${mediaLink}" target="_blank" class="media-link">Clique para Visualizar</a>${convertLinkHtml} 
+                <div class="media-preview form-control" style="font-size: 0.88rem;">
+                    ${getIcon(mediaType)} <span class="media-type-lbl">${mediaType}</span>: <a href="${mediaLink}" target="_blank" class="media-link">Ver Mídia</a>${convertLinkHtml} 
                     ${mediaCaption ? ` (${mediaCaption})` : ''}
                 </div>
                 <input type="hidden" class="cmd-response-input" value="${value}">
@@ -1356,23 +2244,19 @@ document.addEventListener('DOMContentLoaded', () => {
                     const newValue = value.replace(/^\{video-/, '{gif-');
                     div.querySelector('.cmd-response-input').value = newValue;
                     div.querySelector('.media-type-lbl').textContent = 'gif';
-                    
-                    const previewDiv = div.querySelector('.media-preview');
-                    previewDiv.innerHTML = previewDiv.innerHTML.replace(getIcon('video'), getIcon('gif'));
-                    
-                    const convertBtn = div.querySelector('.btn-convert-gif');
-                    if (convertBtn) {
-                        convertBtn.previousSibling.textContent = '';
-                        convertBtn.remove();
-                    }
                     setDirty(true);
+                    updateWhatsAppCmdPreview();
                 };
             }
         }
 
-        div.querySelector('.remove-resp').onclick = () => div.remove();
+        div.querySelector('.remove-resp').onclick = () => {
+            div.remove();
+            updateWhatsAppCmdPreview();
+        };
         els.cmdResponsesList.appendChild(div);
-    }
+        updateWhatsAppCmdPreview();
+    };
 
     window.openMediaUpload = function(type) {
         els.uploadType.value = type;
@@ -1391,125 +2275,113 @@ document.addEventListener('DOMContentLoaded', () => {
             els.asStickerGroup.classList.remove('hidden');
             const varBtn = document.createElement('button');
             varBtn.type = 'button';
-            varBtn.className = 'btn-insert-var';
-            varBtn.innerHTML = '<i class="fas fa-plus-circle"></i> Variável';
+            varBtn.className = 'btn btn-xs btn-outline mt-1';
+            varBtn.innerHTML = '<i class="fas fa-plus-circle"></i> Inserir Variável';
             varBtn.onclick = () => openVariableModal(els.mediaCaption);
             els.captionGroup.appendChild(varBtn);
         }
 
-        if(type === 'image') {
-            els.mediaFileInput.setAttribute('accept', 'image/*');
-        } else if(type === 'video') {
-            els.mediaFileInput.setAttribute('accept', 'video/*');
-        } else if(type === 'audio') {
-            els.mediaFileInput.setAttribute('accept', 'audio/*');
-        } else if(type === 'sticker') {
-            els.mediaFileInput.setAttribute('accept', 'image/*,video/*,image/webp');
-        } else if(type === 'gif') {
-            els.mediaFileInput.setAttribute('accept', 'image/gif,image/webp,video/mp4,video/*');
-        } else {
-            els.mediaFileInput.removeAttribute('accept');
-        }
-
+        setupMediaAccept(type);
         els.uploadModal.classList.remove('hidden');
-    }
+    };
 
-    // --- Upload Logic ---
-
+    // Upload Execution
     els.btnConfirmUpload.addEventListener('click', () => {
         const file = els.mediaFileInput.files[0];
         if (!file) return showCustomAlert('Selecione um arquivo');
-        
-        const type = els.uploadType.value;
+
+        let type = els.uploadType.value;
         const context = els.uploadContext.value;
         const caption = els.mediaCaption.value;
-        const asSticker = document.getElementById('convert-sticker').checked;
-        const finalType = asSticker ? 'sticker' : type;
-        const name = `${Date.now()}-${file.name}`;
+        const convertToSticker = els.convertSticker.checked;
+
+        if (convertToSticker) type = 'sticker';
 
         const formData = new FormData();
-        formData.append('file', file);
         formData.append('token', token);
         formData.append('groupId', groupId);
-        formData.append('type', finalType); 
-        formData.append('name', name);
+        formData.append('type', context);
+        formData.append('name', Date.now());
         formData.append('caption', caption);
+        formData.append('file', file);
 
         els.btnConfirmUpload.disabled = true;
-        els.btnConfirmUpload.innerHTML = 'Enviando... 0%';
-        
-        els.uploadStatus.innerHTML = '<span class="text-warning"><i class="fas fa-spinner fa-spin"></i> Aguarde! Não feche enquanto o arquivo está sendo enviado.</span>';
+        els.btnConfirmUpload.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Enviando...';
+        els.uploadStatus.innerHTML = '<div class="text-sm text-muted">Processando upload...</div>';
 
         const xhr = new XMLHttpRequest();
-        xhr.open('POST', `${API_BASE}/upload-media`, true);
-
-        xhr.upload.onprogress = (e) => {
-            if (e.lengthComputable) {
-                const percent = Math.round((e.loaded / e.total) * 100);
-                els.btnConfirmUpload.innerHTML = `Enviando... ${percent}%`;
-            }
-        };
+        xhr.open('POST', `${API_BASE}/upload-media`);
 
         xhr.onload = () => {
             if (xhr.status === 200) {
-                const data = JSON.parse(xhr.responseText);
+                let data = {};
+                try {
+                    data = JSON.parse(xhr.responseText);
+                } catch (e) {
+                    showCustomAlert('Resposta inválida do servidor.');
+                    cleanup();
+                    return;
+                }
                 if (data.success) {
+                    const finalType = type;
+                    const responseStr = `{${finalType}-${data.fileName}} ${caption}`.trim();
+
                     if (context === 'command') {
-                        const formatted = `{${finalType}-${data.fileName}} ${caption}`;
-                        addResponseInput(finalType, formatted);
-                    } else if (['greetings', 'farewells'].includes(context)) {
+                        addResponseInput(finalType, responseStr);
+                    } else if (context === 'greetings' || context === 'farewells') {
                         if (!groupData[context]) groupData[context] = {};
                         groupData[context][finalType] = { file: data.fileName, caption: caption };
                         renderMediaList(`${context}-list`, groupData[context], context);
                         setDirty(true);
                     } else if (context === 'stream-on') {
-                        const existingIdx = currentStream.data.onConfig.media.findIndex(m => m.type === finalType);
-                        if(existingIdx !== -1) currentStream.data.onConfig.media.splice(existingIdx, 1);
                         currentStream.data.onConfig.media.push({ type: finalType, content: data.fileName, caption });
                         renderStreamMediaList('stream-on-media-list', currentStream.data.onConfig.media);
+                        updateStreamPreview();
                     } else if (context === 'stream-off') {
-                        const existingIdx = currentStream.data.offConfig.media.findIndex(m => m.type === finalType);
-                        if(existingIdx !== -1) currentStream.data.offConfig.media.splice(existingIdx, 1);
                         currentStream.data.offConfig.media.push({ type: finalType, content: data.fileName, caption });
                         renderStreamMediaList('stream-off-media-list', currentStream.data.offConfig.media);
-                    } else if (context === 'stream-photo-on') {
-                        currentStream.data.groupPhotoOnline = data.fileName;
-                        els.streamPhotoOnDisplay.value = data.fileName;
-                        els.btnRemovePhotoOn.classList.remove('hidden');
-                        els.btnViewPhotoOn.classList.remove('hidden');
-                    } else if (context === 'stream-photo-off') {
-                        currentStream.data.groupPhotoOffline = data.fileName;
-                        els.streamPhotoOffDisplay.value = data.fileName;
-                        els.btnRemovePhotoOff.classList.remove('hidden');
-                        els.btnViewPhotoOff.classList.remove('hidden');
                     }
                     els.uploadModal.classList.add('hidden');
                 } else {
-                    showCustomAlert('Erro: ' + data.message);
+                    showCustomAlert('Erro: ' + (data.message || 'Falha no upload.'));
                 }
             } else {
-                showCustomAlert('Erro no upload');
+                let errorMsg = 'Erro no upload.';
+                try {
+                    const errData = JSON.parse(xhr.responseText);
+                    if (errData && errData.message) {
+                        errorMsg = errData.message;
+                    }
+                } catch {}
+                console.error('[Upload] Falha:', xhr.status, xhr.responseText);
+                if (xhr.status === 401 && errorMsg.toLowerCase().includes('token')) {
+                    showCustomAlert(`Sessão expirada: ${errorMsg}`);
+                } else {
+                    showCustomAlert(`Erro no upload (${xhr.status}): ${errorMsg}`);
+                }
             }
             cleanup();
         };
 
         xhr.onerror = () => {
-            showCustomAlert('Erro de rede');
+            console.error('[Upload] Erro de rede ou conexão');
+            showCustomAlert('Erro de conexão durante o upload.');
             cleanup();
         };
 
         function cleanup() {
             els.btnConfirmUpload.disabled = false;
-            els.btnConfirmUpload.innerHTML = 'Upload';
+            els.btnConfirmUpload.innerHTML = 'Fazer Upload';
             els.uploadStatus.innerHTML = '';
         }
 
         xhr.send(formData);
     });
 
+    // Save Custom Command
     els.btnSaveCmd.addEventListener('click', async () => {
         let trigger = els.cmdTrigger.value.trim().toLowerCase();
-        if (!trigger) return await showCustomAlert('O comando precisa de um gatilho');
+        if (!trigger) return await showCustomAlert('O comando precisa de um gatilho.');
 
         const prefix = (groupData.prefix || '!').trim();
         if (trigger.startsWith(prefix)) {
@@ -1518,22 +2390,49 @@ document.addEventListener('DOMContentLoaded', () => {
             trigger = trigger.substring(1).trim();
         }
 
-        if (!trigger) return await showCustomAlert('O comando precisa de um gatilho válido (sem apenas o prefixo)');
+        if (!trigger) return await showCustomAlert('O comando precisa de um gatilho válido.');
 
         const inputs = document.querySelectorAll('.cmd-response-input');
         const responses = Array.from(inputs).map(i => i.value).filter(v => v.trim() !== '');
         
-        if (responses.length === 0) return await showCustomAlert('Adicione pelo menos uma resposta');
+        if (responses.length === 0) return await showCustomAlert('Adicione pelo menos uma resposta ao comando.');
 
         const rawCooldown = parseInt(els.cmdCooldown.value);
         const cooldownValue = isNaN(rawCooldown) || rawCooldown < 0 ? 0 : Math.min(rawCooldown, 60000);
 
+        // Allowed days
+        const selectedDays = [];
+        document.querySelectorAll('.btn-day-pill.active').forEach(b => selectedDays.push(b.dataset.day));
+
+        // Allowed times
+        let allowedTimes = null;
+        const timeStart = els.cmdTimeStart.value;
+        const timeEnd = els.cmdTimeEnd.value;
+        if (timeStart && timeEnd) {
+            allowedTimes = { start: timeStart, end: timeEnd };
+        }
+
+        // Reactions
+        const startEmoji = els.cmdStartEmoji.value.trim();
+        let reactions = null;
+        if (startEmoji) {
+            reactions = { before: startEmoji, error: '❌' };
+        }
+
         const newCmd = {
-            startsWith: trigger, responses: responses, active: els.cmdActive.checked,
-            ignoreInteract: !els.cmdInteract.checked, reply: els.cmdReplyQuote.checked,
-            sendAllResponses: els.cmdSendAll.checked, adminOnly: els.cmdAdminOnly.checked,
+            startsWith: trigger,
+            responses: responses,
+            active: els.cmdActive.checked,
+            ignoreInteract: !els.cmdInteract.checked,
+            reply: els.cmdReplyQuote.checked,
+            sendAllResponses: els.cmdSendAll.checked,
+            adminOnly: els.cmdAdminOnly.checked,
+            replyInPvivate: els.cmdReplyPrivate.checked,
             react: els.cmdEmoji.value.trim() || null,
+            reactions: reactions,
             cooldown: cooldownValue,
+            allowedTimes: allowedTimes,
+            allowedDays: selectedDays.length > 0 ? selectedDays : null,
             mentions: currentCmdMentions,
             count: currentEditingCmd ? currentEditingCmd.count : 0,
             metadata: currentEditingCmd ? currentEditingCmd.metadata : { createdBy: 'Painel Web', createdAt: Date.now() }
@@ -1566,25 +2465,14 @@ document.addEventListener('DOMContentLoaded', () => {
         } catch (e) {
             await showCustomAlert('Erro: ' + e.message);
         } finally {
-            els.btnSaveCmd.textContent = 'Salvar';
+            els.btnSaveCmd.textContent = 'Salvar Comando';
             els.btnSaveCmd.disabled = false;
         }
     });
 
     els.btnDeleteCmd.addEventListener('click', async () => {
-        if(!await showCustomConfirm('Tem certeza?')) return;
-        try {
-            const url = `${API_BASE}/custom-commands/${groupId}/${encodeURIComponent(currentEditingCmd.startsWith)}?token=${token}`;
-            const res = await fetch(url, { method: 'DELETE' });
-            if (res.ok) {
-                await loadData();
-                els.cmdModal.classList.add('hidden');
-            } else {
-                await showCustomAlert('Erro ao deletar');
-            }
-        } catch (e) {
-            await showCustomAlert('Erro: ' + e.message);
-        }
+        if (!currentEditingCmd) return;
+        await deleteCustomCommand(currentEditingCmd.startsWith);
     });
 
     // --- Member Modal Logic ---
@@ -1593,6 +2481,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function renderMembers(filter = '') {
         const tbody = els.memberTableBody;
+        if (!tbody) return;
         tbody.innerHTML = '';
         
         const actionHeader = document.getElementById('member-action-header');
@@ -1609,7 +2498,7 @@ document.addEventListener('DOMContentLoaded', () => {
         });
 
         if (filtered.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="3" class="text-center text-muted">Nenhum membro encontrado</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="3" class="text-center text-muted p-3">Nenhum membro encontrado.</td></tr>';
             return;
         }
 
@@ -1622,15 +2511,15 @@ document.addEventListener('DOMContentLoaded', () => {
             } else {
                 const existingNick = (groupData.nicks || []).find(n => n.numero === p.pn);
                 const currentApelido = existingNick ? existingNick.apelido : '';
-                actionBtn = `<input type="text" class="input-nickname" value="${currentApelido}" data-pn="${p.pn}" placeholder="Definir apelido..." style="width: 100%; min-width: 120px;" />`;
+                actionBtn = `<input type="text" class="form-control text-sm input-nickname" value="${currentApelido}" data-pn="${p.pn}" placeholder="Apelido..." style="min-width: 100px;">`;
             }
 
             const pn = p.pn ? p.pn.split('@')[0] : '-';
             const lid = p.lid ? p.lid.split('@')[0] : '-';
 
             tr.innerHTML = `
-                <td>${pn} ${p.admin ? '<span class="badge badge-warning">Admin</span>' : ''}</td>
-                <td style="font-family: monospace; font-size: 0.9em;">${lid}</td>
+                <td>${pn} ${p.admin ? '<span class="status-pill status-pill-active text-xs">Admin</span>' : ''}</td>
+                <td style="font-family: monospace; font-size: 0.78rem;">${lid}</td>
                 <td>${actionBtn}</td>
             `;
 
@@ -1644,13 +2533,11 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (input) {
                     input.onchange = (e) => {
                         const newNick = e.target.value.trim();
-                        const pn = e.target.dataset.pn;
+                        const pnVal = e.target.dataset.pn;
                         
-                        if (!groupData.nicks) {
-                            groupData.nicks = [];
-                        }
+                        if (!groupData.nicks) groupData.nicks = [];
                         
-                        const idx = groupData.nicks.findIndex(n => n.numero === pn);
+                        const idx = groupData.nicks.findIndex(n => n.numero === pnVal);
                         if (idx !== -1) {
                             if (newNick) {
                                 groupData.nicks[idx].apelido = newNick.substring(0, 20);
@@ -1659,7 +2546,7 @@ document.addEventListener('DOMContentLoaded', () => {
                             }
                         } else if (newNick) {
                             groupData.nicks.push({
-                                numero: pn,
+                                numero: pnVal,
                                 apelido: newNick.substring(0, 20)
                             });
                         }
@@ -1682,42 +2569,35 @@ document.addEventListener('DOMContentLoaded', () => {
         };
     }
 
-    if (els.memberSearch) {
-        els.memberSearch.addEventListener('input', (e) => {
-            renderMembers(e.target.value);
-        });
-    }
-
-    // Fix: Close Member Modal
-    if (els.closeModalBtns) {
-        // This is handled in setupEventListeners below via querySelectorAll('.close-member-modal')
-    }
-
-    // --- Command Mentions Logic ---
-
-    let currentCmdMentions = [];
+    // --- Command Mentions ---
 
     if (els.btnAddTag) {
         els.btnAddTag.onclick = () => {
             onMemberSelect = (member) => {
-                const id = member.lid || member.pn; // Store full ID for backend
-                if (!currentCmdMentions.includes(id)) {
-                    currentCmdMentions.push(id);
+                const targetNumber = member.pn || member.lid;
+                if (!targetNumber) return;
+                
+                const cleanNumber = targetNumber.split('@')[0];
+                const displayName = cleanNumber;
+                
+                if (!currentCmdMentions.includes(targetNumber)) {
+                    currentCmdMentions.push(targetNumber);
                     renderCmdTags();
-                    setDirty(true);
-
-                    // Adiciona a tag {mention-userPart} ao final da resposta de texto
-                    const userPart = id.split('@')[0];
-                    const textareas = document.querySelectorAll('textarea.cmd-response-input');
-                    const lastTextarea = textareas[textareas.length - 1];
-                    if (lastTextarea) {
-                        const space = lastTextarea.value && !lastTextarea.value.endsWith(' ') ? ' ' : '';
-                        lastTextarea.value = lastTextarea.value + space + `{mention-${userPart}}`;
-                        lastTextarea.dispatchEvent(new Event('input'));
+                    
+                    const inputs = document.querySelectorAll('.cmd-response-input');
+                    if (inputs.length > 0) {
+                        const firstInput = inputs[0];
+                        const mentionTag = `{mention-${cleanNumber}}`;
+                        if (!firstInput.value.includes(mentionTag)) {
+                            firstInput.value = (firstInput.value + ' ' + mentionTag).trim();
+                            firstInput.dispatchEvent(new Event('input'));
+                        }
                     }
+                    updateWhatsAppCmdPreview();
                 }
             };
-            els.memberModalTitle.textContent = 'Selecionar Membro';
+            
+            els.memberModalTitle.textContent = 'Selecionar Membro para Marcar';
             els.memberSearch.value = '';
             renderMembers();
             els.memberModal.classList.remove('hidden');
@@ -1725,53 +2605,559 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function renderCmdTags() {
-        const container = els.cmdTagsList;
-        container.innerHTML = '';
-        
-        currentCmdMentions.forEach(id => {
-            // Find member info
-            const participants = groupData.participants || [];
-            // Try to find by LID or PN
-            const member = participants.find(p => p.lid === id || p.pn === id || (p.pn + '@s.whatsapp.net') === id);
-            
-            const displayId = member ? (member.pn ? member.pn.split('@')[0] : (member.lid ? member.lid.split('@')[0] : id.split('@')[0])) : id.split('@')[0];
-            
+        if (!els.cmdTagsList) return;
+        els.cmdTagsList.innerHTML = '';
+        currentCmdMentions.forEach(m => {
+            const clean = m.split('@')[0];
             const tag = document.createElement('span');
             tag.className = 'tag';
-            tag.innerHTML = `${displayId} <span class="insert-var" title="Inserir variável no texto da resposta" style="margin-left: 5px; cursor: pointer; color: var(--primary-color, #007bff);"><i class="fas fa-plus"></i></span> <span class="remove">&times;</span>`;
-            
-            tag.querySelector('.insert-var').onclick = () => {
-                const userPart = id.split('@')[0];
-                const textareas = document.querySelectorAll('textarea.cmd-response-input');
-                const lastTextarea = textareas[textareas.length - 1];
-                if (lastTextarea) {
-                    const space = lastTextarea.value && !lastTextarea.value.endsWith(' ') ? ' ' : '';
-                    lastTextarea.value = lastTextarea.value + space + `{mention-${userPart}}`;
-                    lastTextarea.dispatchEvent(new Event('input'));
+            tag.innerHTML = `
+                <span>${clean}</span>
+                <span class="remove" title="Remover">&times;</span>
+            `;
+            tag.querySelector('.remove').onclick = () => {
+                currentCmdMentions = currentCmdMentions.filter(x => x !== m);
+                renderCmdTags();
+                updateWhatsAppCmdPreview();
+            };
+            els.cmdTagsList.appendChild(tag);
+        });
+    }
+
+    // --- Warnings (Advertências) Section ---
+
+    function getWarningEmojis(count) {
+        if (count <= 1) return '⚠️';
+        if (count === 2) return '🚨';
+        return '🚨🚔';
+    }
+
+    function renderWarnings() {
+        if (!els.warningsTableBody) return;
+        els.warningsTableBody.innerHTML = '';
+        
+        const warnings = groupData.warnings || [];
+        if (warnings.length === 0) {
+            els.noWarningsMsg.classList.remove('hidden');
+            return;
+        }
+        els.noWarningsMsg.classList.add('hidden');
+
+        warnings.forEach((w, index) => {
+            const tr = document.createElement('tr');
+            const cleanNum = w.numero || (w.jid ? w.jid.split('@')[0] : 'Desconhecido');
+            const emojis = getWarningEmojis(w.count);
+
+            tr.innerHTML = `
+                <td><strong>${cleanNum}</strong></td>
+                <td><span class="status-pill status-pill-paused">${emojis} ${w.count} aviso(s)</span></td>
+                <td>
+                    <button type="button" class="btn btn-xs btn-danger btn-del-warn" title="Remover Advertência"><i class="fas fa-trash"></i></button>
+                </td>
+            `;
+
+            tr.querySelector('.btn-del-warn').onclick = async () => {
+                if (await showCustomConfirm(`Remover advertência de ${cleanNum}?`)) {
+                    groupData.warnings.splice(index, 1);
                     setDirty(true);
+                    renderWarnings();
                 }
             };
 
-            tag.querySelector('.remove').onclick = () => {
-                currentCmdMentions = currentCmdMentions.filter(m => m !== id);
-                renderCmdTags();
-                setDirty(true);
-            };
-            container.appendChild(tag);
+            els.warningsTableBody.appendChild(tr);
         });
+    }
 
-        if (els.cmdTagsHelper) {
-            els.cmdTagsHelper.classList.toggle('hidden', currentCmdMentions.length === 0);
+    if (els.btnClearAllWarnings) {
+        els.btnClearAllWarnings.onclick = async () => {
+            if (!groupData.warnings || groupData.warnings.length === 0) return;
+            if (await showCustomConfirm('Tem certeza que deseja zerar TODAS as advertências deste grupo?')) {
+                groupData.warnings = [];
+                setDirty(true);
+                renderWarnings();
+            }
+        };
+    }
+
+    // --- Webhooks Section ---
+
+    function renderWebhooks() {
+        if (!els.webhooksTableBody) return;
+        els.webhooksTableBody.innerHTML = '';
+
+        const webhooksUrl = `${window.location.origin}/webhook/${tokenData?.botId || 'bot'}/${groupId.split('@')[0]}`;
+        if (els.webhooksEndpointUrl) els.webhooksEndpointUrl.value = webhooksUrl;
+
+        const webhooks = groupData.webhooks || [];
+        if (webhooks.length === 0) {
+            els.noWebhooksMsg.classList.remove('hidden');
+            return;
+        }
+        els.noWebhooksMsg.classList.add('hidden');
+
+        webhooks.forEach((wh, index) => {
+            const tr = document.createElement('tr');
+            tr.innerHTML = `
+                <td><strong>${wh.name}</strong></td>
+                <td><code class="text-xs">${wh.header?.name}: ${wh.header?.value} (${wh.headerValue || 'match'})</code></td>
+                <td><span class="text-sm">${(wh.template || '').substring(0, 30)}...</span></td>
+                <td>
+                    <button type="button" class="btn btn-xs btn-danger btn-del-webhook"><i class="fas fa-trash"></i></button>
+                </td>
+            `;
+
+            tr.querySelector('.btn-del-webhook').onclick = async () => {
+                if (await showCustomConfirm(`Apagar o webhook "${wh.name}"?`)) {
+                    groupData.webhooks.splice(index, 1);
+                    setDirty(true);
+                    renderWebhooks();
+                }
+            };
+
+            els.webhooksTableBody.appendChild(tr);
+        });
+    }
+
+    if (els.btnCopyWebhookUrl) {
+        els.btnCopyWebhookUrl.onclick = async () => {
+            try {
+                await navigator.clipboard.writeText(els.webhooksEndpointUrl.value);
+                await showCustomAlert('URL copiada para a área de transferência!', 'Copiado');
+            } catch {
+                els.webhooksEndpointUrl.select();
+                document.execCommand('copy');
+                await showCustomAlert('URL copiada!', 'Copiado');
+            }
+        };
+    }
+
+    if (els.btnAddWebhook) {
+        els.btnAddWebhook.onclick = () => {
+            document.getElementById('webhook-name').value = '';
+            document.getElementById('webhook-header-name').value = 'x-token';
+            document.getElementById('webhook-header-value').value = '';
+            document.getElementById('webhook-header-mode').value = 'match';
+            document.getElementById('webhook-template').value = '';
+            els.webhookModal.classList.remove('hidden');
+        };
+    }
+
+    if (els.btnSaveWebhookConfirm) {
+        els.btnSaveWebhookConfirm.onclick = async () => {
+            const name = document.getElementById('webhook-name').value.trim();
+            const headerName = document.getElementById('webhook-header-name').value.trim();
+            const headerValue = document.getElementById('webhook-header-value').value.trim();
+            const mode = document.getElementById('webhook-header-mode').value;
+            const template = document.getElementById('webhook-template').value.trim();
+
+            if (!name || !headerName || !headerValue || !template) {
+                return await showCustomAlert('Preencha todos os campos do webhook.');
+            }
+
+            if (!groupData.webhooks) groupData.webhooks = [];
+
+            const existingIndex = groupData.webhooks.findIndex(w => w.name === name);
+            if (existingIndex === -1 && groupData.webhooks.length >= 10) {
+                return await showCustomAlert('Limite máximo de 10 webhooks atingido.');
+            }
+
+            const whData = {
+                name,
+                header: { name: headerName, value: headerValue },
+                headerValue: mode,
+                template,
+                createdAt: Date.now()
+            };
+
+            if (existingIndex !== -1) {
+                groupData.webhooks[existingIndex] = whData;
+            } else {
+                groupData.webhooks.push(whData);
+            }
+
+            setDirty(true);
+            renderWebhooks();
+            els.webhookModal.classList.add('hidden');
+        };
+    }
+
+    // --- Group Schedules (Abrir/Fechar) ---
+
+    const DIAS_SEMANA_NOMES = [
+        'Domingo', 'Segunda-feira', 'Terça-feira', 'Quarta-feira',
+        'Quinta-feira', 'Sexta-feira', 'Sábado'
+    ];
+
+    function escapeHtml(str) {
+        if (!str) return '';
+        return String(str)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#039;');
+    }
+
+    async function loadSchedules() {
+        try {
+            const res = await fetch(`${API_BASE}/group-schedules/${groupId}?token=${token}`);
+            if (res.ok) {
+                schedules = await res.json();
+                renderSchedules();
+            }
+        } catch (e) {
+            console.error('Erro ao carregar agendamentos:', e);
         }
     }
+
+    function renderSchedules() {
+        if (!els.schedulesOnetimeContainer || !els.schedulesWeeklyContainer) return;
+
+        els.schedulesOnetimeContainer.innerHTML = '';
+        els.schedulesWeeklyContainer.innerHTML = '';
+
+        const unicos = schedules.filter(s => s.dia_semana === null || s.dia_semana === undefined);
+        const semanais = schedules.filter(s => s.dia_semana !== null && s.dia_semana !== undefined);
+
+        if (unicos.length === 0) {
+            els.noSchedulesOnetimeMsg.classList.remove('hidden');
+            els.schedulesOnetimeContainer.appendChild(els.noSchedulesOnetimeMsg);
+        } else {
+            els.noSchedulesOnetimeMsg.classList.add('hidden');
+            unicos.forEach(s => {
+                const card = createScheduleCardElement(s);
+                els.schedulesOnetimeContainer.appendChild(card);
+            });
+        }
+
+        if (semanais.length === 0) {
+            els.noSchedulesWeeklyMsg.classList.remove('hidden');
+            els.schedulesWeeklyContainer.appendChild(els.noSchedulesWeeklyMsg);
+        } else {
+            els.noSchedulesWeeklyMsg.classList.add('hidden');
+            semanais.forEach(s => {
+                const card = createScheduleCardElement(s);
+                els.schedulesWeeklyContainer.appendChild(card);
+            });
+        }
+    }
+
+    function createScheduleCardElement(s) {
+        const div = document.createElement('div');
+        const isFechar = s.tipo === 'fechar';
+        div.className = `schedule-card ${isFechar ? 'schedule-fechar' : 'schedule-abrir'}`;
+
+        const emoji = isFechar ? '🔒' : '🔓';
+        const acaoText = isFechar ? 'Fechar Grupo' : 'Abrir Grupo';
+        const horaStr = `${String(s.hora).padStart(2, '0')}:${String(s.minuto).padStart(2, '0')}`;
+
+        let recorrenciaStr = '';
+        if (s.dia_semana !== null && s.dia_semana !== undefined) {
+            recorrenciaStr = `Toda(o) ${DIAS_SEMANA_NOMES[s.dia_semana]}`;
+        } else {
+            recorrenciaStr = 'Execução única';
+        }
+
+        const fraseHtml = s.frase ? `<div class="schedule-phrase">"${escapeHtml(s.frase)}"</div>` : '';
+
+        div.innerHTML = `
+            <div class="schedule-info">
+                <div class="schedule-header">
+                    <span>${emoji}</span>
+                    <span class="schedule-badge-id">[${s.id}]</span>
+                    <span class="schedule-time">${horaStr}</span>
+                    <span class="text-muted" style="font-size: 0.82rem;">(${recorrenciaStr} — ${acaoText})</span>
+                </div>
+                ${fraseHtml}
+            </div>
+            <div class="schedule-actions">
+                <button type="button" class="btn btn-xs btn-outline btn-edit-sched" title="Editar agendamento">
+                    <i class="fas fa-edit"></i>
+                </button>
+                <button type="button" class="btn btn-xs btn-danger btn-del-sched" title="Excluir agendamento">
+                    <i class="fas fa-trash"></i>
+                </button>
+            </div>
+        `;
+
+        div.querySelector('.btn-edit-sched').onclick = () => openScheduleModal(s);
+        div.querySelector('.btn-del-sched').onclick = () => deleteSchedule(s.id);
+
+        return div;
+    }
+
+    function openScheduleModal(schedule = null) {
+        if (schedule) {
+            els.scheduleModalTitle.textContent = `Editar Agendamento [${schedule.id}]`;
+            els.scheduleEditId.value = schedule.id;
+            els.scheduleTipo.value = schedule.tipo;
+            els.scheduleHora.value = `${String(schedule.hora).padStart(2, '0')}:${String(schedule.minuto).padStart(2, '0')}`;
+            els.scheduleDia.value = schedule.dia_semana !== null && schedule.dia_semana !== undefined ? schedule.dia_semana : '';
+            els.scheduleFrase.value = schedule.frase || '';
+        } else {
+            els.scheduleModalTitle.textContent = 'Novo Agendamento';
+            els.scheduleEditId.value = '';
+            els.scheduleTipo.value = 'fechar';
+            els.scheduleHora.value = '22:00';
+            els.scheduleDia.value = '';
+            els.scheduleFrase.value = '';
+        }
+        els.scheduleModal.classList.remove('hidden');
+    }
+
+    async function saveSchedule() {
+        const editId = els.scheduleEditId.value;
+        const tipo = els.scheduleTipo.value;
+        const horaRaw = els.scheduleHora.value;
+        const diaSemanaRaw = els.scheduleDia.value;
+        const frase = els.scheduleFrase.value.trim();
+
+        if (!horaRaw) {
+            return await showCustomAlert('Por favor, informe o horário.');
+        }
+
+        const [hStr, mStr] = horaRaw.split(':');
+        const hora = parseInt(hStr, 10);
+        const minuto = parseInt(mStr, 10);
+
+        if (isNaN(hora) || isNaN(minuto)) {
+            return await showCustomAlert('Horário inválido.');
+        }
+
+        if (frase && frase.length > 0 && frase.length < 5) {
+            return await showCustomAlert('A frase personalizada deve ter no mínimo 5 caracteres.');
+        }
+
+        const diaSemana = diaSemanaRaw === '' ? null : parseInt(diaSemanaRaw, 10);
+
+        try {
+            if (editId) {
+                await fetch(`${API_BASE}/group-schedules/${groupId}/${editId}?token=${token}`, {
+                    method: 'DELETE'
+                });
+            }
+
+            const res = await fetch(`${API_BASE}/group-schedules/${groupId}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    token,
+                    tipo,
+                    hora,
+                    minuto,
+                    diaSemana,
+                    frase: frase || null
+                })
+            });
+
+            if (!res.ok) {
+                const err = await res.json();
+                throw new Error(err.message || 'Falha ao salvar agendamento.');
+            }
+
+            els.scheduleModal.classList.add('hidden');
+            await loadSchedules();
+            await showCustomAlert('Agendamento salvo com sucesso!', 'Sucesso');
+        } catch (e) {
+            await showCustomAlert('Erro ao salvar agendamento: ' + e.message, 'Erro');
+        }
+    }
+
+    async function deleteSchedule(id) {
+        const confirmed = await showCustomConfirm(
+            `Deseja realmente remover o agendamento <b>[${id}]</b>?`,
+            'Excluir Agendamento'
+        );
+        if (!confirmed) return;
+
+        try {
+            const res = await fetch(`${API_BASE}/group-schedules/${groupId}/${id}?token=${token}`, {
+                method: 'DELETE'
+            });
+
+            if (!res.ok) {
+                const err = await res.json();
+                throw new Error(err.message || 'Falha ao excluir agendamento.');
+            }
+
+            await loadSchedules();
+            await showCustomAlert(`Agendamento [${id}] removido com sucesso!`, 'Sucesso');
+        } catch (e) {
+            await showCustomAlert('Erro ao remover agendamento: ' + e.message, 'Erro');
+        }
+    }
+
+    // --- Backups Section ---
+
+    // Export Commands as .ZIP
+    if (els.btnExportCmdsZip) {
+        els.btnExportCmdsZip.onclick = () => {
+            window.location.href = `${API_BASE}/custom-commands/${groupId}/export-zip?token=${token}`;
+        };
+    }
+
+    // Import Commands from .ZIP
+    if (els.fileImportCmdsZip) {
+        els.fileImportCmdsZip.onchange = async (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            const confirmed = await showCustomConfirm(
+                `Deseja importar os comandos do arquivo "${file.name}"?<br>Comandos existentes com o mesmo gatilho serão atualizados.`,
+                'Importar Comandos (.zip)'
+            );
+            if (!confirmed) {
+                els.fileImportCmdsZip.value = '';
+                return;
+            }
+
+            const formData = new FormData();
+            formData.append('token', token);
+            formData.append('file', file);
+
+            els.loading.classList.remove('hidden');
+            try {
+                const res = await fetch(`${API_BASE}/custom-commands/${groupId}/import-zip`, {
+                    method: 'POST',
+                    body: formData
+                });
+                const result = await res.json();
+                if (result.success) {
+                    await loadData();
+                    await showCustomAlert(`Importação concluída!<br><b>${result.importedCount}</b> comando(s) e <b>${result.mediaCount}</b> mídia(s) restauradas.`, 'Sucesso');
+                } else {
+                    throw new Error(result.message || 'Erro na importação');
+                }
+            } catch (err) {
+                await showCustomAlert('Erro ao importar comandos: ' + err.message, 'Erro');
+            } finally {
+                els.loading.classList.add('hidden');
+                els.fileImportCmdsZip.value = '';
+            }
+        };
+    }
+
+    // Export Configs as .JSON
+    if (els.btnExportConfigJson) {
+        els.btnExportConfigJson.onclick = () => {
+            const backupData = {
+                version: 1,
+                exportedAt: new Date().toISOString(),
+                groupId: groupId,
+                groupName: groupData.name || 'grupo',
+                config: JSON.parse(JSON.stringify(groupData))
+            };
+
+            const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(backupData, null, 2));
+            const downloadAnchor = document.createElement('a');
+            downloadAnchor.setAttribute("href", dataStr);
+            downloadAnchor.setAttribute("download", `${groupData.name || 'grupo'}_config_backup.json`);
+            document.body.appendChild(downloadAnchor);
+            downloadAnchor.click();
+            downloadAnchor.remove();
+        };
+    }
+
+    // Import Configs from .JSON with ID and Name check
+    if (els.fileImportConfigJson) {
+        els.fileImportConfigJson.onchange = async (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            const reader = new FileReader();
+            reader.onload = async (event) => {
+                try {
+                    const parsed = JSON.parse(event.target.result);
+                    const backupConfig = parsed.config || parsed;
+                    const backupGroupId = parsed.groupId || backupConfig.id;
+
+                    // 1. Check Group ID
+                    if (backupGroupId && backupGroupId !== groupId) {
+                        const allowCrossGroup = await showCustomConfirm(
+                            `⚠️ <b>Atenção:</b> Este arquivo de backup foi gerado a partir de outro grupo (<code class="text-xs">${backupGroupId}</code>).<br><br>Aplicar estas configurações sobrescreverá as preferências do grupo atual (<code class="text-xs">${groupId}</code>). Deseja continuar?`,
+                            'Grupo Diferente Detectado'
+                        );
+                        if (!allowCrossGroup) return;
+                    }
+
+                    // 2. Check Name Uniqueness
+                    let targetName = (backupConfig.name || groupData.name || '').trim().toLowerCase();
+                    if (targetName) {
+                        const checkRes = await fetch(`${API_BASE}/group/check-import-name`, {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({ token, groupId, name: targetName })
+                        }).then(r => r.json());
+
+                        if (!checkRes.available) {
+                            const newName = await showCustomPrompt(
+                                `O nome "<b>${targetName}</b>" já está em uso por outro grupo no sistema.<br>Por favor, defina um nome único para este grupo:`,
+                                targetName + '_novo',
+                                'Nome Duplicado'
+                            );
+                            if (!newName || !newName.trim()) return;
+                            targetName = newName.trim().toLowerCase();
+                        }
+                    }
+
+                    // Apply settings
+                    const protectedFields = ['id', 'createdAt', 'participants'];
+                    for (let key in backupConfig) {
+                        if (!protectedFields.includes(key)) {
+                            groupData[key] = backupConfig[key];
+                        }
+                    }
+                    if (targetName) groupData.name = targetName;
+
+                    populateFields();
+                    renderWarnings();
+                    renderWebhooks();
+                    setDirty(true);
+
+                    await showCustomAlert('Configurações importadas com sucesso! Clique em "Salvar Tudo" para consolidar as alterações.', 'Importação Concluída');
+
+                } catch (err) {
+                    await showCustomAlert('Erro ao ler arquivo de backup: ' + err.message, 'Arquivo Inválido');
+                } finally {
+                    els.fileImportConfigJson.value = '';
+                }
+            };
+            reader.readAsText(file);
+        };
+    }
+
+    // --- Setup Listeners & Modals ---
 
     function setupEventListeners() {
         els.retryBtn.addEventListener('click', () => window.location.reload());
         
-        if (document.getElementById('btn-emoji-picker')) {
-            document.getElementById('btn-emoji-picker').addEventListener('click', () => {
-                renderEmojiGrid();
-                els.emojiModal.classList.remove('hidden');
+        // Hero Status Switch
+        if (els.groupPausedToggle) {
+            els.groupPausedToggle.addEventListener('change', (e) => {
+                const isPaused = !e.target.checked;
+                groupData.paused = isPaused;
+                updateHeroStatusVisuals(isPaused);
+                document.getElementById('bot-enabled').checked = !isPaused;
+                setDirty(true);
+            });
+        }
+
+        const botEnabledCheckbox = document.getElementById('bot-enabled');
+        if (botEnabledCheckbox) {
+            botEnabledCheckbox.addEventListener('change', (e) => {
+                const isEnabled = e.target.checked;
+                groupData.paused = !isEnabled;
+                updateHeroStatusVisuals(!isEnabled);
+                setDirty(true);
+            });
+        }
+
+        const interactUseCmdsCheckbox = document.getElementById('interact-use-cmds');
+        if (interactUseCmdsCheckbox) {
+            interactUseCmdsCheckbox.addEventListener('change', (e) => {
+                if (!groupData.interact) groupData.interact = {};
+                groupData.interact.useCmds = e.target.checked;
+                setDirty(true);
             });
         }
 
@@ -1795,7 +3181,7 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         });
 
-        document.querySelectorAll('.close-modal, .close-modal-btn, .close-stream-modal, .close-variable-modal, .close-emoji-modal, .close-dialog, .close-member-modal').forEach(b => {
+        els.closeModalBtns.forEach(b => {
             b.onclick = () => {
                 els.cmdModal.classList.add('hidden');
                 els.streamModal.classList.add('hidden');
@@ -1803,16 +3189,49 @@ document.addEventListener('DOMContentLoaded', () => {
                 els.emojiModal.classList.add('hidden');
                 els.customDialogModal.classList.add('hidden');
                 els.memberModal.classList.add('hidden');
+                els.webhookModal.classList.add('hidden');
+                els.scheduleModal.classList.add('hidden');
             };
         });
         els.closeUploadBtns.forEach(b => b.onclick = () => els.uploadModal.classList.add('hidden'));
 
+        if (els.btnAddSchedule) {
+            els.btnAddSchedule.onclick = () => openScheduleModal();
+        }
+        if (els.btnSaveScheduleConfirm) {
+            els.btnSaveScheduleConfirm.onclick = saveSchedule;
+        }
+
         // Tag inputs
         setupListAdder('add-ignored-number', 'new-ignored-number', 'ignoredNumbers');
         setupListAdder('add-forbidden-word', 'new-forbidden-word', 'filters.words');
+        setupRegexAdder('add-forbidden-regex', 'new-forbidden-regex', 'regex-error-msg', 'forbidden-regexes-list');
         setupListAdder('add-forbidden-user', 'new-forbidden-user', 'filters.people');
         setupListAdder('add-muted-command', 'new-muted-command', 'mutedCommands');
         setupListAdder('add-additional-admin', 'new-additional-admin', 'additionalAdmins');
+        setupListAdder('add-allowed-link', 'new-allowed-link', 'filters.allowedLinks');
+
+        const btnAddTrustedLinks = document.getElementById('btn-add-trusted-links');
+        if (btnAddTrustedLinks) {
+            btnAddTrustedLinks.addEventListener('click', () => {
+                if (!groupData.filters) groupData.filters = {};
+                if (!Array.isArray(groupData.filters.allowedLinks)) groupData.filters.allowedLinks = [];
+                let addedCount = 0;
+                for (const domain of TRUSTED_DOMAINS) {
+                    if (!groupData.filters.allowedLinks.includes(domain)) {
+                        groupData.filters.allowedLinks.push(domain);
+                        addedCount++;
+                    }
+                }
+                if (addedCount > 0) {
+                    setDirty(true);
+                    renderTags('allowed-links-list', groupData.filters.allowedLinks, (newList) => {
+                        groupData.filters.allowedLinks = newList;
+                        setDirty(true);
+                    });
+                }
+            });
+        }
 
         const botPersonalityInput = document.getElementById('bot-personality');
         if (botPersonalityInput) {
@@ -1821,18 +3240,58 @@ document.addEventListener('DOMContentLoaded', () => {
             });
         }
 
-        // Sliders
+        const groupRulesInput = document.getElementById('group-rules');
+        if (groupRulesInput) {
+            groupRulesInput.addEventListener('input', (e) => {
+                const countEl = document.getElementById('rules-count');
+                if (countEl) countEl.textContent = e.target.value.length;
+            });
+        }
+
+        const deleteNsfwCheckbox = document.getElementById('delete-nsfw');
+        if (deleteNsfwCheckbox) {
+            deleteNsfwCheckbox.addEventListener('change', (e) => {
+                toggleNsfwSettings(e.target.checked);
+            });
+        }
+
+        const nsfwSlider = document.getElementById('nsfw-intensity');
+        if (nsfwSlider) {
+            nsfwSlider.addEventListener('input', (e) => {
+                document.getElementById('nsfw-intensity-val').textContent = e.target.value;
+                setDirty(true);
+            });
+        }
+
+        const autoInteractionCheckbox = document.getElementById('auto-interaction');
+        if (autoInteractionCheckbox) {
+            autoInteractionCheckbox.addEventListener('change', (e) => {
+                toggleInteractionSettings(e.target.checked);
+            });
+        }
+
+        const autoTranslateCheckbox = document.getElementById('auto-translate');
+        if (autoTranslateCheckbox) {
+            autoTranslateCheckbox.addEventListener('change', (e) => {
+                toggleTranslateSettings(e.target.checked);
+            });
+        }
+
         const chanceSlider = document.getElementById('interaction-chance');
-        if(chanceSlider) {
+        if (chanceSlider) {
             chanceSlider.addEventListener('input', (e) => {
-                document.getElementById('chance-val').textContent = (e.target.value / 100).toFixed(2);
+                document.getElementById('chance-val').textContent = e.target.value;
+                const descEl = document.getElementById('chance-desc-val');
+                if (descEl) descEl.textContent = e.target.value + '%';
+                setDirty(true);
             });
         }
 
         const cooldownSlider = document.getElementById('interaction-cooldown');
-        if(cooldownSlider) {
+        if (cooldownSlider) {
             cooldownSlider.addEventListener('input', (e) => {
-                document.getElementById('cooldown-val').textContent = e.target.value;
+                document.getElementById('cooldown-val').textContent = formatCooldownText(e.target.value);
+                setDirty(true);
             });
         }
 
@@ -1850,40 +3309,36 @@ document.addEventListener('DOMContentLoaded', () => {
                     } else if (iaChance === 0) {
                         descEl.innerHTML = "Usando apenas <b>comandos</b> para interagir";
                     } else {
-                        descEl.textContent = `${cmdChance}% de chance de usar algum comando, ${iaChance}% de chance de usar IA para interagir`;
+                        descEl.textContent = `${cmdChance}% de chance de usar comandos, ${iaChance}% de chance de usar IA`;
                     }
                 }
+                setDirty(true);
             });
         }
 
-        // Cmd cooldown live label
-        const cmdCooldownInput = document.getElementById('cmd-cooldown');
-        if (cmdCooldownInput) {
-            function formatCooldownSeconds(s) {
-                const val = parseInt(s);
-                if (isNaN(val) || val <= 0) return 'sem cooldown';
-                if (val < 60) return `${val}s`;
-                if (val < 3600) {
-                    const m = Math.floor(val / 60), sec = val % 60;
-                    return sec > 0 ? `${m}m ${sec}s` : `${m}m`;
-                }
-                const h = Math.floor(val / 3600), m = Math.floor((val % 3600) / 60);
-                return m > 0 ? `${h}h ${m}m` : `${h}h`;
-            }
-            cmdCooldownInput.addEventListener('input', (e) => {
-                const lbl = document.getElementById('cmd-cooldown-label');
-                if (lbl) lbl.textContent = `segundos  (${formatCooldownSeconds(e.target.value)})`;
-            });
+        const mcServerInput = document.getElementById('minecraft-server');
+        if (mcServerInput) {
+            mcServerInput.addEventListener('input', () => setDirty(true));
+            mcServerInput.addEventListener('change', () => setDirty(true));
+        }
+
+        const roletaTempoInput = document.getElementById('roleta-tempo');
+        if (roletaTempoInput) {
+            roletaTempoInput.addEventListener('input', () => setDirty(true));
+            roletaTempoInput.addEventListener('change', () => setDirty(true));
+        }
+
+        const roletaSilenciarInput = document.getElementById('roleta-silenciar');
+        if (roletaSilenciarInput) {
+            roletaSilenciarInput.addEventListener('change', () => setDirty(true));
         }
     }
 
     async function loadDossierHistory() {
         if (!els.dossiesHistoryList) return;
-        
         try {
             const res = await fetch(`${API_BASE}/group-dossier-history?groupId=${groupId}&token=${token}`);
             if (!res.ok) throw new Error('Falha ao carregar histórico de dossiês');
-            
             const history = await res.json();
             renderDossierHistory(history);
         } catch (e) {
@@ -1899,7 +3354,6 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         els.dossiesHistoryList.innerHTML = '';
-        
         history.forEach((item, index) => {
             const div = document.createElement('div');
             div.className = 'dossie-item';

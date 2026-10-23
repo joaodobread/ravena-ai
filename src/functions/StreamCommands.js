@@ -4,6 +4,7 @@ const Database = require("../utils/Database");
 const Command = require("../models/Command");
 const ReturnMessage = require("../models/ReturnMessage");
 const StreamSystem = require("../StreamSystem");
+const GroupContextHelper = require("../utils/GroupContextHelper");
 
 const logger = new Logger("stream-commands");
 const database = Database.getInstance();
@@ -20,19 +21,19 @@ const database = Database.getInstance();
  */
 async function listMonitoredChannels(bot, message, args, group) {
 	try {
-		const chatId = message.group ?? message.author;
-
-		if (!group) {
-			return new ReturnMessage({
-				chatId,
-				content: "Este comando só pode ser usado em grupos."
-			});
-		}
+		const {
+			targetGroup,
+			responseChatId: chatId,
+			errorResponse
+		} = await GroupContextHelper.resolveGroup(bot, message, group, {
+			featureName: "listar streams"
+		});
+		if (errorResponse) return errorResponse;
 
 		// Verifica se há canais configurados
-		const twitchChannels = Array.isArray(group.twitch) ? group.twitch : [];
-		const kickChannels = Array.isArray(group.kick) ? group.kick : [];
-		const youtubeChannels = Array.isArray(group.youtube) ? group.youtube : [];
+		const twitchChannels = Array.isArray(targetGroup.twitch) ? targetGroup.twitch : [];
+		const kickChannels = Array.isArray(targetGroup.kick) ? targetGroup.kick : [];
+		const youtubeChannels = Array.isArray(targetGroup.youtube) ? targetGroup.youtube : [];
 
 		const totalChannels = twitchChannels.length + kickChannels.length + youtubeChannels.length;
 
@@ -45,7 +46,7 @@ async function listMonitoredChannels(bot, message, args, group) {
 		}
 
 		// Constrói mensagem
-		let response = `*Canais Monitorados neste Grupo*\n\n`;
+		let response = `*Canais Monitorados neste Grupo (${targetGroup.name || targetGroup.id})*\n\n`;
 
 		// Lista canais Twitch
 		if (twitchChannels.length > 0) {
@@ -141,17 +142,17 @@ function avisoStreamSystem(bot, chatId) {
  */
 async function showStreamStatus(bot, message, args, group) {
 	try {
-		const chatId = message.group ?? message.author;
-
-		if (!group) {
-			return new ReturnMessage({
-				chatId,
-				content: "Este comando só pode ser usado em grupos."
-			});
-		}
+		const {
+			targetGroup,
+			responseChatId: chatId,
+			errorResponse
+		} = await GroupContextHelper.resolveGroup(bot, message, group, {
+			featureName: "ver status das streams"
+		});
+		if (errorResponse) return errorResponse;
 
 		// Cleanup bot status for this group
-		await StreamSystem.getInstance().refreshGroup(group);
+		await StreamSystem.getInstance().refreshGroup(targetGroup);
 
 		// Verifica se o StreamMonitor está inicializado
 		if (!bot.streamMonitor) {
@@ -159,14 +160,14 @@ async function showStreamStatus(bot, message, args, group) {
 		}
 
 		// Obtém canais configurados para este grupo
-		const twitchChannels = Array.isArray(group.twitch)
-			? group.twitch.map((c) => c.channel.toLowerCase())
+		const twitchChannels = Array.isArray(targetGroup.twitch)
+			? targetGroup.twitch.map((c) => c.channel.toLowerCase())
 			: [];
-		const kickChannels = Array.isArray(group.kick)
-			? group.kick.map((c) => c.channel.toLowerCase())
+		const kickChannels = Array.isArray(targetGroup.kick)
+			? targetGroup.kick.map((c) => c.channel.toLowerCase())
 			: [];
-		const youtubeChannels = Array.isArray(group.youtube)
-			? group.youtube.map((c) => c.channel.toLowerCase())
+		const youtubeChannels = Array.isArray(targetGroup.youtube)
+			? targetGroup.youtube.map((c) => c.channel.toLowerCase())
 			: [];
 
 		const totalChannels = twitchChannels.length + kickChannels.length + youtubeChannels.length;
@@ -913,4 +914,131 @@ const commands = [
 // Registra os comandos sendo exportados
 //logger.debug(`Exportando ${commands.length} comandos:`, commands.map(cmd => cmd.name));
 
-module.exports = { commands };
+const helper = {
+	about: "Monitoramento de lives e canais da Twitch, Kick e YouTube",
+	implementation:
+		"Consulta status de canais em tempo real, monitora streamers favoritos e lista canais online no momento",
+	tags: "stream,twitch,kick,youtube,live,streamers,transmissao",
+	cmds: [
+		{
+			cmd: "!streams",
+			desc: "Lista todos os canais configurados para monitoramento no grupo",
+			usage: ["!streams"],
+			category: "streams"
+		},
+		{
+			cmd: "!streamers",
+			desc: "Lista os canais monitorados que estão ao vivo agora",
+			usage: ["!streamers"],
+			category: "streams"
+		},
+		{
+			cmd: "!live",
+			desc: "Consulta o status e informações de um canal da Twitch",
+			usage: ["!live gaules", "!live alanzoka"],
+			category: "streams"
+		},
+		{
+			cmd: "!live-kick",
+			desc: "Consulta o status e informações de um canal do Kick",
+			usage: ["!live-kick nome_do_canal"],
+			category: "streams"
+		},
+		{
+			cmd: "!topstreams",
+			desc: "Exibe as transmissões com maior audiência no momento",
+			usage: ["!topstreams"],
+			category: "streams"
+		}
+	]
+};
+
+/**
+ * Consulta o resumo em tempo real dos streamers monitorados e seus status (Twitch, Kick, YouTube)
+ * @param {string} [filterPlatform] - Filtro opcional ('twitch', 'kick', 'youtube' ou 'all')
+ * @returns {Promise<string>}
+ */
+async function getMonitoredStreamsSummary(filterPlatform = "all") {
+	try {
+		const StreamMonitor = require("../services/StreamMonitor");
+		const streamMonitor = StreamMonitor.getInstance();
+		const statuses = streamMonitor.getStreamStatus();
+		const channels = streamMonitor.getSubscribedChannels();
+
+		if (!channels || channels.length === 0) {
+			return "Nenhum canal de stream está cadastrado no monitoramento global da Ravena no momento.";
+		}
+
+		const filter = (filterPlatform || "all").toLowerCase();
+		const onlineStreams = [];
+		const offlineStreams = [];
+
+		for (const ch of channels) {
+			if (filter !== "all" && ch.source.toLowerCase() !== filter) continue;
+
+			const key = `${ch.source.toLowerCase()}:${ch.name.toLowerCase()}`;
+			const st = statuses[key];
+
+			if (st && st.isLive) {
+				onlineStreams.push({
+					platform: ch.source.toUpperCase(),
+					name: ch.name,
+					title: st.title || "Sem título",
+					game: st.game || "Desconhecido",
+					viewers: st.viewerCount || 0,
+					startedAt: st.startedAt,
+					lastVideoUrl:
+						st.lastVideo?.url ||
+						(st.lastVideo?.id ? `https://youtube.com/watch?v=${st.lastVideo.id}` : null)
+				});
+			} else {
+				offlineStreams.push({
+					platform: ch.source.toUpperCase(),
+					name: ch.name
+				});
+			}
+		}
+
+		let resultado = `📺 **Status das Transmissões Monitoradas (Ravena):**\n\n`;
+
+		if (onlineStreams.length > 0) {
+			resultado += `🟢 **Ao Vivo Agora (${onlineStreams.length}):**\n\n`;
+			for (const stream of onlineStreams) {
+				let linkUrl = "";
+				const pLower = stream.platform.toLowerCase();
+				if (pLower === "twitch") {
+					linkUrl = `https://twitch.tv/${stream.name}`;
+				} else if (pLower === "kick") {
+					linkUrl = `https://kick.com/${stream.name}`;
+				} else if (pLower === "youtube") {
+					linkUrl = stream.lastVideoUrl || `https://youtube.com/@${stream.name}`;
+				}
+
+				resultado += `  - **[${stream.platform}] ${stream.name}**: ${stream.title}\n`;
+				resultado += `    🎮 Jogo: ${stream.game} | 👥 Espectadores: ${stream.viewers}\n`;
+				if (linkUrl) {
+					resultado += `    🔗 Assistir: ${linkUrl}\n`;
+				}
+				resultado += `\n`;
+			}
+		} else {
+			resultado += `🔴 Nenhum dos canais monitorados está transmitindo ao vivo no momento.\n\n`;
+		}
+
+		if (offlineStreams.length > 0) {
+			const names = offlineStreams.map((s) => `[${s.platform}] ${s.name}`).slice(0, 15);
+			resultado += `💤 **Canais Offline (${offlineStreams.length}):** ${names.join(", ")}${offlineStreams.length > 15 ? "..." : ""}`;
+		}
+
+		return resultado.trim();
+	} catch (err) {
+		logger.error("Erro ao gerar resumo de streams:", err.message);
+		return `Erro ao consultar status das transmissões: ${err.message}`;
+	}
+}
+
+module.exports = {
+	helper,
+	commands,
+	getMonitoredStreamsSummary
+};

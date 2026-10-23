@@ -3,6 +3,7 @@ const Logger = require("../utils/Logger");
 const Database = require("../utils/Database");
 const Command = require("../models/Command");
 const ReturnMessage = require("../models/ReturnMessage");
+const GroupContextHelper = require("../utils/GroupContextHelper");
 
 const logger = new Logger("roleta-russa-commands");
 const database = Database.getInstance();
@@ -15,6 +16,7 @@ database.getSQLiteDb(
     CREATE TABLE IF NOT EXISTS roleta_groups (
       group_id TEXT PRIMARY KEY,
       timeout_time INTEGER DEFAULT 300,
+      silenciar INTEGER DEFAULT 0,
       last_player_id TEXT,
       last_updated INTEGER,
       total_tries INTEGER DEFAULT 0,
@@ -45,6 +47,14 @@ database.getSQLiteDb(
     );
 `
 );
+
+database
+	.dbRun(dbName, "ALTER TABLE roleta_groups ADD COLUMN silenciar INTEGER DEFAULT 0")
+	.catch((error) => {
+		if (!/duplicate column/i.test(error.message || "")) {
+			logger.error("Erro ao atualizar schema da roleta:", error);
+		}
+	});
 
 /**
  * Emojis para ranking
@@ -83,6 +93,64 @@ const FRASES_MORTE = [
 ];
 
 /**
+ * Extrai o 1º mention do comando (via message.mentions, args ou quoted)
+ * @param {Object} message - Objeto da mensagem
+ * @param {Array} args - Argumentos do comando
+ * @returns {{ targetJid: string|null, targetText: string }}
+ */
+function extractFirstMention(message, args) {
+	let targetJid = null;
+	let targetText = "";
+
+	const rawMentions =
+		Array.isArray(message.mentions) && message.mentions.length > 0
+			? message.mentions
+			: Array.isArray(message.origin?.mentionedIds) && message.origin.mentionedIds.length > 0
+				? message.origin.mentionedIds
+				: [];
+
+	if (rawMentions.length > 0) {
+		targetJid = rawMentions[0];
+	}
+
+	const mentionArg = Array.isArray(args)
+		? args.find((a) => typeof a === "string" && a.startsWith("@"))
+		: null;
+
+	if (mentionArg) {
+		const cleanDigits = mentionArg.replace(/^@/, "").replace(/\D/g, "");
+		if (!targetJid && cleanDigits.length >= 7) {
+			targetJid = `${cleanDigits}@s.whatsapp.net`;
+		}
+		if (cleanDigits.length >= 7) {
+			targetText = `@${cleanDigits}`;
+		} else if (!targetJid) {
+			targetText = mentionArg;
+		}
+	}
+
+	if (!targetJid && !targetText) {
+		const quotedParticipant =
+			message.quotedParticipant ??
+			message.origin?.quotedParticipant ??
+			message.quotedMsg?.author ??
+			message.origin?.quotedMsg?.author ??
+			message.quotedMsg?.participant ??
+			message.origin?.quotedMsg?.participant;
+		if (quotedParticipant) {
+			targetJid = quotedParticipant;
+		}
+	}
+
+	if (targetJid && !targetText) {
+		const cleanNum = targetJid.split("@")[0].replace(/\D/g, "");
+		targetText = cleanNum ? `@${cleanNum}` : `@${targetJid.split("@")[0]}`;
+	}
+
+	return { targetJid, targetText };
+}
+
+/**
  * Obtém ou cria dados do grupo
  */
 async function getGroupData(groupId) {
@@ -103,6 +171,7 @@ async function getGroupData(groupId) {
 		group = {
 			group_id: groupId,
 			timeout_time: 300,
+			silenciar: 0,
 			last_player_id: null,
 			last_updated: now,
 			total_tries: 0,
@@ -111,6 +180,22 @@ async function getGroupData(groupId) {
 	}
 
 	return group;
+}
+
+async function isUserSilenced(groupId, userId) {
+	const group = await database.dbGet(
+		dbName,
+		"SELECT silenciar FROM roleta_groups WHERE group_id = ?",
+		[groupId]
+	);
+	if (!group?.silenciar) return false;
+
+	const player = await database.dbGet(
+		dbName,
+		"SELECT timeout_until FROM roleta_players WHERE group_id = ? AND user_id = ?",
+		[groupId, userId]
+	);
+	return Number(player?.timeout_until || 0) > Date.now();
 }
 
 /**
@@ -237,6 +322,20 @@ async function jogarRoletaRussa(bot, message, args, group) {
 		const currentTries = (playerData.current_tries || 0) + 1;
 		const totalTries = (playerData.total_tries || 0) + 1;
 
+		const authorNum = userId.split("@")[0].replace(/\D/g, "");
+		const authorMention = authorNum ? `@${authorNum}` : `@${userId}`;
+
+		const { targetJid, targetText } = extractFirstMention(message, args);
+
+		const mentionPrefix = targetText
+			? `${authorMention} pegou a pistola de ${targetText} e ....\n\n`
+			: "";
+
+		const mentionsList = [userId];
+		if (targetJid && !mentionsList.includes(targetJid)) {
+			mentionsList.push(targetJid);
+		}
+
 		// Roll the dice (1 in 6)
 		const died = Math.floor(Math.random() * 6) === 0;
 
@@ -308,10 +407,11 @@ async function jogarRoletaRussa(bot, message, args, group) {
 
 			return new ReturnMessage({
 				chatId: groupId,
-				content: `💥🔫 *BANG* - *F no chat* ${info}\n\n> _${fraseAleatoria}_`,
+				content: `${mentionPrefix}💥🔫 *BANG* - *F no chat* ${info}\n\n> _${fraseAleatoria}_`,
 				options: {
 					quotedMessageId: message.origin.id._serialized,
-					goReply: message.origin
+					goReply: message.origin,
+					mentions: mentionsList
 				}
 			});
 		} else {
@@ -340,10 +440,11 @@ async function jogarRoletaRussa(bot, message, args, group) {
 
 			return new ReturnMessage({
 				chatId: groupId,
-				content: `💨🔫 *click* - Tá *safe*! \`\`\`${currentTries}\`\`\``,
+				content: `${mentionPrefix}💨🔫 *click* - Tá *safe*! \`\`\`${currentTries}\`\`\``,
 				options: {
 					quotedMessageId: message.origin.id._serialized,
-					goReply: message.origin
+					goReply: message.origin,
+					mentions: mentionsList
 				}
 			});
 		}
@@ -446,31 +547,16 @@ async function mostrarRanking(bot, message, args, group) {
  */
 async function resetarRoletaRussa(bot, message, args, group) {
 	try {
-		if (!message.group) {
-			return [
-				new ReturnMessage({
-					chatId: message.author,
-					content: "O reset da roleta russa só pode ser executado em grupos."
-				})
-			];
-		}
+		const {
+			targetGroup,
+			responseChatId: chatId,
+			errorResponse
+		} = await GroupContextHelper.resolveGroupAndAdmin(bot, message, group, {
+			featureName: "a roleta russa"
+		});
+		if (errorResponse) return [errorResponse];
 
-		const groupId = message.group;
-		const userId = message.author;
-
-		const isAdmin = await bot.isUserAdminInGroup(userId, groupId);
-		if (!isAdmin) {
-			return [
-				new ReturnMessage({
-					chatId: groupId,
-					content: "⛔ Apenas administradores podem resetar os dados da roleta russa.",
-					options: {
-						quotedMessageId: message.origin.id._serialized,
-						goReply: message.origin
-					}
-				})
-			];
-		}
+		const groupId = targetGroup.id;
 
 		// Count players to show in message
 		const countResult = await database.dbGet(
@@ -483,10 +569,10 @@ async function resetarRoletaRussa(bot, message, args, group) {
 		if (numJogadores === 0) {
 			return [
 				new ReturnMessage({
-					chatId: groupId,
-					content: "⚠️ Não há dados da roleta russa para este grupo.",
+					chatId,
+					content: `⚠️ Não há dados da roleta russa para o grupo ${targetGroup.name || targetGroup.id}.`,
 					options: {
-						quotedMessageId: message.origin.id._serialized,
+						quotedMessageId: message.origin?.id?._serialized,
 						goReply: message.origin
 					}
 				})
@@ -494,7 +580,10 @@ async function resetarRoletaRussa(bot, message, args, group) {
 		}
 
 		// Get ranking before reset
-		const rankingMessage = await mostrarRanking(bot, message, args, group);
+		const rankingMessage = await mostrarRanking(bot, message, args, targetGroup);
+		if (rankingMessage && rankingMessage.chatId !== chatId) {
+			rankingMessage.chatId = chatId;
+		}
 
 		// Reset players (Delete them)
 		await database.dbRun(dbName, "DELETE FROM roleta_players WHERE group_id = ?", [groupId]);
@@ -515,10 +604,10 @@ async function resetarRoletaRussa(bot, message, args, group) {
 		return [
 			rankingMessage,
 			new ReturnMessage({
-				chatId: groupId,
-				content: `🔄 *Dados da Roleta Russa Resetados*\n\nForam removidos dados de ${numJogadores} jogadores deste grupo.\n\nO ranking acima mostra como estava antes do reset.`,
+				chatId,
+				content: `🔄 *Dados da Roleta Russa Resetados*\n\nForam removidos dados de ${numJogadores} jogadores do grupo ${targetGroup.name || targetGroup.id}.\n\nO ranking acima mostra como estava antes do reset.`,
 				options: {
-					quotedMessageId: message.origin.id._serialized,
+					quotedMessageId: message.origin?.id?._serialized,
 					goReply: message.origin
 				}
 			})
@@ -539,30 +628,20 @@ async function resetarRoletaRussa(bot, message, args, group) {
  */
 async function definirTempoRoleta(bot, message, args, group) {
 	try {
-		if (!message.group) {
-			return new ReturnMessage({
-				chatId: message.author,
-				content: "Este comando só pode ser usado em grupos."
-			});
-		}
+		const {
+			targetGroup,
+			responseChatId: chatId,
+			errorResponse
+		} = await GroupContextHelper.resolveGroupAndAdmin(bot, message, group, {
+			featureName: "o tempo da roleta russa"
+		});
+		if (errorResponse) return errorResponse;
 
-		const groupId = message.group;
-
-		const isAdmin = await bot.isUserAdminInGroup(message.author, groupId);
-		if (!isAdmin) {
-			return new ReturnMessage({
-				chatId: groupId,
-				content: "⛔ Apenas administradores podem definir o tempo da roleta russa.",
-				options: {
-					quotedMessageId: message.origin.id._serialized,
-					goReply: message.origin
-				}
-			});
-		}
+		const groupId = targetGroup.id;
 
 		if (args.length === 0 || isNaN(parseInt(args[0]))) {
 			return new ReturnMessage({
-				chatId: groupId,
+				chatId,
 				content:
 					"Por favor, forneça um tempo em segundos (mínimo 10, máximo 259200, 72 horas). Exemplo: !roleta-tempo 300"
 			});
@@ -595,8 +674,8 @@ async function definirTempoRoleta(bot, message, args, group) {
 		}
 
 		return new ReturnMessage({
-			chatId: groupId,
-			content: `🕐 Tempo de "morte" na roleta russa definido para ${tempoFormatado}.`
+			chatId,
+			content: `🕐 Tempo de "morte" na roleta russa do grupo *${targetGroup.name || targetGroup.id}* definido para ${tempoFormatado}.`
 		});
 	} catch (error) {
 		logger.error("Erro ao definir tempo de roleta:", error);
@@ -607,10 +686,72 @@ async function definirTempoRoleta(bot, message, args, group) {
 	}
 }
 
+async function alternarSilenciamentoRoleta(bot, message, args, group) {
+	try {
+		const {
+			targetGroup,
+			responseChatId: chatId,
+			errorResponse
+		} = await GroupContextHelper.resolveGroupAndAdmin(bot, message, group, {
+			featureName: "o silenciamento da roleta russa"
+		});
+		if (errorResponse) return errorResponse;
+
+		const groupId = targetGroup.id;
+
+		const current = await getGroupData(groupId);
+		const value = String(args?.[0] || "toggle").toLowerCase();
+		const enabled = ["true", "1", "sim", "on", "ativar", "ativado"].includes(value)
+			? true
+			: ["false", "0", "nao", "não", "off", "desativar", "desativado"].includes(value)
+				? false
+				: !current.silenciar;
+
+		await database.dbRun(dbName, "UPDATE roleta_groups SET silenciar = ? WHERE group_id = ?", [
+			enabled ? 1 : 0,
+			groupId
+		]);
+
+		let content = `🔇 Silenciamento da roleta russa ${enabled ? "ativado" : "desativado"} para o grupo *${targetGroup.name || targetGroup.id}*.`;
+		if (enabled) {
+			const management = bot.eventHandler?.commandHandler?.management;
+			const botIsAdmin =
+				typeof management?.isBotAdmin === "function"
+					? await management.isBotAdmin(bot, targetGroup)
+					: false;
+			if (!botIsAdmin) {
+				content +=
+					" ⚠️ O bot não é administrador do grupo e não poderá apagar as mensagens dos jogadores mortos.";
+			}
+		}
+
+		return new ReturnMessage({ chatId: groupId, content });
+	} catch (error) {
+		logger.error("Erro ao alternar silenciamento da roleta:", error);
+		return new ReturnMessage({
+			chatId: message.group ?? message.author,
+			content: "Erro ao alterar o silenciamento da roleta russa. Por favor, tente novamente."
+		});
+	}
+}
+
 // Commands list
 const commands = [
 	new Command({
 		name: "roletarussa",
+		description: "Joga roleta russa, risco de ser silenciado",
+		category: "jogos",
+		cooldown: 0,
+		reactions: {
+			after: "🔫",
+			error: "❌"
+		},
+		method: jogarRoletaRussa
+	}),
+
+	new Command({
+		name: "roleta",
+		hidden: true,
 		description: "Joga roleta russa, risco de ser silenciado",
 		category: "jogos",
 		cooldown: 0,
@@ -668,7 +809,102 @@ const commands = [
 			error: "❌"
 		},
 		method: definirTempoRoleta
+	}),
+	new Command({
+		name: "roleta-silenciar",
+		description: "Ativa ou desativa a remoção de mensagens de jogadores mortos",
+		category: "jogos",
+		adminOnly: true,
+		cooldown: 10,
+		reactions: {
+			after: "🔇",
+			error: "❌"
+		},
+		method: alternarSilenciamentoRoleta
 	})
 ];
 
-module.exports = { commands };
+const helper = {
+	about: "Jogo de Roleta Russa com silenciamento e timeout temporário dos participantes eliminados",
+	implementation:
+		"Gerencia câmara do revólver de 6 posições, remoção ou silenciamento temporário via WhatsApp Web API e ranking de sobreviventes em SQLite",
+	tags: "roleta,roletarussa,tiro,revólver,jogo,timeout,ranking",
+	cmds: [
+		{
+			cmd: "!roletarussa",
+			desc: "Puxa o gatilho na Roleta Russa do grupo",
+			usage: ["!roletarussa"],
+			category: "jogos"
+		},
+		{
+			cmd: "!roleta-ranking",
+			desc: "Exibe o ranking de sobreviventes e mortes na roleta",
+			usage: ["!roleta-ranking"],
+			category: "jogos"
+		},
+		{
+			cmd: "!roleta-tempo",
+			desc: "Define o tempo em minutos de punição para quem morrer (Admins)",
+			usage: ["!roleta-tempo 5"],
+			category: "jogos"
+		},
+		{
+			cmd: "!roleta-silenciar [true|false|toggle]",
+			desc: "Ativa ou desativa o silenciamento temporário dos jogadores mortos (Admins)",
+			usage: ["!roleta-silenciar", "!roleta-silenciar false"],
+			category: "jogos"
+		},
+		{
+			cmd: "!roleta-reset",
+			desc: "Reseta os dados da roleta russa no grupo (Admins)",
+			usage: ["!roleta-reset"],
+			category: "jogos"
+		}
+	]
+};
+
+/**
+ * Obtém os dados da semana do Roleta Russa para o resumo semanal
+ * @param {number} sinceMs
+ * @returns {Promise<Array<Object>>}
+ */
+async function getWeeklyRoletaStats(sinceMs) {
+	try {
+		const rows = await database.dbAll(
+			dbName,
+			`SELECT user_id,
+			        MAX(user_name) as user_name,
+			        SUM(CASE WHEN action = 'safe' THEN 1 ELSE 0 END) as survivals,
+			        SUM(CASE WHEN action = 'death' THEN 1 ELSE 0 END) as deaths,
+			        COUNT(*) as total_tries
+			 FROM roleta_history
+			 WHERE timestamp >= ?
+			   AND user_id NOT LIKE 'user_%'
+			   AND user_id NOT IN ('user1', 'user2')
+			   AND group_id != '123@g.us'
+			   AND group_id NOT LIKE 'test_%'
+			 GROUP BY user_id
+			 HAVING survivals > 0 OR deaths > 0
+			 ORDER BY survivals DESC, total_tries ASC
+			 LIMIT 10`,
+			[sinceMs]
+		);
+		return (rows || []).map((r) => ({
+			user_id: r.user_id,
+			user_name: r.user_name || "Jogador",
+			survivals: Number(r.survivals) || 0,
+			deaths: Number(r.deaths) || 0,
+			isAlive: (Number(r.deaths) || 0) === 0
+		}));
+	} catch (error) {
+		logger.error("Erro ao buscar estatísticas semanais de Roleta Russa:", error);
+		return [];
+	}
+}
+
+module.exports = {
+	helper,
+	commands,
+	isUserSilenced,
+	getWeeklyRoletaStats
+};

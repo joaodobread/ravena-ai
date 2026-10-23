@@ -1,10 +1,10 @@
 const fs = require("fs");
 const path = require("path");
 const mysql = require("mysql2/promise");
+const BetterSQLite = require("better-sqlite3");
 const Logger = require("./Logger");
 const zlib = require("zlib");
 const { pipeline } = require("stream/promises");
-const BetterSQLite = require("better-sqlite3");
 
 class DatabaseBackup {
 	constructor(databaseInstance) {
@@ -36,6 +36,7 @@ class DatabaseBackup {
 		if (this.backupIgnoreFiles.includes(filename)) return true;
 		if (filename === "cache.db" || filename.startsWith("cache.db-")) return true;
 		if (filename.includes("corrupt") || filename.includes("corrupted")) return true;
+		if (filename.endsWith("-wal") || filename.endsWith("-shm")) return true;
 
 		// Ignore databases flagged as noBackup (and their companion files like -wal, -shm)
 		if (this.db && this.db.noBackupDatabases) {
@@ -115,6 +116,11 @@ class DatabaseBackup {
 
 			this.logger.info(`File backup created: ${backupDir}`);
 			this.cleanupOldScheduledBackups();
+
+			// Arquiva relatórios antigos com mais de 30 dias automaticamente
+			await this.db.archiveOldLoadReports(30).catch((err) => {
+				this.logger.error("Erro ao arquivar relatórios antigos durante backup:", err);
+			});
 
 			return true;
 		} catch (error) {
@@ -365,12 +371,12 @@ class DatabaseBackup {
 			let db = this.db.sqlites[dbName];
 
 			// If not currently loaded in memory, open it temporarily
-			let temporary = false;
+			let temporaryDb = null;
 			if (!db) {
 				const dbPath = path.join(this.databasePath, "sqlites", `${dbName}.db`);
 				if (!fs.existsSync(dbPath)) return;
-				db = new BetterSQLite(dbPath, { readonly: true, timeout: 5000 });
-				temporary = true;
+				temporaryDb = new BetterSQLite(dbPath, { readonly: true, timeout: 5000 });
+				db = temporaryDb;
 			}
 
 			const tables = await this.getTables(db);
@@ -383,7 +389,7 @@ class DatabaseBackup {
 				await this.syncTable(db, tableName, pks, remoteConn);
 			}
 
-			if (temporary) db.close();
+			if (temporaryDb) temporaryDb.close();
 		} catch (error) {
 			this.logger.error(`Error syncing database ${dbName}:`, error);
 		}
@@ -764,6 +770,7 @@ ${err.message}`);
 	}
 
 	async populateSQLiteTable(sqliteDb, tableName, rows) {
+		if (!rows || rows.length === 0) return;
 		const keys = Object.keys(rows[0]);
 		const columns = keys.map((k) => `\`${k}\``).join(", ");
 		const placeholders = keys.map(() => "?").join(", ");

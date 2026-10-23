@@ -165,7 +165,11 @@ async function generateImage(bot, message, args, group, skipNotify = false) {
 		});
 	}
 
-	prompt = await translateText(prompt, "pt", "en");
+	try {
+		prompt = await translateText(prompt, "pt", "en");
+	} catch (e) {
+		logger.warn(`Erro ao traduzir prompt para Stable Diffusion (${e.message}), mantendo original.`);
+	}
 
 	logger.info(`Gerando imagem com prompt: '${prompt}'`);
 
@@ -276,9 +280,13 @@ async function generateImage(bot, message, args, group, skipNotify = false) {
 		try {
 			const nsfwResult = await nsfwPredict.detectNSFW(imageBase64);
 			isNSFW = nsfwResult.isNSFW;
-			logger.info(
-				`Imagem analisada: NSFW = ${isNSFW}, Reason: ${JSON.stringify(nsfwResult.reason)}`
-			);
+			if (nsfwResult.skipped) {
+				logger.info(`Verificação NSFW ignorada: ${nsfwResult.reason}`);
+			} else {
+				logger.info(
+					`Imagem analisada: NSFW = ${isNSFW}, Reason: ${JSON.stringify(nsfwResult.reason)}`
+				);
+			}
 		} catch (nsfwError) {
 			logger.error("Erro ao verificar NSFW:", nsfwError);
 		}
@@ -390,4 +398,16 @@ const commands = [
 // Registra os comandos sendo exportados
 //logger.debug(`Exportando ${commands.length} comandos:`, commands.map(cmd => cmd.name));
 
-//module.exports = { commands };
+const helper = {
+	about:
+		"Geração de imagens via inteligência artificial com Stable Diffusion (Desativado / Legado)",
+	implementation:
+		"Integra com APIs de Stable Diffusion WebUI / Automatic1111 enviando prompts e parâmetros de amostragem",
+	tags: "sd,stablediffusion,ia,legado",
+	cmds: []
+};
+
+module.exports = {
+	helper,
+	commands: []
+};

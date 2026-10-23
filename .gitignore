@@ -142,7 +142,9 @@ dist
 
 # Scripts e coisas locais
 nssm-service.bat
-data/textos/archive.txt
+/scripts/
+data/textos/*.txt
+!data/textos/*.example.txt
 /src/scripts
 /old
 /.Trash-1000
@@ -152,12 +154,14 @@ test-output-*
 *.db-journal
 *.db-wal
 *.db-shm
+*.zip
+*.bak
 
 # Ravena data
 bots.json
 service-providers.json
 temp
-media
+data/nudenet_debug
 data/sqlites
 data/backups
 data/media
@@ -169,16 +173,21 @@ data/kick-token.json
 data/www.youtube.com_cookies.txt
 data/smd_cookies.txt
 data/errors-debug
+data/profile-pics
+data/marriages
 public/gifs
 public/attachments
 public/audios
+public/os/img/profiles/
 
 data/services-status.json
+data/external-API-users.json
+!data/external-API-users.example.json
 public/code-snippets.json
 /npm-update-testes
 /data/sillies
 /src/utils/db/migrations
-/scripts
+/scripts/__pycache__
 
 # whatsgoapi ignores
 /whatsgoapi/build
@@ -196,4 +205,8 @@ data/www.youtube.com_cookies.json
 /.antigravitycli
 /data/qrcodes
 data/notified_streams_cache.json
+data/geoguesser.json
 SKIP_HEALTH_CHECK
+data/status_motivo.txt
+data/chat-cleaner-state.json
+.ai-memory.toml

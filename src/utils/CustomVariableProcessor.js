@@ -2,6 +2,7 @@ const Database = require("./Database");
 const Logger = require("./Logger");
 const axios = require("axios").default;
 const { processFileVariable } = require("../functions/FileManager");
+const ProfilePictureHelper = require("./ProfilePictureHelper");
 
 /**
  * Processa variáveis personalizadas em respostas de comandos
@@ -27,11 +28,23 @@ class CustomVariableProcessor {
 	async process(text, context) {
 		if (!text) return "";
 
-		this.logger.debug(`[CustomVariableProcessor][process] ${text} <=> ${Object.keys(context)}`);
+		this.logger.debug(`[CustomVariableProcessor][process] Contexto: ${Object.keys(context)}`);
 
 		try {
-			const hasFotoPerfil = text.includes("{fotoPerfil}");
-			const hasFotoPerfilMention = text.includes("{fotoPerfilMention}");
+			// Mascara blocos de código e inline code (ex: `!g-addCmd {mention}`) para não substituir variáveis explicativas
+			const codePlaceholders = [];
+			let processedText = text.replace(/(`{1,3})([\s\S]*?)\1/g, (match) => {
+				const placeholder = `__CV_CODE_BLOCK_${codePlaceholders.length}__`;
+				codePlaceholders.push(match);
+				return placeholder;
+			});
+			const messageVariables = await this.getMessageVariables(processedText, context);
+			if (processedText.trim() === "{midiaCitada}") {
+				return messageVariables.media ?? "";
+			}
+
+			const hasFotoPerfil = /\{fotoPerfil\}/.test(processedText);
+			const hasFotoPerfilMention = /\{fotoPerfilMention\}/.test(processedText);
 			let targetJid = null;
 
 			if ((hasFotoPerfil || hasFotoPerfilMention) && context && context.message) {
@@ -41,14 +54,67 @@ class CustomVariableProcessor {
 						context.message.mentionedIds ??
 						context.message.mentions ??
 						[];
-					targetJid =
-						mentions.length > 0 ? mentions[0] : context.message.author || context.message.sender;
+					if (mentions.length > 0) {
+						const rawMention = mentions[0];
+						targetJid =
+							typeof rawMention === "string"
+								? rawMention
+								: rawMention?.id?._serialized ||
+									rawMention?._serialized ||
+									rawMention?.id ||
+									rawMention?.user ||
+									rawMention;
+					} else if (context.message.quotedParticipant) {
+						targetJid = context.message.quotedParticipant;
+					} else if (typeof context.message.origin?.getQuotedMessage === "function") {
+						try {
+							const quoted = await context.message.origin.getQuotedMessage().catch(() => null);
+							if (quoted) {
+								targetJid = quoted.authorAlt || quoted.author || quoted.sender || quoted.from;
+							}
+						} catch (e) {}
+					}
+
+					// Se não achou por menção ou quote, tenta achar número mencionado no texto da mensagem
+					if (!targetJid && (context.message.body || context.message.content)) {
+						const msgText =
+							typeof context.message.body === "string"
+								? context.message.body
+								: typeof context.message.content === "string"
+									? context.message.content
+									: "";
+						const numMatch = msgText.match(/@?(\d{10,25})/);
+						if (numMatch) {
+							targetJid = numMatch[1];
+						}
+					}
+
+					// Fallback: se não achou alvo, usa o autor da mensagem
+					if (!targetJid) {
+						targetJid =
+							context.message.authorAlt ||
+							context.message.author ||
+							context.message.sender ||
+							context.message.from;
+					}
 				} else {
-					targetJid = context.message.author || context.message.sender;
+					targetJid =
+						context.message.authorAlt ||
+						context.message.author ||
+						context.message.sender ||
+						context.message.from;
+				}
+
+				if (targetJid && typeof targetJid === "object") {
+					targetJid =
+						targetJid._serialized ||
+						targetJid.id?._serialized ||
+						targetJid.id ||
+						targetJid.user ||
+						String(targetJid);
 				}
 			}
 
-			let processedText = text;
 			if (hasFotoPerfil || hasFotoPerfilMention) {
 				processedText = processedText
 					.replace(/\{fotoPerfil\}/g, "")
@@ -89,7 +155,7 @@ class CustomVariableProcessor {
 			}
 
 			// Processa variáveis de API
-			processedText = await this.processAPIRequest(processedText, context);
+			processedText = await this.processAPIRequest(processedText, context, messageVariables);
 
 			// Processa variáveis de tempo e data
 			processedText = this.processSystemVariables(processedText);
@@ -134,6 +200,22 @@ class CustomVariableProcessor {
 							context.options.mentions.push(jid);
 						}
 					}
+				}
+			}
+
+			// Insere conteúdo de mensagens por último, sem executá-lo como comandos/variáveis.
+			if (typeof processedText === "string") {
+				if (processedText.includes("{mensagemCitada}")) context.hasQuotedText = true;
+				processedText = processedText.replace(
+					/\{(mensagemCitada|autor|autorCitado|midiaCitada)\}/g,
+					(match, name) => messageVariables[name] ?? ""
+				);
+			}
+
+			// Restaura blocos de código e inline code mascarados
+			if (typeof processedText === "string" && codePlaceholders.length > 0) {
+				for (let i = 0; i < codePlaceholders.length; i++) {
+					processedText = processedText.replace(`__CV_CODE_BLOCK_${i}__`, codePlaceholders[i]);
 				}
 			}
 
@@ -242,6 +324,23 @@ class CustomVariableProcessor {
 	 */
 	processSystemVariables(text) {
 		const now = new Date();
+		const timeZone = process.env.TZ || "America/Sao_Paulo";
+
+		const dtf = new Intl.DateTimeFormat("en-US", {
+			timeZone,
+			year: "numeric",
+			month: "2-digit",
+			day: "2-digit",
+			hour: "2-digit",
+			minute: "2-digit",
+			second: "2-digit",
+			hourCycle: "h23"
+		});
+		const parts = dtf.formatToParts(now);
+		const map = {};
+		for (const p of parts) {
+			map[p.type] = p.value;
+		}
 
 		// Substitui {day} pelo nome do dia atual
 		const days = [
@@ -253,34 +352,35 @@ class CustomVariableProcessor {
 			"Sexta-feira",
 			"Sábado"
 		];
-		text = text.replace(/{day}/g, days[now.getDay()]);
+		const dayIndex = new Date(now.toLocaleString("en-US", { timeZone })).getDay();
+		text = text.replace(/{day}/g, days[dayIndex]);
 
 		// Substitui {date} pela data atual
-		const dateStr = now.toLocaleDateString();
+		const dateStr = `${map.day}/${map.month}/${map.year}`;
 		text = text.replace(/{date}/g, dateStr);
 
 		// Substitui {time} pela hora atual
-		const timeStr = now.toLocaleTimeString();
+		const timeStr = `${map.hour}:${map.minute}:${map.second}`;
 		text = text.replace(/{time}/g, timeStr);
 
 		// NOVAS VARIÁVEIS DE DATA E HORA DETALHADAS
 		// Substitui {data-hora} pela hora atual
-		text = text.replace(/{data-hora}/g, now.getHours().toString().padStart(2, "0"));
+		text = text.replace(/{data-hora}/g, map.hour);
 
 		// Substitui {data-minuto} pelo minuto atual
-		text = text.replace(/{data-minuto}/g, now.getMinutes().toString().padStart(2, "0"));
+		text = text.replace(/{data-minuto}/g, map.minute);
 
 		// Substitui {data-segundo} pelo segundo atual
-		text = text.replace(/{data-segundo}/g, now.getSeconds().toString().padStart(2, "0"));
+		text = text.replace(/{data-segundo}/g, map.second);
 
 		// Substitui {data-dia} pelo dia atual
-		text = text.replace(/{data-dia}/g, now.getDate().toString().padStart(2, "0"));
+		text = text.replace(/{data-dia}/g, map.day);
 
 		// Substitui {data-mes} pelo mês atual
-		text = text.replace(/{data-mes}/g, (now.getMonth() + 1).toString().padStart(2, "0"));
+		text = text.replace(/{data-mes}/g, map.month);
 
 		// Substitui {data-ano} pelo ano atual
-		text = text.replace(/{data-ano}/g, now.getFullYear());
+		text = text.replace(/{data-ano}/g, map.year);
 
 		// VARIÁVEIS DE NÚMEROS ALEATÓRIOS
 		// Substitui {randomPequeno} por um número aleatório de 1 a 10
@@ -321,9 +421,9 @@ class CustomVariableProcessor {
 		if (sumMatches) {
 			// Procura por números anteriores no texto que foram gerados por variáveis random
 			const numbersInText = text
-				.split(/\\s+/)
-				.filter((word) => /^\\d+$/.test(word))
-				.map((num) => parseInt(num));
+				.split(/\s+/)
+				.filter((word) => /^\d+$/.test(word))
+				.map((num) => parseInt(num, 10));
 			const sum = numbersInText.reduce((acc, curr) => acc + curr, 0);
 
 			// Substitui {somaRandoms} pela soma
@@ -331,6 +431,37 @@ class CustomVariableProcessor {
 		}
 
 		return text;
+	}
+
+	/**
+	 * Verifica se um participante corresponde ao próprio bot
+	 * @param {Object} bot
+	 * @param {Object} participant
+	 * @returns {boolean}
+	 */
+	isBotSelf(bot, participant) {
+		if (!bot || !participant) return false;
+		const botIdentifiers = [];
+
+		if (bot.phoneNumber) {
+			botIdentifiers.push(String(bot.phoneNumber).split("@")[0]);
+		}
+		if (bot.client?.info?.wid?._serialized) {
+			botIdentifiers.push(String(bot.client.info.wid._serialized).split("@")[0]);
+		}
+		if (bot.client?.info?.wid?.user) {
+			botIdentifiers.push(String(bot.client.info.wid.user));
+		}
+		if (bot.client?.info?.me?._serialized) {
+			botIdentifiers.push(String(bot.client.info.me._serialized).split("@")[0]);
+		}
+
+		const pNum =
+			participant.id?.user ||
+			String(participant.id?._serialized || participant.id || "").split("@")[0];
+		const pLid = participant.lid ? String(participant.lid).split("@")[0] : null;
+
+		return botIdentifiers.some((id) => id && (id === pNum || id === pLid));
 	}
 
 	/**
@@ -357,10 +488,13 @@ class CustomVariableProcessor {
 				return null;
 			}
 
-			// Filtra para excluir o próprio bot
-			const filteredParticipants = participants.filter(
-				(p) => p.id._serialized !== bot.client.info.wid._serialized
-			);
+			// Filtra para excluir o próprio bot e contas de robôs (se identificadas)
+			let filteredParticipants = participants.filter((p) => !this.isBotSelf(bot, p) && !p.isBot);
+
+			if (filteredParticipants.length === 0) {
+				// Fallback se todos forem robôs ou não houver humanos identificados
+				filteredParticipants = participants.filter((p) => !this.isBotSelf(bot, p));
+			}
 
 			if (filteredParticipants.length === 0) {
 				return null;
@@ -413,9 +547,10 @@ class CustomVariableProcessor {
 		if (context.group && context.group.name) {
 			text = text.replace(/{group}/g, context.group.name);
 
-			// Novas variáveis {nomeCanal} e {nomeGrupo} - mesmo comportamento que {group}
+			// Novas variáveis {nomeCanal}, {nomeGrupo} e {tituloGrupo} - mesmo comportamento que {group}
 			text = text.replace(/{nomeCanal}/g, context.group.name);
 			text = text.replace(/{nomeGrupo}/g, context.group.name);
+			text = text.replace(/{tituloGrupo}/g, context.group.name);
 		}
 
 		// Variável {contador} - número de vezes que o comando foi executado
@@ -427,11 +562,13 @@ class CustomVariableProcessor {
 		const membroRandomMatches = text.match(/{membroRandom}/g);
 		if (membroRandomMatches && context.bot && context.message && context.message.group) {
 			try {
-				const randomMember = await this.getRandomGroupMember(context.bot, context.message.group);
-				const memberName = randomMember
-					? (randomMember.pushname ?? randomMember.name ?? "Alguém")
-					: "Alguém";
-				text = text.replace(/{membroRandom}/g, memberName.pushName ?? memberName);
+				for (let i = 0; i < membroRandomMatches.length; i++) {
+					const randomMember = await this.getRandomGroupMember(context.bot, context.message.group);
+					const memberName = randomMember
+						? (randomMember.pushname ?? randomMember.name ?? "Alguém")
+						: "Alguém";
+					text = text.replace(/{membroRandom}/, memberName);
+				}
 			} catch (error) {
 				this.logger.error("Erro ao processar variável {membroRandom}:", error);
 				text = text.replace(/{membroRandom}/g, "Alguém");
@@ -457,14 +594,15 @@ class CustomVariableProcessor {
 					let mentionName = null;
 
 					// 1. Primeiro, verifica se há pessoas mencionadas na mensagem original
-					if (
-						context.message.origin.mentionedIds &&
-						context.message.origin.mentionedIds.length > 0
-					) {
+					const msgMentions =
+						context.message.origin?.mentionedIds ??
+						context.message.mentionedIds ??
+						context.message.mentions ??
+						[];
+
+					if (Array.isArray(msgMentions) && msgMentions.length > 0) {
 						// Filtra para usar apenas menções que ainda não foram usadas
-						const availableMentions = context.message.origin.mentionedIds.filter(
-							(id) => !usedMentions.includes(id)
-						);
+						const availableMentions = msgMentions.filter((id) => !usedMentions.includes(id));
 						this.logger.debug(`[processContextVariables][availableMentions] `, availableMentions);
 						if (availableMentions.length > 0) {
 							// Seleciona uma menção aleatória das disponíveis, sem pegar contato
@@ -475,10 +613,10 @@ class CustomVariableProcessor {
 							try {
 								// Obtém informações do contato mencionado
 								mentionContact = await context.bot.client.getContactById(mentionId);
-								mentionName = `@${mentionContact?.number?.split("@")[0] ?? mentionContact?.id?.user.split("@")[0]}`;
+								mentionName = `@${mentionContact?.number?.split("@")[0] ?? mentionContact?.id?.user?.split("@")[0] ?? String(mentionId).split("@")[0]}`;
 							} catch (err) {
 								this.logger.error("Erro ao obter contato mencionado:", err);
-								mentionName = `@${mentionId.split("@")[0]}`;
+								mentionName = `@${String(mentionId).split("@")[0]}`;
 							}
 
 							// Marca esta menção como usada
@@ -488,7 +626,10 @@ class CustomVariableProcessor {
 					}
 
 					// 2. Se não há menções ou todas já foram usadas, tenta usar a mensagem citada
-					const quotedMsg = await context.message.origin.getQuotedMessage().catch(() => null);
+					const quotedMsg =
+						typeof context.message.origin?.getQuotedMessage === "function"
+							? await context.message.origin.getQuotedMessage().catch(() => null)
+							: null;
 
 					if (quotedMsg && !usedMentions.includes(quotedMsg.author)) {
 						// Usa o contato da mensagem citada
@@ -496,7 +637,7 @@ class CustomVariableProcessor {
 							const mentionContact = await quotedMsg.getContact();
 							if (mentionContact) {
 								mentionId = mentionContact.id._serialized;
-								mentionName = `@${mentionContact?.number?.split("@")[0] ?? mentionContact?.id?.user?.split("@")[0]}`;
+								mentionName = `@${mentionContact?.number?.split("@")[0] ?? mentionContact?.id?.user?.split("@")[0] ?? String(mentionId).split("@")[0]}`;
 
 								// Marca esta menção como usada
 								usedMentions.push(mentionId);
@@ -510,7 +651,7 @@ class CustomVariableProcessor {
 					// 3. Se não há mensagem citada ou já foi usada, seleciona um membro aleatório - a não ser que tenha um fallback especificado
 					if (fallbackNumber) {
 						const mentionContact = await context.bot.client.getContactById(fallbackNumber);
-						mentionName = `@${mentionContact?.number?.split("@")[0] ?? mentionContact?.id?.user?.split("@")[0]}`;
+						mentionName = `@${mentionContact?.number?.split("@")[0] ?? mentionContact?.id?.user?.split("@")[0] ?? String(fallbackNumber).split("@")[0]}`;
 
 						return { mentionId: fallbackNumber, mentionName, mentionContact };
 					} else {
@@ -519,12 +660,21 @@ class CustomVariableProcessor {
 								// Obtém membros que ainda não foram usados
 								const chat = await context.bot.client.getChatById(context.message.group);
 								if (chat && chat.isGroup && Array.isArray(chat.participants)) {
-									// Filtra participantes para excluir o próprio bot e menções já usadas
-									const filteredParticipants = chat.participants.filter(
+									// Filtra participantes para excluir o próprio bot, robôs e menções já usadas
+									let filteredParticipants = chat.participants.filter(
 										(p) =>
-											p.id._serialized !== context.bot.client.info.wid._serialized &&
+											!this.isBotSelf(context.bot, p) &&
+											!p.isBot &&
 											!usedMentions.includes(p.id._serialized)
 									);
+
+									if (filteredParticipants.length === 0) {
+										// Fallback se todos forem robôs
+										filteredParticipants = chat.participants.filter(
+											(p) =>
+												!this.isBotSelf(context.bot, p) && !usedMentions.includes(p.id._serialized)
+										);
+									}
 
 									if (filteredParticipants.length > 0) {
 										// Seleciona um participante aleatório
@@ -535,16 +685,22 @@ class CustomVariableProcessor {
 
 										// Obtém o objeto de contato
 										const mentionContact = await context.bot.client.getContactById(mentionId);
-										mentionName = `@${mentionContact?.number?.split("@")[0] ?? mentionContact?.id?.user?.split("@")[0]}`;
+										mentionName = `@${mentionContact?.number?.split("@")[0] ?? mentionContact?.id?.user?.split("@")[0] ?? String(mentionId).split("@")[0]}`;
 
 										// Marca esta menção como usada
 										usedMentions.push(mentionId);
 										return { mentionId, mentionName, mentionContact };
 									} else if (chat.participants.length > 1) {
 										// Se todos já foram usados, reseta e usa qualquer um exceto o bot
-										const nonBotParticipants = chat.participants.filter(
-											(p) => p.id._serialized !== context.bot.client.info.wid._serialized
+										let nonBotParticipants = chat.participants.filter(
+											(p) => !this.isBotSelf(context.bot, p) && !p.isBot
 										);
+
+										if (nonBotParticipants.length === 0) {
+											nonBotParticipants = chat.participants.filter(
+												(p) => !this.isBotSelf(context.bot, p)
+											);
+										}
 
 										if (nonBotParticipants.length > 0) {
 											const randomIndex = Math.floor(Math.random() * nonBotParticipants.length);
@@ -554,7 +710,7 @@ class CustomVariableProcessor {
 
 											// Obtém o objeto de contato
 											const mentionContact = await context.bot.client.getContactById(mentionId);
-											mentionName = `@${mentionContact?.number?.split("@")[0] ?? mentionContact?.id?.user?.split("@")[0]}`;
+											mentionName = `@${mentionContact?.number?.split("@")[0] ?? mentionContact?.id?.user?.split("@")[0] ?? String(mentionId).split("@")[0]}`;
 
 											return { mentionId, mentionName, mentionContact };
 										}
@@ -639,6 +795,56 @@ class CustomVariableProcessor {
 							}
 						} else if (context.options) {
 							context.options.mentions = [mentionId];
+						}
+					}
+				}
+
+				const mentionPickMatches = text.match(/{mentionPick}/g);
+				if (mentionPickMatches) {
+					const rawMentions =
+						context.message.origin?.mentionedIds ??
+						context.message.mentionedIds ??
+						context.message.mentions ??
+						[];
+					const mentionIds = Array.isArray(rawMentions)
+						? rawMentions
+								.map((mention) =>
+									typeof mention === "string"
+										? mention
+										: mention?.id?._serialized ||
+											mention?._serialized ||
+											mention?.id ||
+											mention?.user
+								)
+								.filter(Boolean)
+						: [];
+					const fallbackId = context.message.authorAlt || context.message.author;
+
+					for (let i = 0; i < mentionPickMatches.length; i++) {
+						const mentionId =
+							mentionIds.length > 0
+								? mentionIds[Math.floor(Math.random() * mentionIds.length)]
+								: fallbackId;
+						let mentionName = `@${String(mentionId || "Usuário").split("@")[0]}`;
+
+						try {
+							const contact = await context.bot?.client?.getContactById?.(mentionId);
+							mentionName = `@${contact?.number?.split("@")[0] ?? contact?.id?.user?.split("@")[0] ?? String(mentionId || "Usuário").split("@")[0]}`;
+						} catch (error) {
+							this.logger.debug(
+								`Não foi possível obter contato de {mentionPick}: ${error.message}`
+							);
+						}
+
+						text = text.replace(/{mentionPick}/, mentionName);
+						if (mentionId) {
+							if (context.options?.mentions) {
+								if (!context.options.mentions.includes(mentionId)) {
+									context.options.mentions.push(mentionId);
+								}
+							} else if (context.options) {
+								context.options.mentions = [mentionId];
+							}
 						}
 					}
 				}
@@ -738,8 +944,8 @@ class CustomVariableProcessor {
 					// Marca este índice como usado
 					usedIndices[key].push(selectedIndex);
 
-					// Substitui a primeira ocorrência da variável pelo valor selecionado
-					text = text.replace(regex, value[selectedIndex]);
+					// Substitui a primeira ocorrência restante da variável pelo valor selecionado
+					text = text.replace(`{${key}}`, value[selectedIndex]);
 				}
 			} else if (typeof value === "string") {
 				// Para valores de string, substitui normalmente
@@ -751,19 +957,52 @@ class CustomVariableProcessor {
 	}
 
 	/**
-	 * Processa variáveis de solicitação de API no formato {API#MÉTODO#TIPO_RESPOSTA#URL}
-	 * @param {string} text - Texto contendo variáveis de API
-	 * @param {Object} context - Dados de contexto (mensagem, args, etc.)
-	 * @returns {Promise<string>} - Texto processado
+	 * Obtém autores, texto e mídia citada somente quando solicitados na resposta.
 	 */
-	async processAPIRequest(text, context) {
+	async getMessageVariables(text, context) {
+		const message = context?.message;
+		const values = { autor: message?.authorAlt || message?.author || "" };
+		if (!/\{(mensagemCitada|autorCitado|midiaCitada)\}/.test(text)) return values;
+
+		let quoted = null;
+		try {
+			const source = message?.getQuotedMessage ? message : message?.origin;
+			quoted = await source?.getQuotedMessage?.();
+		} catch (error) {
+			this.logger.debug("Mensagem citada indisponível");
+		}
+		quoted ??= message?.quotedMsg;
+		values.mensagemCitada =
+			[quoted?.caption, quoted?.body, quoted?.content].find(
+				(value) => typeof value === "string" && value.length > 0
+			) ?? "";
+		values.autorCitado = quoted?.authorAlt || quoted?.author || "";
+		if (text.includes("{midiaCitada}") && quoted) {
+			try {
+				const source = quoted.downloadMedia ? quoted : quoted.origin;
+				const media = (await source?.downloadMedia?.()) ?? quoted.content;
+				if (media?.data && /^(image|video)\//.test(media.mimetype)) {
+					values.media = media;
+					values.midiaCitada = `data:${media.mimetype};base64,${media.data}`;
+				}
+			} catch (error) {
+				this.logger.debug("Mídia citada indisponível");
+			}
+		}
+		return values;
+	}
+
+	/** Processa {API#MÉTODO#TIPO_RESPOSTA#URL}, com headers opcionais. */
+	async processAPIRequest(text, context, messageVariables) {
 		try {
 			// Expressão regular para encontrar variáveis de solicitação de API
-			const apiRegex = /{API#(GET|POST|FORM)#(TEXT|JSON)#([^}]+)}/gs;
+			const apiRegex =
+				/{API#(GET|POST|FORM)#(TEXT|JSON)#((?:[^{}]|\{(?:mensagemCitada|autor|autorCitado|midiaCitada)\})+)}/gs;
 
 			// Encontra todas as variáveis de solicitação de API
 			const matches = Array.from(text.matchAll(apiRegex));
 			if (matches.length === 0) return text;
+			messageVariables ??= await this.getMessageVariables(text, context);
 
 			this.logger.debug(`Encontradas ${matches.length} variáveis de API para processar`);
 
@@ -771,40 +1010,53 @@ class CustomVariableProcessor {
 			for (const match of matches) {
 				const [fullMatch, method, responseType, urlAndTemplate] = match;
 
-				// Divide URL e template (para tipo de resposta JSON)
-				let url, template;
-				if (responseType === "JSON") {
-					// Encontra a primeira quebra de linha para separar URL do template
-					const firstLineBreak = urlAndTemplate.indexOf("\n");
-					if (firstLineBreak !== -1) {
-						url = urlAndTemplate.substring(0, firstLineBreak).trim();
-						template = urlAndTemplate.substring(firstLineBreak + 1).trim();
+				try {
+					// Divide URL e template (para tipo de resposta JSON)
+					let url, template;
+					if (responseType === "JSON") {
+						// Encontra a primeira quebra de linha para separar URL do template
+						const firstLineBreak = urlAndTemplate.indexOf("\n");
+						if (firstLineBreak !== -1) {
+							url = urlAndTemplate.substring(0, firstLineBreak).trim();
+							template = urlAndTemplate.substring(firstLineBreak + 1).trim();
+						} else {
+							url = urlAndTemplate.trim();
+							template = "";
+						}
 					} else {
 						url = urlAndTemplate.trim();
-						template = "";
 					}
-				} else {
-					url = urlAndTemplate.trim();
-				}
 
-				// Processa argumentos na URL (arg1, arg2, etc.)
-				if (context && context.command && Array.isArray(context.command.args)) {
-					// Substitui arg1, arg2, etc. pelos argumentos reais
-					url = url.replace(/arg(\d+)/g, (match, index) => {
-						const argIndex = parseInt(index, 10) - 1;
-						return argIndex < context.command.args.length
-							? encodeURIComponent(context.command.args[argIndex])
-							: "";
-					});
-				}
+					// Headers: #HEADER#Nome=valor (valor percent-encoded, como na query).
+					const [requestUrl, ...headerParts] = url.split("#HEADER#");
+					const substitute = (value) =>
+						value.replace(
+							/arg(\d+)|\{(mensagemCitada|autor|autorCitado|midiaCitada)\}/g,
+							(match, index, name) => {
+								if (name) return encodeURIComponent(messageVariables[name] ?? "");
+								if (!Array.isArray(context?.command?.args)) return match;
+								return encodeURIComponent(context.command.args[Number(index) - 1] ?? "");
+							}
+						);
+					url = substitute(requestUrl);
+					const headers = Object.create(null);
+					for (const part of headerParts) {
+						const separator = part.indexOf("=");
+						if (separator < 1) throw new Error("Header deve usar Nome=valor");
+						const name = part.slice(0, separator).trim();
+						const value = decodeURIComponent(substitute(part.slice(separator + 1)));
+						if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name) || /[\r\n]/.test(value)) {
+							throw new Error("Header inválido");
+						}
+						if (value) headers[name.toLowerCase()] = value;
+					}
 
-				this.logger.debug(`Processando solicitação de API: ${method} ${url}`);
+					this.logger.debug(`Processando solicitação de API: ${method}`);
 
-				// Faz a solicitação de API real
-				let response;
-				try {
+					// Faz a solicitação de API real
+					let response;
 					if (method === "GET") {
-						response = await axios.get(url);
+						response = await axios.get(url, { headers, timeout: 10000 });
 					} else if (method === "POST") {
 						// Analisa a URL para extrair dados
 						const [baseUrl, queryParams] = url.split("?");
@@ -819,7 +1071,7 @@ class CustomVariableProcessor {
 							});
 						}
 
-						response = await axios.post(baseUrl, data);
+						response = await axios.post(baseUrl, data, { headers, timeout: 10000 });
 					} else if (method === "FORM") {
 						// Analisa a URL para extrair dados do formulário
 						const [baseUrl, queryParams] = url.split("?");
@@ -836,8 +1088,10 @@ class CustomVariableProcessor {
 
 						response = await axios.post(baseUrl, formData, {
 							headers: {
-								"Content-Type": "application/x-www-form-urlencoded"
-							}
+								"content-type": "application/x-www-form-urlencoded",
+								...headers
+							},
+							timeout: 10000
 						});
 					}
 
@@ -869,10 +1123,11 @@ class CustomVariableProcessor {
 					}
 
 					// Substitui a variável de API pelo resultado
-					text = text.replace(fullMatch, result);
+					text = text.replace(fullMatch, () => result);
 				} catch (apiError) {
-					this.logger.error(`Erro ao fazer solicitação de API para ${url}:`, apiError);
-					text = text.replace(fullMatch, `Erro na requisição API: ${apiError.message}`);
+					// Erros do axios podem conter a configuração completa, incluindo credenciais.
+					this.logger.error("Erro na requisição API");
+					text = text.replace(fullMatch, "Erro na requisição API");
 				}
 			}
 
@@ -978,130 +1233,385 @@ class CustomVariableProcessor {
 	}
 
 	/**
-	 * Obtém informações de clima (implementação de exemplo)
+	 * Obtém informações de clima via WeatherMeteo
 	 * @param {string} location - Nome da localização
 	 * @returns {Promise<string>} - Informações de clima
 	 */
 	async getWeather(location) {
 		try {
-			// Isso é um placeholder. Em uma implementação real, você chamaria uma API de clima
-			return `Clima para ${location}: Ensolarado, 25°C`;
+			if (!location || typeof location !== "string" || location.trim().length === 0) {
+				return "Localização não especificada";
+			}
+
+			const {
+				getCityCoordinates,
+				getWeatherData,
+				WMO_MAPPING
+			} = require("../functions/WeatherMeteo");
+
+			const loc = await getCityCoordinates(location.trim());
+			const weather = await getWeatherData(loc.lat, loc.lon);
+			const current = weather?.current;
+
+			if (!current) {
+				return `Dados de clima não disponíveis para ${location}`;
+			}
+
+			const temp = Math.round(current.temperature_2m);
+			const feelsLike = Math.round(current.apparent_temperature);
+			const humidity = current.relative_humidity_2m;
+			const code = current.weather_code;
+			const wmo = WMO_MAPPING?.[code] || { desc: "Tempo estável", emoji: "🌡️" };
+
+			const stateSuffix = loc.admin1 ? `, ${loc.admin1}` : "";
+			return `${wmo.emoji} ${wmo.desc}, ${temp}°C (sensação ${feelsLike}°C), umidade ${humidity}% em ${loc.name}${stateSuffix}`;
 		} catch (error) {
-			this.logger.error(`Erro ao obter clima para ${location}:`, error);
+			this.logger.error(`Erro ao obter clima para ${location}:`, error.message);
 			return `Dados de clima não disponíveis para ${location}`;
 		}
 	}
 
+	/**
+	 * Detecta se a URL corresponde a uma imagem, GIF ou vídeo
+	 * @param {string} url
+	 * @returns {string|null} 'image' | 'gif' | 'video' | null
+	 */
+	detectMediaType(url) {
+		if (!url || typeof url !== "string") return null;
+		const cleanUrl = url.split("?")[0].toLowerCase();
+		if (cleanUrl.endsWith(".mp4") || cleanUrl.endsWith(".webm") || url.includes("v.redd.it")) {
+			return "video";
+		}
+		if (cleanUrl.endsWith(".gif") || cleanUrl.endsWith(".gifv")) {
+			return "gif";
+		}
+		if (
+			cleanUrl.endsWith(".jpg") ||
+			cleanUrl.endsWith(".jpeg") ||
+			cleanUrl.endsWith(".png") ||
+			cleanUrl.endsWith(".webp") ||
+			url.includes("i.redd.it") ||
+			url.includes("i.imgur.com")
+		) {
+			return "image";
+		}
+		return null;
+	}
+
+	/**
+	 * Normaliza a lista de posts vinda da API do Reddit / espelhos
+	 * @param {Array} children
+	 * @returns {Array<Object>}
+	 */
+	normalizeRedditChildren(children) {
+		return children
+			.map((p) => {
+				const data = p?.data || {};
+				const rawUrl = data.url_overridden_by_dest || data.url || "";
+				const videoUrl =
+					data.media?.reddit_video?.fallback_url ||
+					data.preview?.reddit_video_preview?.fallback_url ||
+					null;
+				const type = videoUrl ? "video" : this.detectMediaType(rawUrl);
+
+				return {
+					id: data.id || String(Math.random()),
+					title: data.title || "",
+					author: data.author || "",
+					subreddit: data.subreddit_name_prefixed || `r/${data.subreddit || ""}`,
+					ups: data.ups || 0,
+					downs: data.downs || 0,
+					permalink: data.permalink
+						? data.permalink.startsWith("http")
+							? data.permalink
+							: `https://reddit.com${data.permalink.startsWith("/") ? "" : "/"}${data.permalink}`
+						: rawUrl,
+					url: rawUrl,
+					videoUrl,
+					isNsfw: Boolean(data.over_18),
+					stickied: Boolean(data.stickied),
+					type
+				};
+			})
+			.filter((p) => Boolean(p.url || p.videoUrl));
+	}
+
+	/**
+	 * Busca posts de um subreddit utilizando múltiplos provedores públicos em cascata
+	 * @param {string} subreddit
+	 * @returns {Promise<Array<Object>>}
+	 */
+	async fetchRedditPosts(subreddit) {
+		const cleanSubreddit = subreddit.replace(/^r\//i, "").trim();
+
+		// 1. Provedor meme-api.com (serviço dedicado para mídia do Reddit, imune a bloqueios de IP de datacenter)
+		try {
+			const memeResponse = await axios.get(
+				`https://meme-api.com/gimme/${encodeURIComponent(cleanSubreddit)}/50`,
+				{
+					timeout: 8000,
+					headers: {
+						"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) RavenaBot/1.0"
+					}
+				}
+			);
+			const memes = memeResponse?.data?.memes;
+			if (Array.isArray(memes) && memes.length > 0) {
+				return memes
+					.map((m) => {
+						const id = m.postLink ? m.postLink.split("/").pop() : String(Math.random());
+						const mediaType = this.detectMediaType(m.url) || "image";
+						return {
+							id,
+							title: m.title || "",
+							author: m.author || "",
+							subreddit: m.subreddit ? `r/${m.subreddit}` : `r/${cleanSubreddit}`,
+							ups: m.ups || 0,
+							downs: 0,
+							permalink: m.postLink || `https://reddit.com/r/${cleanSubreddit}`,
+							url: m.url,
+							videoUrl: null,
+							isNsfw: Boolean(m.nsfw),
+							stickied: false,
+							type: mediaType
+						};
+					})
+					.filter((m) => Boolean(m.url));
+			}
+		} catch (err) {
+			this.logger.debug(
+				`[Reddit] meme-api não retornou posts para r/${cleanSubreddit}: ${err.message}`
+			);
+		}
+
+		// 2. Provedor Reddit JSON público direto (funciona caso o IP não esteja bloqueado)
+		try {
+			const directResponse = await axios.get(
+				`https://www.reddit.com/r/${encodeURIComponent(cleanSubreddit)}/hot.json?limit=100`,
+				{
+					headers: {
+						"User-Agent":
+							"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+						Accept: "application/json, text/plain, */*"
+					},
+					timeout: 8000
+				}
+			);
+			const children = directResponse?.data?.data?.children;
+			if (Array.isArray(children) && children.length > 0) {
+				const normalized = this.normalizeRedditChildren(children);
+				if (normalized.length > 0) return normalized;
+			}
+		} catch (err) {
+			this.logger.debug(
+				`[Reddit] Requisição pública direta falhou para r/${cleanSubreddit}: ${err.message}`
+			);
+		}
+
+		// 3. Provedor PullPush API (busca pública de submissões como contingência)
+		try {
+			const pullpushResponse = await axios.get(
+				`https://api.pullpush.io/reddit/search/submission/?subreddit=${encodeURIComponent(cleanSubreddit)}&size=50`,
+				{
+					headers: {
+						"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) RavenaBot/1.0"
+					},
+					timeout: 8000
+				}
+			);
+			const submissions = pullpushResponse?.data?.data;
+			if (Array.isArray(submissions) && submissions.length > 0) {
+				return submissions
+					.map((data) => {
+						const rawUrl = data.url_overridden_by_dest || data.url || "";
+						const videoUrl =
+							data.media?.reddit_video?.fallback_url ||
+							data.preview?.reddit_video_preview?.fallback_url ||
+							null;
+						const type = videoUrl ? "video" : this.detectMediaType(rawUrl);
+
+						return {
+							id: data.id || String(Math.random()),
+							title: data.title || "",
+							author: data.author || "",
+							subreddit: data.subreddit ? `r/${data.subreddit}` : `r/${cleanSubreddit}`,
+							ups: data.ups || data.score || 0,
+							downs: 0,
+							permalink: data.permalink
+								? data.permalink.startsWith("http")
+									? data.permalink
+									: `https://reddit.com${data.permalink.startsWith("/") ? "" : "/"}${data.permalink}`
+								: rawUrl,
+							url: rawUrl,
+							videoUrl,
+							isNsfw: Boolean(data.over_18),
+							stickied: Boolean(data.stickied),
+							type
+						};
+					})
+					.filter((p) => Boolean((p.url || p.videoUrl) && p.type));
+			}
+		} catch (err) {
+			this.logger.debug(`[Reddit] PullPush falhou para r/${cleanSubreddit}: ${err.message}`);
+		}
+
+		return [];
+	}
+
+	/**
+	 * Processa variáveis do Reddit no formato {reddit-subreddit1-subreddit2...}
+	 * @param {string} text
+	 * @param {Object} context
+	 * @returns {Promise<{type: string, text?: string, payload?: Object}>}
+	 */
 	async processRedditVariable(text, context) {
-		// A regex agora busca por {reddit-xxx} dentro do texto recebido
 		const regex = /\{reddit-(.+?)\}/;
 		const match = text.match(regex);
 
-		// Se a variável não for encontrada, retorna o texto original para continuar o processamento.
 		if (!match) {
 			return { type: "text", text };
 		}
 
-		const fullVariable = match[0]; // Ex: "{reddit-memes-funny-coolthings}"
+		const fullVariable = match[0];
+		const subredditOptions = match[1]
+			.split("-")
+			.map((s) => s.trim().replace(/^r\//i, ""))
+			.filter(Boolean);
 
-		// Separa os subreddits especificados pelo caractere '-'
-		const subredditOptions = match[1].split("-"); // Ex: ['memes', 'funny', 'coolthings']
-
-		// Escolhe um subreddit aleatório da lista fornecida
-		const subreddit = subredditOptions[Math.floor(Math.random() * subredditOptions.length)];
-
-		try {
-			// 1. Busca os posts mais recentes via API do Reddit
-			const response = await axios.get(`https://www.reddit.com/r/${subreddit}/new.json?limit=100`);
-			const posts = response?.data?.data?.children;
-
-			if (!posts || posts.length === 0) {
-				const newText = text.replace(
-					fullVariable,
-					`Subreddit r/${subreddit} não foi encontrado ou não possui posts.`
-				);
-				return { type: "text", text: newText };
-			}
-
-			// 2. Gerencia o cache global
-			const groupId = context.group;
-			if (!this.redditCache[groupId]) this.redditCache[groupId] = {};
-			if (!this.redditCache[groupId][subreddit]) this.redditCache[groupId][subreddit] = [];
-
-			// 3. Filtra posts fixados e já enviados
-			let availablePosts = posts
-				.filter((p) => !p.data.stickied)
-				.filter((p) => !this.redditCache[groupId][subreddit].includes(p.data.id));
-
-			// 4. Se todos os posts já foram vistos, reseta o cache
-			if (availablePosts.length === 0 && posts.filter((p) => !p.data.stickied).length > 0) {
-				this.redditCache[groupId][subreddit] = [];
-				availablePosts = posts.filter((p) => !p.data.stickied);
-			}
-
-			// 5. Separa e seleciona a mídia com base na prioridade (Imagem > GIF > Vídeo)
-			const images = [],
-				gifs = [],
-				videos = [];
-			for (const post of availablePosts) {
-				const { data } = post;
-				const url = data.url_overridden_by_dest;
-				const hint = data.post_hint;
-				if (!url) continue;
-
-				if (hint === "image" && (url.endsWith(".jpg") || url.endsWith(".png"))) images.push(post);
-				else if (hint === "image" && (url.endsWith(".gif") || url.endsWith(".gifv")))
-					gifs.push(post);
-				else if (
-					(data.is_video || hint === "hosted:video") &&
-					data?.media?.reddit_video?.fallback_url
-				) {
-					videos.push(post);
-				}
-			}
-
-			const selectRandom = (arr) =>
-				arr.length > 0 ? arr[Math.floor(Math.random() * arr.length)] : null;
-			let selectedPost, mediaUrl, mediaType;
-
-			let customMime = "image/jpeg";
-			if ((selectedPost = selectRandom(images))) {
-				mediaUrl = selectedPost.data.url_overridden_by_dest;
-				mediaType = "image";
-			} else if ((selectedPost = selectRandom(gifs))) {
-				mediaUrl = selectedPost.data.url_overridden_by_dest;
-				mediaType = "image";
-			} else if ((selectedPost = selectRandom(videos))) {
-				mediaUrl = selectedPost.data.media.reddit_video.fallback_url;
-				mediaType = "video";
-				customMime = "video/mp4";
-			}
-
-			// 6. Cria o MessageMedia e retorna o payload
-			if (selectedPost && mediaUrl && mediaType) {
-				const opts = { unsafeMime: false, customMime };
-				const media = await context.bot.createMediaFromURL(mediaUrl, opts);
-
-				// Hijack as options pra fazer legenda
-				context.options.caption = `📷 [${selectedPost.data.subreddit_name_prefixed}] _${selectedPost.data.title}_
-> ${selectedPost.data.ups} 👍 ${selectedPost.data.downs} 👎
-> reddit.com/${selectedPost.data.permalink}`; // > reddit.com/u/${selectedPost.data.author
-
-				if (media) {
-					this.redditCache[groupId][subreddit].push(selectedPost.data.id);
-					// Retorna um tipo 'media' para indicar que a mensagem inteira deve ser este anexo
-					return { type: "media", payload: media };
-				}
-			}
-
-			// Se nenhuma mídia foi encontrada ou a criação do MessageMedia falhou
-			const errorText = `Nenhuma mídia (imagem/gif/vídeo) recente encontrada em r/${subreddit}.`;
-			return { type: "text", text: text.replace(fullVariable, errorText) };
-		} catch (error) {
-			console.error(`[RedditVariable] Erro ao processar r/${subreddit}:`, error.message);
-			const errorText = `Subreddit r/${subreddit} não foi encontrado.`;
+		if (subredditOptions.length === 0) {
+			const errorText = "Subreddit não especificado.";
 			return { type: "text", text: text.replace(fullVariable, errorText) };
 		}
+
+		// Embaralha as opções para permitir alternância quando múltiplos subreddits são fornecidos
+		const shuffledOptions = [...subredditOptions].sort(() => Math.random() - 0.5);
+
+		const groupId =
+			context?.group?.id ||
+			(typeof context?.group === "string" ? context.group : null) ||
+			context?.message?.group ||
+			context?.message?.author ||
+			"global";
+
+		if (!this.redditCache[groupId]) this.redditCache[groupId] = {};
+
+		const filterNsfw = Boolean(context?.group?.filters?.nsfw);
+
+		for (const subreddit of shuffledOptions) {
+			if (!this.redditCache[groupId][subreddit]) this.redditCache[groupId][subreddit] = [];
+
+			try {
+				const posts = await this.fetchRedditPosts(subreddit);
+				if (!posts || posts.length === 0) {
+					continue;
+				}
+
+				// Filtra posts fixados, NSFW (se filtro ativo) e já vistos no grupo
+				let availablePosts = posts
+					.filter((p) => !p.stickied)
+					.filter((p) => !filterNsfw || !p.isNsfw)
+					.filter((p) => !this.redditCache[groupId][subreddit].includes(p.id));
+
+				// Se todos os posts disponíveis já foram vistos, reseta o cache para este subreddit
+				if (
+					availablePosts.length === 0 &&
+					posts.filter((p) => !p.stickied && (!filterNsfw || !p.isNsfw)).length > 0
+				) {
+					this.redditCache[groupId][subreddit] = [];
+					availablePosts = posts.filter((p) => !p.stickied).filter((p) => !filterNsfw || !p.isNsfw);
+				}
+
+				if (availablePosts.length === 0) {
+					continue;
+				}
+
+				// Separa por prioridade: Imagem > GIF > Vídeo
+				const images = [];
+				const gifs = [];
+				const videos = [];
+
+				for (const post of availablePosts) {
+					if (post.type === "video" || post.videoUrl) {
+						videos.push(post);
+					} else if (post.type === "gif") {
+						gifs.push(post);
+					} else if (post.type === "image") {
+						images.push(post);
+					}
+				}
+
+				const selectRandom = (arr) =>
+					arr.length > 0 ? arr[Math.floor(Math.random() * arr.length)] : null;
+
+				// Tenta até 3 candidatos caso algum link de mídia falhe ao ser baixado
+				const candidatesPool = [
+					selectRandom(images),
+					selectRandom(gifs),
+					selectRandom(videos)
+				].filter(Boolean);
+
+				for (const selectedPost of candidatesPool) {
+					let mediaUrl = selectedPost.url;
+					let mediaType = selectedPost.type;
+					let customMime = "image/jpeg";
+
+					if (selectedPost.videoUrl) {
+						mediaUrl = selectedPost.videoUrl;
+						mediaType = "video";
+						customMime = "video/mp4";
+					} else if (mediaType === "gif") {
+						if (mediaUrl.toLowerCase().endsWith(".gifv")) {
+							mediaUrl = mediaUrl.replace(/\.gifv$/i, ".mp4");
+							mediaType = "video";
+							customMime = "video/mp4";
+						} else {
+							customMime = "image/gif";
+						}
+					} else if (mediaType === "video") {
+						customMime = "video/mp4";
+					}
+
+					if (context?.bot?.createMediaFromURL && mediaUrl) {
+						try {
+							const opts = { unsafeMime: true, customMime };
+							const media = await context.bot.createMediaFromURL(mediaUrl, opts);
+
+							if (media) {
+								if (!context.options) {
+									context.options = {};
+								}
+
+								const subDisplay = selectedPost.subreddit.startsWith("r/")
+									? selectedPost.subreddit
+									: `r/${selectedPost.subreddit}`;
+
+								const link = selectedPost.permalink.startsWith("http")
+									? selectedPost.permalink
+									: `https://reddit.com${selectedPost.permalink.startsWith("/") ? "" : "/"}${selectedPost.permalink}`;
+
+								const cleanLink = link.replace(/^https?:\/\//i, "");
+
+								context.options.caption = `📷 [${subDisplay}] _${selectedPost.title}_\n> ${selectedPost.ups} 👍 ${selectedPost.downs} 👎\n> ${cleanLink}`;
+
+								this.redditCache[groupId][subreddit].push(selectedPost.id);
+								return { type: "media", payload: media };
+							}
+						} catch (mediaError) {
+							this.logger.warn(
+								`[RedditVariable] Falha ao baixar mídia de ${mediaUrl}: ${mediaError.message}`
+							);
+						}
+					}
+				}
+			} catch (subError) {
+				this.logger.error(`[RedditVariable] Erro ao processar r/${subreddit}:`, subError.message);
+			}
+		}
+
+		// Se nenhuma mídia foi encontrada ou todos os subreddits falharam
+		const subList = subredditOptions.map((s) => `r/${s}`).join(", ");
+		const errorText = `Subreddit ${subList} não foi encontrado ou não possui posts com mídia recente.`;
+		return { type: "text", text: text.replace(fullVariable, errorText) };
 	}
 
 	/**
@@ -1111,40 +1621,33 @@ class CustomVariableProcessor {
 	 */
 	async handleProfilePictureResponse(processedText, targetJid, context) {
 		try {
-			if (typeof context.bot.getProfilePictureUrl !== "function") {
-				throw new Error("Bot não suporta getProfilePictureUrl");
-			}
+			const media = await ProfilePictureHelper.fetchUserProfilePictureMedia(context.bot, targetJid);
 
-			const profileUrl = await context.bot.getProfilePictureUrl(targetJid);
-			if (!profileUrl) {
+			if (!media) {
 				throw new Error("Nenhuma URL de imagem de perfil encontrada");
 			}
 
-			const response = await axios.get(profileUrl, { responseType: "arraybuffer" });
-			const buffer = Buffer.from(response.data, "binary");
-			const media = {
-				mimetype: "image/jpeg",
-				data: buffer.toString("base64"),
-				filename: "profile.jpg",
-				isMessageMedia: true
-			};
+			const captionText = typeof processedText === "string" ? processedText.trim() : "";
 
-			if (processedText.length <= 1000) {
+			if (captionText.length <= 1000) {
 				if (!context.options) {
 					context.options = {};
 				}
-				context.options.caption = processedText;
+				context.options.caption = captionText;
 				return media;
 			} else {
 				const chatId = context.message.group ?? context.message.author;
 				await context.bot.sendMessage(chatId, media, {
 					goReply: context.message.origin
 				});
-				return processedText;
+				return captionText;
 			}
 		} catch (error) {
-			this.logger.error(`Erro ao obter foto de perfil para ${targetJid}:`, error.message);
-			return processedText + "\n> não foi possível baixar a foto de perfil deste usuário";
+			this.logger.error(`Erro ao obter foto de perfil para ${targetJid}:`, error.message || error);
+			return (
+				(processedText ? processedText.trim() + "\n" : "") +
+				"> não foi possível baixar a foto de perfil deste usuário"
+			);
 		}
 	}
 }

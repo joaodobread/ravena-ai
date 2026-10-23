@@ -1,0 +1,1906 @@
+/* windows.css - WinBox Theme Override and Window Content Styling */
+
+/* WinBox Theme Override */
+.winbox.os-window {
+    background: linear-gradient(180deg, rgba(55, 17, 143, 0.92) 0%, rgba(28, 5, 88, 0.92) 100%) !important;
+    border: 2px solid var(--bright-blue) !important;
+    border-radius: 6px !important;
+    box-shadow: 0 8px 30px rgba(0, 0, 0, 0.85), 0 0 15px rgba(4, 169, 240, 0.3) !important;
+    font-family: var(--font-mono) !important;
+    overflow: hidden;
+    backdrop-filter: blur(12px) !important;
+    -webkit-backdrop-filter: blur(12px) !important;
+    transition: filter 0.25s ease, opacity 0.25s ease, border-color 0.2s ease !important;
+}
+
+/* Background/Unfocused Windows: Dimmed saturation and slight opacity */
+.winbox.os-window:not(.focus) {
+    filter: saturate(0.55) opacity(0.92) !important;
+    border-color: rgba(71, 72, 108, 0.7) !important;
+}
+
+.winbox.os-window.focus {
+    filter: saturate(1) opacity(1) !important;
+    border-color: var(--cyan-neon) !important;
+    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.95), 0 0 25px rgba(0, 240, 255, 0.4) !important;
+}
+
+/* Titlebar */
+.winbox.os-window .wb-header {
+    height: 30px !important;
+    background: linear-gradient(180deg, #37118f 0%, #1c0558 100%) !important;
+    border-bottom: 1px solid var(--bright-blue) !important;
+    padding: 0 6px !important;
+    position: relative !important;
+    display: flex !important;
+    flex-direction: row !important;
+    align-items: center !important;
+    overflow: hidden !important;
+}
+
+.winbox.os-window:not(.focus) .wb-header {
+    background: linear-gradient(180deg, #24223d 0%, #141324 100%) !important;
+    border-bottom-color: #3b3c58 !important;
+}
+
+/* wb-drag: covers entire titlebar behind controls to allow drag everywhere */
+.winbox.os-window .wb-drag {
+    position: absolute !important;
+    top: 0 !important;
+    left: 0 !important;
+    right: 0 !important;
+    bottom: 0 !important;
+    width: 100% !important;
+    height: 100% !important;
+    cursor: move !important;
+    z-index: 1 !important;
+}
+
+.winbox.os-window .wb-icon {
+    order: 1 !important;
+    width: 18px;
+    height: 18px;
+    margin-right: 6px;
+    flex-shrink: 0;
+    position: relative !important;
+    z-index: 2 !important;
+    pointer-events: none !important;
+}
+
+.winbox.os-window .wb-title {
+    order: 2 !important;
+    font-family: var(--font-display) !important;
+    font-size: 12px !important;
+    font-weight: 700 !important;
+    color: #ffffff !important;
+    text-shadow: 1px 1px 2px rgba(0, 0, 0, 0.9) !important;
+    letter-spacing: 0.5px;
+    padding-left: 2px;
+    flex: 1 !important;
+    text-align: left !important;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    position: relative !important;
+    z-index: 2 !important;
+    pointer-events: none !important;
+}
+
+/* Control Buttons Container (Far Right, Above Drag Layer) */
+.winbox.os-window .wb-control {
+    order: 4 !important;
+    display: flex !important;
+    align-items: center !important;
+    gap: 4px !important;
+    margin-left: auto !important;
+    margin-right: 2px !important;
+    height: 100% !important;
+    flex-shrink: 0;
+    position: relative !important;
+    z-index: 10 !important;
+    pointer-events: auto !important;
+}
+
+/* Individual Buttons */
+.winbox.os-window .wb-control * {
+    display: inline-flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    width: 20px !important;
+    height: 20px !important;
+    margin: 0 !important;
+    border-radius: 3px !important;
+    border: 1px solid rgba(255, 255, 255, 0.25) !important;
+    background-color: rgba(255, 255, 255, 0.12) !important;
+    background-image: none !important;
+    cursor: pointer !important;
+    color: #ffffff !important;
+    font-family: var(--font-mono) !important;
+    font-weight: 700 !important;
+    line-height: 1 !important;
+    text-align: center !important;
+    transition: all 0.15s ease !important;
+    position: relative !important;
+    z-index: 11 !important;
+    pointer-events: auto !important;
+}
+
+/* Button Ordering: Minimizar (1) -> Maximizar (2) -> Fechar (3) */
+.winbox.os-window .wb-min {
+    order: 1 !important;
+}
+
+.winbox.os-window .wb-max {
+    order: 2 !important;
+}
+
+.winbox.os-window .wb-close {
+    order: 3 !important;
+}
+
+/* Hide Fullscreen Button (Não exibir ícone tela cheia) */
+.winbox.os-window .wb-full {
+    display: none !important;
+}
+
+/* Minimize Button */
+.winbox.os-window .wb-min::before {
+    content: "−" !important;
+    font-size: 15px !important;
+    line-height: 1 !important;
+    display: block !important;
+}
+
+/* Maximize Button */
+.winbox.os-window .wb-max::before {
+    content: "□" !important;
+    font-size: 12px !important;
+    line-height: 1 !important;
+    display: block !important;
+}
+
+/* Close Button */
+.winbox.os-window .wb-close::before {
+    content: "✕" !important;
+    font-size: 11px !important;
+    line-height: 1 !important;
+    display: block !important;
+}
+
+.winbox.os-window .wb-min:hover {
+    background-color: rgba(246, 173, 85, 0.9) !important;
+    border-color: #f6ad55 !important;
+    color: #000000 !important;
+}
+
+.winbox.os-window .wb-max:hover {
+    background-color: rgba(4, 169, 240, 0.9) !important;
+    border-color: var(--bright-blue) !important;
+    color: #ffffff !important;
+}
+
+.winbox.os-window .wb-close:hover {
+    background-color: rgba(229, 62, 62, 0.95) !important;
+    border-color: #e53e3e !important;
+    color: #ffffff !important;
+}
+
+/* Avatar activity pulse/flash animation */
+@keyframes avatar-pulse-flash {
+    0% {
+        filter: brightness(1);
+        transform: scale(1);
+        box-shadow: 0 0 0 rgba(0, 240, 255, 0);
+    }
+    35% {
+        filter: brightness(1.8) contrast(1.15);
+        transform: scale(1.1);
+        border-color: var(--cyan-neon) !important;
+        box-shadow: 0 0 16px var(--cyan-neon);
+    }
+    100% {
+        filter: brightness(1);
+        transform: scale(1);
+        box-shadow: 0 0 0 rgba(0, 240, 255, 0);
+    }
+}
+
+.avatar-flash {
+    animation: avatar-pulse-flash 0.6s ease-out !important;
+}
+
+/* Body Area */
+.winbox.os-window .wb-body {
+    background: rgba(5, 6, 13, 0.90) !important;
+    color: var(--light-gray) !important;
+    font-family: var(--font-mono) !important;
+    padding: 12px !important;
+    overflow-y: auto !important;
+    user-select: text;
+    box-sizing: border-box !important;
+    height: calc(100% - 30px) !important;
+    backdrop-filter: blur(10px) !important;
+    -webkit-backdrop-filter: blur(10px) !important;
+}
+
+/* Separator */
+.win-xp-separator {
+    border: 0;
+    height: 2px;
+    background: linear-gradient(90deg, transparent, var(--medium-gray), transparent);
+    margin: 14px 0;
+}
+
+/* Common Buttons & Inputs in Windows */
+.os-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    padding: 6px 14px;
+    background: linear-gradient(180deg, var(--medium-purple) 0%, var(--dark-purple) 100%);
+    border: 1px solid var(--bright-blue);
+    border-radius: 4px;
+    color: #ffffff;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    text-decoration: none;
+    transition: all 0.15s ease;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.4);
+}
+
+.os-btn:hover {
+    background: linear-gradient(180deg, var(--bright-blue) 0%, var(--medium-purple) 100%);
+    box-shadow: 0 0 10px rgba(4, 169, 240, 0.5);
+    color: #ffffff;
+}
+
+.os-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+    filter: grayscale(1);
+}
+
+.os-input, .os-textarea, .os-select {
+    width: 100%;
+    background: #0e0d1e;
+    border: 1px solid var(--win-border-subtle);
+    border-radius: 4px;
+    padding: 8px 10px;
+    color: #ffffff;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    outline: none;
+    transition: border-color 0.15s ease;
+}
+
+.os-input:focus, .os-textarea:focus, .os-select:focus {
+    border-color: var(--bright-blue);
+    box-shadow: 0 0 6px rgba(4, 169, 240, 0.4);
+}
+
+/* ========================================================
+   1. STATUS DAS RAVENAS (Disk View)
+   ======================================================== */
+.meu-computador {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.drive-category {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.drive-category-title {
+    font-family: var(--font-display);
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--bright-blue);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.drive-list {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 10px;
+}
+
+.drive-item {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px;
+    background: #110d29;
+    border: 1px solid rgba(4, 169, 240, 0.25);
+    border-radius: 6px;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    user-select: none;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.4);
+}
+
+.drive-item:hover {
+    background: #191438;
+    border-color: var(--bright-blue);
+    transform: translateY(-1px);
+    box-shadow: 0 4px 12px rgba(4, 169, 240, 0.2);
+}
+
+.drive-icon {
+    width: 44px;
+    height: 44px;
+    border-radius: 6px;
+    object-fit: cover;
+    border: 1px solid var(--bright-blue);
+    flex-shrink: 0;
+    background: #090714;
+}
+
+.drive-info {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-width: 0;
+}
+
+.drive-name {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13.5px;
+    font-weight: 600;
+    color: #ffffff;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.status-dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+
+.status-dot.status-green   { background: var(--status-green); box-shadow: 0 0 5px var(--status-green); }
+.status-dot.status-yellow  { background: var(--status-yellow); box-shadow: 0 0 5px var(--status-yellow); }
+.status-dot.status-red     { background: var(--status-red); box-shadow: 0 0 5px var(--status-red); }
+.status-dot.disconnected   { background: var(--status-gray); }
+.status-dot.banned         { background: #990000; box-shadow: 0 0 4px #990000; }
+
+.drive-bar {
+    position: relative;
+    width: 100%;
+    height: 18px;
+    background: #090714;
+    border: 1px solid var(--win-border-subtle);
+    border-radius: 3px;
+    overflow: hidden;
+}
+
+.drive-bar-fill {
+    height: 100%;
+    transition: width 0.4s ease, background 0.4s ease;
+}
+
+.drive-bar-text {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 10.5px;
+    font-weight: 600;
+    color: #ffffff;
+    text-shadow: 1px 1px 2px #000000;
+    pointer-events: none;
+    padding: 0 4px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.drive-item.drive-offline .drive-icon {
+    filter: grayscale(1) opacity(0.5);
+}
+
+.drive-item.drive-offline .drive-bar-fill {
+    background: #2a2a38 !important;
+}
+
+.drive-item.drive-offline .bar-text-offline {
+    color: #ff4d4d;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+}
+
+.drive-wa-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 34px;
+    height: 34px;
+    background: #25d366;
+    color: #ffffff;
+    border-radius: 6px;
+    text-decoration: none;
+    font-size: 16px;
+    flex-shrink: 0;
+    transition: all 0.15s ease;
+    box-shadow: 0 2px 6px rgba(37, 211, 102, 0.3);
+}
+
+.drive-wa-btn:hover {
+    background: #1eb857;
+    transform: scale(1.08);
+    box-shadow: 0 4px 10px rgba(37, 211, 102, 0.5);
+    color: #ffffff;
+}
+
+.drive-wa-btn:active {
+    transform: scale(0.95);
+}
+
+/* ========================================================
+   2. STATUS DETAIL WINDOW
+   ======================================================== */
+.bot-detail-view {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+}
+
+.bot-detail-header {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 12px;
+    background: #110d29;
+    border-radius: 6px;
+    border: 1px solid var(--win-border-subtle);
+}
+
+.bot-detail-avatar {
+    width: 64px;
+    height: 64px;
+    border-radius: 8px;
+    border: 2px solid var(--bright-blue);
+    object-fit: cover;
+}
+
+.bot-detail-title h2 {
+    font-size: 16px;
+    color: #ffffff;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.bot-detail-title p {
+    font-size: 11px;
+    color: var(--light-gray);
+    margin-top: 2px;
+}
+
+.bot-detail-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 8px;
+}
+
+.detail-card {
+    padding: 8px 12px;
+    background: #0e0d1e;
+    border: 1px solid var(--win-border-subtle);
+    border-radius: 4px;
+}
+
+.detail-card-label {
+    font-size: 10px;
+    color: #8888aa;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.detail-card-value {
+    font-size: 13px;
+    color: #ffffff;
+    font-weight: 600;
+    margin-top: 2px;
+}
+
+/* ========================================================
+   3. DOAÇÕES WINDOW (Explorer Details Table)
+   ======================================================== */
+.donations-window {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.donations-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 14px;
+    background: #110d29;
+    border: 1px solid var(--win-border-subtle);
+    border-radius: 6px;
+    flex-wrap: wrap;
+    gap: 10px;
+}
+
+.donations-meta {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--gold-color);
+}
+
+.explorer-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 11px;
+    text-align: left;
+}
+
+.explorer-table th {
+    background: #141030;
+    color: var(--bright-blue);
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--win-border-subtle);
+    font-weight: 600;
+    text-transform: uppercase;
+    font-size: 10px;
+    letter-spacing: 0.5px;
+}
+
+.explorer-table td {
+    padding: 8px 10px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    color: #d0d0e0;
+}
+
+.explorer-table tr.donation-row {
+    cursor: pointer;
+    transition: background 0.12s ease;
+}
+
+.explorer-table tr.donation-row:hover {
+    background: rgba(4, 169, 240, 0.15);
+    color: #ffffff;
+}
+
+.col-rank { width: 35px; text-align: center; }
+.col-icon { width: 30px; text-align: center; }
+.col-value { font-weight: 600; color: var(--gold-color) !important; }
+
+/* Donor detail dialog */
+.donor-entry {
+    padding: 8px 10px;
+    background: #110d29;
+    border: 1px solid var(--win-border-subtle);
+    border-radius: 4px;
+    margin-bottom: 6px;
+}
+
+.donor-entry-header {
+    display: flex;
+    justify-content: space-between;
+    font-size: 11px;
+    color: var(--gold-color);
+    font-weight: 600;
+}
+
+.donor-entry-msg {
+    margin-top: 4px;
+    font-size: 12px;
+    color: #ffffff;
+    background: #090714;
+    padding: 6px 8px;
+    border-radius: 3px;
+    border-left: 2px solid var(--bright-blue);
+    font-style: italic;
+}
+
+/* ========================================================
+   4. ESTATÍSTICAS WINDOW
+   ======================================================== */
+.stats-window {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+.stats-table-wrap {
+    overflow-x: auto;
+    border: 1px solid var(--win-border-subtle);
+    border-radius: 6px;
+    background: #110d29;
+}
+
+.stats-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 11px;
+}
+
+.stats-table th, .stats-table td {
+    padding: 8px 10px;
+    text-align: right;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.stats-table th:first-child, .stats-table td:first-child {
+    text-align: left;
+}
+
+.stats-table th {
+    background: #141030;
+    color: var(--bright-blue);
+    font-size: 10px;
+    text-transform: uppercase;
+}
+
+.stats-charts-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 12px;
+}
+
+.chart-box {
+    background: #110d29;
+    border: 1px solid var(--win-border-subtle);
+    border-radius: 6px;
+    padding: 10px;
+    min-height: 220px;
+    touch-action: pan-y;
+}
+
+.chart-container-inner {
+    width: 100%;
+    min-height: 200px;
+    touch-action: pan-y;
+}
+
+.chart-box-title {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--bright-blue);
+    margin-bottom: 6px;
+}
+
+/* ========================================================
+   5. COMUNIDADE WINDOW
+   ======================================================== */
+.community-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+    gap: 12px;
+    padding: 10px;
+}
+
+.community-card {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+    gap: 8px;
+    padding: 14px 10px;
+    background: #110d29;
+    border: 1px solid var(--win-border-subtle);
+    border-radius: 6px;
+    cursor: pointer;
+    text-decoration: none;
+    color: var(--light-gray);
+    transition: all 0.15s ease;
+}
+
+.community-card:hover {
+    background: #1a143d;
+    border-color: var(--bright-blue);
+    transform: translateY(-2px);
+    color: #ffffff;
+}
+
+.community-card i, .community-card img {
+    font-size: 32px;
+    width: 42px;
+    height: 42px;
+    object-fit: cover;
+    border-radius: 6px;
+    color: var(--bright-blue);
+}
+
+.community-card span {
+    font-size: 11px;
+    font-weight: 600;
+}
+
+/* ========================================================
+   6. AJUDA (Chat LLM)
+   ======================================================== */
+.chat-window {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    gap: 10px;
+}
+
+.chat-messages {
+    flex: 1;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding-right: 4px;
+}
+
+.chat-msg {
+    max-width: 85%;
+    padding: 8px 12px;
+    border-radius: 6px;
+    font-size: 12px;
+    line-height: 1.4;
+    word-break: break-word;
+}
+
+.chat-msg.msg-bot {
+    align-self: flex-start;
+    background: #141030;
+    border: 1px solid var(--win-border-subtle);
+    color: #e0e0ee;
+}
+
+.chat-msg.msg-user {
+    align-self: flex-end;
+    background: rgba(4, 169, 240, 0.25);
+    border: 1px solid var(--bright-blue);
+    color: #ffffff;
+}
+
+.chat-input-area {
+    display: flex;
+    gap: 8px;
+}
+
+/* ========================================================
+   7. IMAGINE / TTS / STT WINDOWS
+   ======================================================== */
+.ai-tool-view {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.ai-preview-box {
+    min-height: 180px;
+    background: #090714;
+    border: 1px dashed var(--win-border-subtle);
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    position: relative;
+}
+
+.ai-preview-box img {
+    max-width: 100%;
+    max-height: 300px;
+    object-fit: contain;
+    border-radius: 4px;
+}
+
+/* ========================================================
+   8. PESCA LENDÁRIA WINDOW
+   ======================================================== */
+.fishing-window {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.fishing-controls {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+}
+
+.fishing-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+    gap: 10px;
+}
+
+.fish-card {
+    background: #110d29;
+    border: 1px solid var(--win-border-subtle);
+    border-radius: 6px;
+    padding: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.fish-card img {
+    width: 100%;
+    height: 120px;
+    object-fit: cover;
+    border-radius: 4px;
+    background: #090714;
+}
+
+.fish-card-name {
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--gold-color);
+}
+
+.fish-card-info {
+    font-size: 10px;
+    color: var(--light-gray);
+}
+
+/* ========================================================
+   9. QUERO UMA! (Invite Window)
+   ======================================================== */
+.invite-page {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+}
+
+.invite-header {
+    background: #110d29;
+    padding: 12px;
+    border-radius: 6px;
+    border: 1px solid var(--win-border-subtle);
+}
+
+.invite-header h2 {
+    font-size: 14px;
+    color: var(--bright-blue);
+    font-family: var(--font-display);
+}
+
+/* Invite Normal Bots Row */
+.invite-bots-container {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    background: #110d29;
+    border: 1px solid var(--win-border-subtle);
+    border-radius: 6px;
+    padding: 12px;
+}
+
+.invite-bots-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 16px;
+    align-items: center;
+    margin-top: 4px;
+}
+
+.invite-bot-avatar-btn {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+    text-decoration: none;
+    cursor: pointer;
+    transition: transform 0.15s ease, filter 0.15s ease;
+}
+
+.invite-bot-avatar-btn:hover {
+    transform: translateY(-3px) scale(1.06);
+}
+
+.invite-bot-avatar-wrap {
+    position: relative;
+    width: 54px;
+    height: 54px;
+    border-radius: 50%;
+    border: 2px solid var(--bright-blue);
+    background: #090714;
+    overflow: visible;
+    box-shadow: 0 4px 10px rgba(0, 0, 0, 0.6);
+    transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.invite-bot-avatar-btn:hover .invite-bot-avatar-wrap {
+    border-color: var(--cyan-neon);
+    box-shadow: 0 0 12px rgba(0, 240, 255, 0.6);
+}
+
+.invite-bot-avatar-wrap img {
+    width: 100%;
+    height: 100%;
+    border-radius: 50%;
+    object-fit: cover;
+    display: block;
+}
+
+.invite-whatsapp-badge {
+    position: absolute;
+    bottom: -1px;
+    right: -1px;
+    width: 18px;
+    height: 18px;
+    background: #25d366;
+    border: 2px solid #110d29;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #ffffff;
+    font-size: 10px;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.8);
+}
+
+.invite-bot-label {
+    font-size: 11.5px;
+    font-weight: 600;
+    color: #ffffff;
+    text-align: center;
+}
+
+.invite-section {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.invite-section h3 {
+    font-size: 12px;
+    color: #ffffff;
+    font-family: var(--font-display);
+}
+
+.invite-cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 8px;
+}
+
+.invite-card {
+    background: #110d29;
+    border: 1px solid var(--win-border-subtle);
+    border-radius: 6px;
+    padding: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 11px;
+}
+
+.invite-card i {
+    font-size: 18px;
+    color: var(--bright-blue);
+}
+
+.invite-avoid-list {
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.invite-avoid-list li {
+    font-size: 11px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.invite-badge {
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-size: 9px;
+    font-weight: 700;
+    text-transform: uppercase;
+}
+
+.badge-never { background: rgba(229, 62, 62, 0.2); color: #ff6b6b; border: 1px solid #e53e3e; }
+.badge-rare  { background: rgba(246, 173, 85, 0.2); color: #f6ad55; border: 1px solid #f6ad55; }
+
+.invite-warning-box {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 12px;
+    background: rgba(229, 62, 62, 0.15);
+    border: 1px solid #e53e3e;
+    border-radius: 6px;
+    color: #ff9999;
+    font-size: 11px;
+}
+
+/* ========================================================
+   10. MENSAGÍMETRO WINDOW
+   ======================================================== */
+.speedometer-view {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    padding: 10px;
+}
+
+#speedometer-canvas {
+    width: 280px;
+    height: 190px;
+}
+
+.speedometer-readout {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+}
+
+.speedometer-val {
+    font-size: 26px;
+    font-weight: 700;
+    color: var(--cyan-neon);
+    font-family: var(--font-display);
+    text-shadow: 0 0 10px rgba(0, 240, 255, 0.6);
+}
+
+.speedometer-lbl {
+    font-size: 11px;
+    color: var(--light-gray);
+}
+
+/* ========================================================
+   11. NUDENET NSFW SCANNER WINDOW
+   ======================================================== */
+.nudenet-tool-view {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.nudenet-dropzone {
+    border: 2px dashed var(--bright-blue);
+    border-radius: 8px;
+    padding: 24px 16px;
+    text-align: center;
+    background: #090714;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    position: relative;
+}
+
+.nudenet-dropzone:hover,
+.nudenet-dropzone.dragover {
+    border-color: var(--cyan-neon);
+    background: #130d2d;
+    box-shadow: 0 0 16px rgba(0, 240, 255, 0.3);
+}
+
+.nudenet-dropzone-icon {
+    font-size: 36px;
+    color: var(--bright-blue);
+    margin-bottom: 4px;
+    transition: transform 0.2s ease;
+}
+
+.nudenet-dropzone:hover .nudenet-dropzone-icon {
+    transform: scale(1.1);
+    color: var(--cyan-neon);
+}
+
+.nudenet-preview-wrapper {
+    background: #090714;
+    border: 1px solid var(--win-border-subtle);
+    border-radius: 8px;
+    padding: 10px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 10px;
+    position: relative;
+}
+
+.nudenet-image-stage {
+    position: relative;
+    display: inline-block;
+    max-width: 100%;
+    border-radius: 6px;
+    overflow: visible;
+}
+
+.nudenet-preview-img {
+    display: block;
+    max-width: 100%;
+    max-height: 380px;
+    width: auto;
+    height: auto;
+    object-fit: contain;
+    border-radius: 6px;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.7);
+}
+
+.nudenet-boxes-overlay {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+    border-radius: 6px;
+    overflow: visible;
+}
+
+.nudenet-box {
+    position: absolute;
+    pointer-events: auto;
+    transition: all 0.15s ease;
+    box-sizing: border-box;
+    cursor: default;
+}
+
+.nudenet-box.nsfw {
+    background-color: rgba(255, 23, 68, 0.28);
+    border: 2px solid #ff1744;
+    box-shadow: 0 0 10px rgba(255, 23, 68, 0.5), inset 0 0 8px rgba(255, 23, 68, 0.25);
+}
+
+.nudenet-box.neutral {
+    background-color: rgba(0, 240, 255, 0.12);
+    border: 1.5px dashed #00f0ff;
+    box-shadow: 0 0 6px rgba(0, 240, 255, 0.3);
+}
+
+.nudenet-box-label {
+    position: absolute;
+    bottom: 100%;
+    left: 0;
+    margin-bottom: 2px;
+    font-size: 10px;
+    font-weight: 700;
+    font-family: var(--font-mono);
+    padding: 2px 6px;
+    border-radius: 3px;
+    white-space: nowrap;
+    pointer-events: none;
+    z-index: 10;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.7);
+    line-height: 1.2;
+}
+
+.nudenet-box.nsfw .nudenet-box-label {
+    background: #ff1744;
+    color: #ffffff;
+}
+
+.nudenet-box.neutral .nudenet-box-label {
+    background: #00d2ff;
+    color: #070614;
+}
+
+.nudenet-box:hover {
+    transform: scale(1.02);
+    z-index: 20;
+}
+
+.nudenet-box.nsfw:hover {
+    background-color: rgba(255, 23, 68, 0.45);
+    box-shadow: 0 0 16px rgba(255, 23, 68, 0.85);
+}
+
+.nudenet-result-card {
+    border-radius: 8px;
+    padding: 12px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    transition: all 0.2s ease;
+}
+
+.nudenet-result-card.danger {
+    background: linear-gradient(135deg, rgba(50, 10, 24, 0.9) 0%, rgba(20, 6, 12, 0.95) 100%);
+    border: 2px solid #ff1744;
+    box-shadow: 0 0 18px rgba(255, 23, 68, 0.3);
+}
+
+.nudenet-result-card.safe {
+    background: linear-gradient(135deg, rgba(8, 38, 20, 0.9) 0%, rgba(6, 20, 12, 0.95) 100%);
+    border: 2px solid #00e676;
+    box-shadow: 0 0 18px rgba(0, 230, 118, 0.25);
+}
+
+.nudenet-result-card.warning {
+    background: linear-gradient(135deg, rgba(45, 30, 10, 0.9) 0%, rgba(25, 18, 8, 0.95) 100%);
+    border: 2px solid #ffb300;
+    box-shadow: 0 0 18px rgba(255, 179, 0, 0.25);
+}
+
+.nudenet-result-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.nudenet-status-title {
+    font-size: 13px;
+    font-weight: 800;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-family: var(--font-mono);
+}
+
+.nudenet-result-card.danger .nudenet-status-title {
+    color: #ff3366;
+    text-shadow: 0 0 10px rgba(255, 51, 102, 0.6);
+}
+
+.nudenet-result-card.safe .nudenet-status-title {
+    color: #00e676;
+    text-shadow: 0 0 10px rgba(0, 230, 118, 0.6);
+}
+
+.nudenet-chips-container {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 4px;
+}
+
+.nudenet-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 3px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-family: var(--font-mono);
+    font-weight: 600;
+    line-height: 1.3;
+}
+
+.nudenet-chip.nsfw {
+    background: rgba(255, 23, 68, 0.2);
+    border: 1px solid #ff1744;
+    color: #ff6b8b;
+}
+
+.nudenet-chip.neutral {
+    background: rgba(0, 240, 255, 0.1);
+    border: 1px solid rgba(0, 240, 255, 0.4);
+    color: #00f0ff;
+}
+
+.nudenet-certainty-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 10px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-family: var(--font-mono);
+    font-weight: 600;
+}
+
+.nudenet-certainty-badge.nsfw {
+    background: rgba(255, 23, 68, 0.25);
+    border: 1px solid #ff1744;
+    color: #ff6b8b;
+}
+
+.nudenet-certainty-badge.safe {
+    background: rgba(0, 230, 118, 0.2);
+    border: 1px solid #00e676;
+    color: #00e676;
+}
+
+/* ========================================================
+   12. WAIFULETES (Novo Site Redirect Notice)
+   ======================================================== */
+.waifu-redirect-container {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    padding: 24px 20px;
+    height: 100%;
+    box-sizing: border-box;
+    gap: 18px;
+    background: radial-gradient(circle at 50% 25%, rgba(168, 85, 247, 0.15) 0%, rgba(17, 13, 41, 0.95) 75%, #0d0922 100%);
+    border-radius: 6px;
+    overflow-y: auto;
+}
+
+.waifu-redirect-header {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+}
+
+.waifu-redirect-title {
+    font-size: 17px;
+    font-weight: 700;
+    color: #ffffff;
+    font-family: var(--font-display);
+    text-shadow: 0 0 14px rgba(255, 46, 147, 0.6);
+    margin: 0;
+}
+
+.waifu-redirect-card {
+    background: rgba(21, 20, 40, 0.85);
+    border: 1px solid rgba(168, 85, 247, 0.35);
+    border-radius: 8px;
+    padding: 16px 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    max-width: 480px;
+    width: 100%;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.45);
+}
+
+.waifu-redirect-text {
+    font-size: 12.5px;
+    line-height: 1.6;
+    color: var(--light-gray);
+    margin: 0;
+}
+
+.waifu-command-tag {
+    background: #090714;
+    border: 1px solid rgba(0, 240, 255, 0.45);
+    color: var(--cyan-neon);
+    padding: 2px 7px;
+    border-radius: 4px;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    display: inline-block;
+}
+
+.waifu-command-tag:hover {
+    background: rgba(0, 240, 255, 0.15);
+    border-color: var(--cyan-neon);
+    box-shadow: 0 0 8px rgba(0, 240, 255, 0.45);
+    transform: translateY(-1px);
+}
+
+.waifu-command-tag.copied {
+    background: rgba(40, 167, 69, 0.25);
+    border-color: var(--status-green);
+    color: #4ade80;
+}
+
+.waifu-redirect-cta-section {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 10px;
+    margin-top: 4px;
+}
+
+.waifu-redirect-cta-label {
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--light-gray);
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+}
+
+.waifu-redirect-links {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 10px;
+}
+
+.waifu-redirect-icon-link {
+    display: inline-block;
+    transition: transform 0.25s ease, filter 0.25s ease;
+    cursor: pointer;
+    text-decoration: none;
+}
+
+.waifu-redirect-icon-link:hover {
+    transform: scale(1.08);
+    filter: drop-shadow(0 0 14px rgba(255, 46, 147, 0.75));
+}
+
+.waifu-redirect-icon {
+    width: 60px;
+    height: 60px;
+    display: block;
+}
+
+.waifu-redirect-url-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    background: linear-gradient(135deg, #2d0b5a, #4a127a);
+    border: 1px solid rgba(255, 46, 147, 0.6);
+    color: #ffffff;
+    font-size: 13px;
+    font-weight: 600;
+    text-decoration: none;
+    padding: 8px 18px;
+    border-radius: 6px;
+    transition: all 0.25s ease;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35);
+}
+
+.waifu-redirect-url-link:hover {
+    background: linear-gradient(135deg, #3d0f7a, #6917a8);
+    border-color: #ff2e93;
+    color: #ff8ac7;
+    box-shadow: 0 0 15px rgba(255, 46, 147, 0.5);
+    transform: translateY(-2px);
+}
+
+.waifu-window-container {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    gap: 8px;
+    position: relative;
+}
+
+.waifu-toolbar {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    background: #110d29;
+    border: 1px solid var(--win-border-subtle);
+    border-radius: 6px;
+    padding: 8px 10px;
+    flex-shrink: 0;
+}
+
+.waifu-search-group {
+    position: relative;
+    display: flex;
+    align-items: center;
+    width: 100%;
+}
+
+.waifu-search-icon {
+    position: absolute;
+    left: 10px;
+    color: #71728c;
+    font-size: 11px;
+    pointer-events: none;
+}
+
+.waifu-search-input {
+    width: 100%;
+    background: #090714;
+    border: 1px solid #2d2b45;
+    border-radius: 4px;
+    color: #ffffff;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    padding: 6px 30px 6px 30px;
+    outline: none;
+    transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.waifu-search-input:focus {
+    border-color: var(--cyan-neon);
+    box-shadow: 0 0 8px rgba(0, 240, 255, 0.3);
+}
+
+.waifu-clear-btn {
+    position: absolute;
+    right: 8px;
+    background: none;
+    border: none;
+    color: #8888a0;
+    cursor: pointer;
+    font-size: 11px;
+    padding: 2px 4px;
+}
+
+.waifu-clear-btn:hover {
+    color: #ffffff;
+}
+
+.waifu-filters-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    align-items: center;
+}
+
+.waifu-filter-group {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.waifu-filter-label {
+    font-size: 10px;
+    color: var(--light-gray);
+    font-weight: 600;
+}
+
+.waifu-pill-group {
+    display: flex;
+    gap: 4px;
+}
+
+.waifu-pill {
+    background: #0d0a1f;
+    border: 1px solid #2d2b45;
+    border-radius: 12px;
+    color: #b7b7c5;
+    font-size: 10px;
+    padding: 2px 8px;
+    cursor: pointer;
+    font-family: var(--font-mono);
+    transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+
+.waifu-pill:hover {
+    border-color: var(--bright-blue);
+    color: #ffffff;
+}
+
+.waifu-pill.active {
+    background: #37118f;
+    border-color: var(--cyan-neon);
+    color: #ffffff;
+    font-weight: 600;
+    box-shadow: 0 0 6px rgba(0, 240, 255, 0.3);
+}
+
+.waifu-select {
+    background: #0d0a1f;
+    border: 1px solid #2d2b45;
+    border-radius: 4px;
+    color: #ffffff;
+    font-size: 10px;
+    font-family: var(--font-mono);
+    padding: 2px 6px;
+    outline: none;
+    cursor: pointer;
+}
+
+.waifu-select:focus {
+    border-color: var(--cyan-neon);
+}
+
+.waifu-grid-wrapper {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding-right: 4px;
+}
+
+.waifu-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+    gap: 10px;
+    align-content: start;
+}
+
+.waifu-card {
+    background: #110d29;
+    border: 1px solid var(--win-border-subtle);
+    border-radius: 6px;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    position: relative;
+    transition: transform 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.waifu-card:hover {
+    transform: translateY(-2px);
+    border-color: var(--cyan-neon);
+    box-shadow: 0 4px 15px rgba(0, 240, 255, 0.2);
+}
+
+.waifu-card.rarity-legendary {
+    border-color: rgba(255, 215, 0, 0.4);
+}
+.waifu-card.rarity-epic {
+    border-color: rgba(168, 85, 247, 0.4);
+}
+
+.waifu-img-wrap {
+    position: relative;
+    width: 100%;
+    height: 135px;
+    background: #090714;
+    overflow: hidden;
+}
+
+.waifu-img-wrap img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+    transition: transform 0.2s ease;
+}
+
+.waifu-card:hover .waifu-img-wrap img {
+    transform: scale(1.05);
+}
+
+.waifu-fav-btn {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    background: rgba(9, 7, 20, 0.75);
+    border: 1px solid rgba(255, 215, 0, 0.5);
+    color: var(--gold-color);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    font-size: 13px;
+    backdrop-filter: blur(4px);
+    -webkit-backdrop-filter: blur(4px);
+    transition: transform 0.15s ease, background 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
+    z-index: 2;
+}
+
+.waifu-fav-btn:hover {
+    background: #ffd700;
+    color: #11052c;
+    transform: scale(1.15);
+    box-shadow: 0 0 10px rgba(255, 215, 0, 0.6);
+}
+
+.waifu-fav-btn.active {
+    background: #ffd700;
+    color: #11052c;
+    transform: scale(1.2);
+    box-shadow: 0 0 12px rgba(255, 215, 0, 0.8);
+}
+
+.waifu-rarity-badge {
+    position: absolute;
+    bottom: 4px;
+    left: 4px;
+    font-size: 11px;
+    background: rgba(9, 7, 20, 0.8);
+    border: 1px solid;
+    border-radius: 4px;
+    padding: 1px 4px;
+    backdrop-filter: blur(3px);
+    z-index: 1;
+}
+
+.waifu-married-badge {
+    position: absolute;
+    top: 6px;
+    left: 6px;
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    background: rgba(17, 13, 41, 0.88);
+    border: 1px solid rgba(255, 182, 193, 0.6);
+    color: #ffffff;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    font-size: 13px;
+    backdrop-filter: blur(4px);
+    -webkit-backdrop-filter: blur(4px);
+    transition: transform 0.15s ease, background 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
+    z-index: 2;
+    padding: 0;
+    line-height: 1;
+}
+
+.waifu-married-badge:hover {
+    transform: scale(1.15);
+    border-color: #ff69b4;
+    box-shadow: 0 0 12px rgba(255, 105, 180, 0.65);
+    background: rgba(36, 18, 64, 0.95);
+}
+
+.waifu-married-badge:active {
+    transform: scale(0.95);
+}
+
+.waifu-wishes-badge {
+    position: absolute;
+    bottom: 4px;
+    right: 4px;
+    font-size: 10px;
+    font-weight: 700;
+    color: var(--cyan-neon);
+    background: rgba(9, 7, 20, 0.85);
+    border: 1px solid rgba(0, 240, 255, 0.4);
+    border-radius: 4px;
+    padding: 1px 5px;
+    display: flex;
+    align-items: center;
+    gap: 3px;
+    backdrop-filter: blur(3px);
+    -webkit-backdrop-filter: blur(3px);
+    z-index: 1;
+    cursor: pointer;
+    transition: transform 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.waifu-wishes-badge:hover {
+    transform: scale(1.08);
+    border-color: var(--cyan-neon);
+    box-shadow: 0 0 8px rgba(0, 240, 255, 0.5);
+    color: #ffffff;
+}
+
+.waifu-wishes-badge .waifu-wishes-icon {
+    font-size: 10px;
+    line-height: 1;
+}
+
+.waifu-wishes-badge .waifu-wishes-count {
+    font-family: var(--font-mono);
+    line-height: 1;
+}
+
+.waifu-card-info {
+    padding: 6px 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.waifu-card-name {
+    font-size: 11px;
+    font-weight: 700;
+    color: #ffffff;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.waifu-card-series {
+    font-size: 9px;
+    color: var(--light-gray);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.waifu-pagination-bar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+    flex-shrink: 0;
+    padding: 6px 10px;
+    background: #110d29;
+    border: 1px solid var(--win-border-subtle);
+    border-radius: 6px;
+    font-size: 10px;
+}
+
+.waifu-page-info {
+    color: var(--light-gray);
+}
+
+.waifu-page-buttons {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.waifu-nav-btn {
+    font-size: 10px;
+    padding: 3px 8px;
+}
+
+.waifu-page-indicator {
+    font-weight: 700;
+    color: var(--cyan-neon);
+    padding: 0 4px;
+}
+
+.waifu-toast {
+    position: absolute;
+    bottom: 50px;
+    left: 50%;
+    transform: translateX(-50%) translateY(10px);
+    background: rgba(24, 10, 52, 0.95);
+    border: 1px solid var(--cyan-neon);
+    border-radius: 20px;
+    padding: 8px 16px;
+    color: #ffffff;
+    font-size: 11.5px;
+    font-weight: 600;
+    white-space: normal;
+    text-align: center;
+    max-width: 90%;
+    font-family: var(--font-mono);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    box-shadow: 0 4px 20px rgba(0, 240, 255, 0.4);
+    z-index: 100;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.25s ease, transform 0.25s ease;
+}
+
+.waifu-toast-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+}
+
+.waifu-toast.visible {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+}
+
+.waifu-loading,
+.waifu-empty {
+    text-align: center;
+    padding: 40px 20px;
+    color: #8888a0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 10px;
+    grid-column: 1 / -1;
+}
+
+.waifu-loading i {
+    font-size: 24px;
+    color: var(--bright-blue);
+}
+
+/* ========================================================
+   COMMANDS WINDOW & EMBEDDED IFRAME
+   ======================================================== */
+.winbox.window-commands .wb-body,
+.wb-body.commands-body {
+    padding: 0 !important;
+    overflow: hidden !important;
+    background: #05060d !important;
+}
+
+.commands-iframe {
+    width: 100%;
+    height: 100%;
+    border: none;
+    display: block;
+    background: #05060d;
+}
+
+

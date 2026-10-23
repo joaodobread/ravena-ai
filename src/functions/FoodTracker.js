@@ -548,7 +548,7 @@ const commands = [
 	new Command({
 		name: "comida",
 		description: "Envie foto de comida para registrar os ingredientes e calorias.",
-		category: "saude",
+		category: "utilidades",
 		cooldown: 10,
 		method: comidaCommand,
 		needsMedia: true,
@@ -562,7 +562,7 @@ const commands = [
 	new Command({
 		name: "comida-info",
 		description: "Mostra estatísticas da sua alimentação.",
-		category: "saude",
+		category: "utilidades",
 		cooldown: 5,
 		method: comidaInfoCommand,
 		reactions: {
@@ -572,7 +572,7 @@ const commands = [
 	new Command({
 		name: "comida-lista",
 		description: "Lista seu histórico de alimentação.",
-		category: "saude",
+		category: "utilidades",
 		cooldown: 5,
 		method: comidaListaCommand,
 		reactions: {
@@ -581,4 +581,34 @@ const commands = [
 	})
 ];
 
-module.exports = { commands };
+const helper = {
+	about: "Registro e acompanhamento diário de refeições e hábitos alimentares do grupo",
+	implementation:
+		"Armazena logs diários de alimentação por usuário em SQLite, gera resumos e calcula estatísticas de consumo",
+	tags: "comida,alimentacao,dieta,saude,refeicao,tracker,calorias",
+	cmds: [
+		{
+			cmd: "!comida",
+			desc: "Registra o que você acabou de comer ou beber",
+			usage: ["!comida Almoço: arroz, feijão e frango", "!comida Maçã e suco de laranja"],
+			category: "utilidades"
+		},
+		{
+			cmd: "!comida-lista",
+			desc: "Lista todas as refeições registradas pelos membros do grupo hoje",
+			usage: ["!comida-lista"],
+			category: "utilidades"
+		},
+		{
+			cmd: "!comida-info",
+			desc: "Exibe seu resumo e estatísticas alimentares",
+			usage: ["!comida-info"],
+			category: "utilidades"
+		}
+	]
+};
+
+module.exports = {
+	helper,
+	commands
+};

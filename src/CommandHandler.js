@@ -10,6 +10,8 @@ const ReturnMessage = require("./models/ReturnMessage");
 const AdminUtils = require("./utils/AdminUtils");
 const CacheManager = require("./services/CacheManager");
 const CmdUsage = require("./utils/CmdUsage");
+const ProfilePictureHelper = require("./utils/ProfilePictureHelper");
+const PhoneUtils = require("./utils/PhoneUtils");
 
 class CommandHandler {
 	constructor() {
@@ -66,6 +68,19 @@ class CommandHandler {
 				}
 			}
 		}, this.debounceDecayTime);
+
+		// Limpeza periódica do cache de mensagens de cooldown para evitar vazamento de memória
+		this.cooldownMsgCleanupInterval = setInterval(
+			() => {
+				const cutoff = Date.now() - 5 * 60 * 1000;
+				for (const key of Object.keys(this.cooldownMessages)) {
+					if (this.cooldownMessages[key] < cutoff) {
+						delete this.cooldownMessages[key];
+					}
+				}
+			},
+			5 * 60 * 1000
+		);
 
 		// Inicializa cache de comandos
 		this.loadAllCommands();
@@ -479,6 +494,17 @@ class CommandHandler {
 	 */
 	async handleCommand(bot, message, commandText, group) {
 		try {
+			// Ignora comandos se a mensagem vier do grupo de dossiês
+			if (
+				message.group &&
+				bot &&
+				typeof bot.isDossieGroup === "function" &&
+				bot.isDossieGroup(message.group)
+			) {
+				this.logger.debug(`[${bot.id}] Ignorando comando em grupo de dossiês: ${message.group}`);
+				return null;
+			}
+
 			const userId = message.author || message.authorAlt || message.from;
 			if (userId) {
 				// Ignorar prevenção de spam para super admins/dono do bot
@@ -655,13 +681,32 @@ class CommandHandler {
 
 			// Verifica se é gerenciamento de grupo via PV
 			if (!message.group) {
+				const cleanAuthor = PhoneUtils.cleanPhone(message.author);
+
+				const findTargetGroup = (allGroups, query) => {
+					if (!query || !Array.isArray(allGroups)) return null;
+					const q = query.trim().toLowerCase();
+					// 1. Match exato por JID/ID
+					const byId = allGroups.find((g) => (g.id || "").toLowerCase() === q);
+					if (byId) return byId;
+					// 2. Match exato por nome
+					const byName = allGroups.find((g) => (g.name || "").trim().toLowerCase() === q);
+					if (byName) return byName;
+					// 3. Match parcial por nome
+					if (q.length >= 3) {
+						const byPartial = allGroups.find((g) => (g.name || "").toLowerCase().includes(q));
+						if (byPartial) return byPartial;
+					}
+					return null;
+				};
+
 				// Se veio no PV, primeiro vê se não é g-manage
 				if (command === "g-manage") {
-					if (args.length > 0) {
+					const groupSearchQuery = args.join(" ").trim();
+					if (groupSearchQuery.length > 0) {
 						// Tem argumento, está tentando definir um grupo no PV
-						const groupName = args[0].trim().toLowerCase();
 						const groups = await this.database.getGroups();
-						const targetGroup = groups.find((g) => g.name.trim().toLowerCase() === groupName);
+						const targetGroup = findTargetGroup(groups, groupSearchQuery);
 
 						if (targetGroup) {
 							const isUserAdminInTarget = await this.adminUtils.isAdmin(
@@ -672,13 +717,14 @@ class CommandHandler {
 							);
 							if (isUserAdminInTarget) {
 								this.privateManagement[message.author] = targetGroup.id;
+								if (cleanAuthor) this.privateManagement[cleanAuthor] = targetGroup.id;
 								this.logger.info(
 									`Usuário ${message.author} agora está gerenciando o grupo: ${targetGroup.name} (${targetGroup.id})`
 								);
 
 								const returnMessage = new ReturnMessage({
 									chatId: message.author,
-									content: `Você agora está gerenciando o grupo: ${targetGroup.name}`,
+									content: `Você agora está gerenciando o grupo: *${targetGroup.name}*`,
 									reaction: this.defaultReactions.after
 								});
 								if (!silent) await bot.sendReturnMessages(returnMessage, group);
@@ -694,11 +740,11 @@ class CommandHandler {
 								return returnMessage;
 							}
 						} else {
-							this.logger.warn(`Grupo não encontrado: ${groupName}`);
+							this.logger.warn(`Grupo não encontrado: ${groupSearchQuery}`);
 
 							const returnMessage = new ReturnMessage({
 								chatId: message.author,
-								content: `Grupo não encontrado: ${groupName}`,
+								content: `Grupo não encontrado: ${groupSearchQuery}`,
 								reaction: this.defaultReactions.after
 							});
 							if (!silent) await bot.sendReturnMessages(returnMessage, group);
@@ -706,62 +752,142 @@ class CommandHandler {
 							return returnMessage;
 						}
 					} else {
-						// No PV e sem argumentos = quer voltar ao normal
-						this.privateManagement[message.author] = undefined;
-						const returnMessage = new ReturnMessage({
-							chatId: message.author,
-							content: `Você agora não está mais gerenciando o grupo pelo pv.`,
-							reaction: this.defaultReactions.after
-						});
-						if (!silent) await bot.sendReturnMessages(returnMessage, group);
-						return returnMessage;
-					}
-				} else if (command === "g-painel" && args.length > 0) {
-					// Permite !g-painel nomegrupo diretamente no PV
-					const groupName = args[0].trim().toLowerCase();
-					const groups = await this.database.getGroups();
-					const targetGroup = groups.find((g) => g.name.trim().toLowerCase() === groupName);
+						// No PV e sem argumentos = quer voltar ao normal se estiver gerenciando
+						const activeId =
+							this.privateManagement[message.author] ||
+							(cleanAuthor && this.privateManagement[cleanAuthor]);
 
-					if (targetGroup) {
-						const isUserAdminInTarget = await this.adminUtils.isAdmin(
-							message.author,
-							targetGroup,
-							false,
-							bot
-						);
-						if (isUserAdminInTarget) {
-							this.privateManagement[message.author] = targetGroup.id;
-							this.logger.info(
-								`Usuário ${message.author} agora está gerenciando o grupo (via g-painel): ${targetGroup.name} (${targetGroup.id})`
-							);
-							group = targetGroup;
-							replyToChat = message.author;
-							isManagingFromPrivate = true;
+						if (activeId) {
+							this.privateManagement[message.author] = undefined;
+							if (cleanAuthor) this.privateManagement[cleanAuthor] = undefined;
+							const returnMessage = new ReturnMessage({
+								chatId: message.author,
+								content: `Você agora não está mais gerenciando o grupo pelo pv.`,
+								reaction: this.defaultReactions.after
+							});
+							if (!silent) await bot.sendReturnMessages(returnMessage, group);
+							return returnMessage;
 						} else {
 							const returnMessage = new ReturnMessage({
 								chatId: message.author,
-								content: `Você *NÃO É* administrador do grupo '${targetGroup.name}'.`,
-								reaction: "🙅‍♂️"
+								content: `Para gerenciar um grupo a partir do chat privado, envie:\n\`!g-manage [nomeDoGrupo]\`\n\n(Ou use o comando diretamente dentro do seu grupo).`,
+								reaction: this.defaultReactions.after
 							});
 							if (!silent) await bot.sendReturnMessages(returnMessage, group);
 							return returnMessage;
 						}
-					} else {
-						this.logger.warn(`Grupo não encontrado: ${groupName}`);
+					}
+				} else if (command === "g-painel") {
+					const groupSearchQuery = args.join(" ").trim();
+					const activeId =
+						this.privateManagement[message.author] ||
+						(cleanAuthor && this.privateManagement[cleanAuthor]);
 
-						const returnMessage = new ReturnMessage({
-							chatId: message.author,
-							content: `Grupo não encontrado: ${groupName}`,
-							reaction: this.defaultReactions.after
+					if (groupSearchQuery.length > 0) {
+						// Permite !g-painel nomegrupo diretamente no PV
+						const groups = await this.database.getGroups();
+						const targetGroup = findTargetGroup(groups, groupSearchQuery);
+
+						if (targetGroup) {
+							const isUserAdminInTarget = await this.adminUtils.isAdmin(
+								message.author,
+								targetGroup,
+								false,
+								bot
+							);
+							if (isUserAdminInTarget) {
+								this.privateManagement[message.author] = targetGroup.id;
+								if (cleanAuthor) this.privateManagement[cleanAuthor] = targetGroup.id;
+								this.logger.info(
+									`Usuário ${message.author} agora está gerenciando o grupo (via g-painel): ${targetGroup.name} (${targetGroup.id})`
+								);
+								group = targetGroup;
+								replyToChat = message.author;
+								isManagingFromPrivate = true;
+							} else {
+								const returnMessage = new ReturnMessage({
+									chatId: message.author,
+									content: `Você *NÃO É* administrador do grupo '${targetGroup.name}'.`,
+									reaction: "🙅‍♂️"
+								});
+								if (!silent) await bot.sendReturnMessages(returnMessage, group);
+								return returnMessage;
+							}
+						} else {
+							this.logger.warn(`Grupo não encontrado: ${groupSearchQuery}`);
+
+							const returnMessage = new ReturnMessage({
+								chatId: message.author,
+								content: `Grupo não encontrado: ${groupSearchQuery}`,
+								reaction: this.defaultReactions.after
+							});
+							if (!silent) await bot.sendReturnMessages(returnMessage, group);
+							return returnMessage;
+						}
+					} else if (activeId) {
+						// Já está gerenciando um grupo no PV
+						const managedGroup = await this.database.getGroup(activeId);
+						if (managedGroup) {
+							group = managedGroup;
+							replyToChat = message.author;
+							isManagingFromPrivate = true;
+						}
+					} else {
+						// Sem argumentos no PV e sem grupo ativo: verifica se há grupo administrado pelo autor
+						const groups = await this.database.getGroups();
+						const userGroups = groups.filter((g) => {
+							if (
+								g.addedBy &&
+								(g.addedBy === message.author || PhoneUtils.isSamePhone(g.addedBy, message.author))
+							)
+								return true;
+							if (
+								Array.isArray(g.additionalAdmins) &&
+								g.additionalAdmins.some(
+									(a) => a === message.author || PhoneUtils.isSamePhone(a, message.author)
+								)
+							)
+								return true;
+							return false;
 						});
-						if (!silent) await bot.sendReturnMessages(returnMessage, group);
-						return returnMessage;
+
+						if (userGroups.length === 1) {
+							// Exatamente 1 grupo: seleciona automaticamente
+							const targetGroup = userGroups[0];
+							this.privateManagement[message.author] = targetGroup.id;
+							if (cleanAuthor) this.privateManagement[cleanAuthor] = targetGroup.id;
+							group = targetGroup;
+							replyToChat = message.author;
+							isManagingFromPrivate = true;
+						} else if (userGroups.length > 1) {
+							const lista = userGroups
+								.slice(0, 15)
+								.map((g, i) => `${i + 1}. *${g.name}*`)
+								.join("\n");
+							const returnMessage = new ReturnMessage({
+								chatId: message.author,
+								content: `📋 Você administra os seguintes grupos:\n\n${lista}\n\nPara acessar o painel de um grupo, envie:\n\`!g-painel [nome do grupo]\``,
+								reaction: this.defaultReactions.after
+							});
+							if (!silent) await bot.sendReturnMessages(returnMessage, group);
+							return returnMessage;
+						} else {
+							const returnMessage = new ReturnMessage({
+								chatId: message.author,
+								content: `Para acessar o painel web a partir do chat privado, envie o comando com o nome do grupo:\n👉 Exemplo: \`!g-painel [nome do grupo]\`\n\n(Ou envie \`!g-painel\` diretamente dentro do seu grupo).`,
+								reaction: this.defaultReactions.after
+							});
+							if (!silent) await bot.sendReturnMessages(returnMessage, group);
+							return returnMessage;
+						}
 					}
 				} else {
-					// Não é g-manage ou g-painel com argumentos, então verifica se o cara já está gerenciando um pelo PV
+					// Não é g-manage ou g-painel, então verifica se o autor já está gerenciando um pelo PV
+					const managedGroupId =
+						this.privateManagement[message.author] ||
+						(cleanAuthor && this.privateManagement[cleanAuthor]);
 
-					if (this.privateManagement[message.author]) {
-						const managedGroupId = this.privateManagement[message.author];
+					if (managedGroupId) {
 						const managedGroup = await this.database.getGroup(managedGroupId);
 
 						if (managedGroup) {
@@ -792,7 +918,7 @@ class CommandHandler {
 
 			// Verifica se o grupo está pausado e se o comando NÃO é g-pausar
 			// No privado não existe !pausar
-			if (group && group.paused && (command !== "g-pausar") & !isManagingFromPrivate) {
+			if (group && group.paused && command !== "g-pausar" && !isManagingFromPrivate) {
 				this.logger.info(`Ignorando comando de gerenciamento em grupo pausado: ${command}`);
 				return null;
 			}
@@ -856,12 +982,22 @@ class CommandHandler {
 		}
 
 		// Nenhum comando encontrado
-		this.logger.debug(
-			`[${gidDebug}][${message.author}/${message.authorName}] Comando desconhecido: '${command}' '${args.join(" ")}'`
-		);
+		// Se o grupo não tem prefixo (vazio), qualquer conversa normal chegaria aqui, então não polui o debug
+		const hasPrefix = group ? group.prefix && group.prefix !== "" : true;
+		if (hasPrefix) {
+			this.logger.debug(
+				`[${gidDebug}][${message.author}/${message.authorName}] Comando desconhecido: '${command}' '${args.join(" ")}'`
+			);
+		}
 
 		// Se em um grupo, podemos querer notificar sobre comando desconhecido (opcional)
-		if (group && process.env.NOTIFY_UNKNOWN_COMMANDS === "true" && !silent) {
+		if (
+			group &&
+			group.prefix &&
+			group.prefix !== "" &&
+			process.env.NOTIFY_UNKNOWN_COMMANDS === "true" &&
+			!silent
+		) {
 			const returnMessage = new ReturnMessage({
 				chatId: replyToChat, // Usa o chatId de resposta correto
 				content: `Comando desconhecido: ${command}`
@@ -1111,18 +1247,65 @@ class CommandHandler {
 
 				// Verifica a mensagem citada para mídia se a mensagem direta não tiver
 				let hasQuotedMedia = false;
+				let actualQuotedHasMedia = false;
 				if (!hasDirectMedia) {
 					// Se há referência a uma mensagem citada (mesmo que o cache tenha expirado),
 					// passa o comando adiante para que ele possa retornar a mensagem de erro adequada
 					if (message.hasQuotedMsg) {
 						hasQuotedMedia = true; // deixa o comando tratar o caso de cache expirado
+						const quotedMsg = await message.origin.getQuotedMessage().catch(() => null);
+						actualQuotedHasMedia = !!(
+							quotedMsg &&
+							(quotedMsg.hasMedia ||
+								(quotedMsg.type && quotedMsg.type !== "text" && quotedMsg.type !== "chat"))
+						);
 					} else {
 						const quotedMsg = await message.origin.getQuotedMessage().catch(() => null);
-						hasQuotedMedia = quotedMsg && quotedMsg.hasMedia;
+						hasQuotedMedia = !!(quotedMsg && quotedMsg.hasMedia);
+						actualQuotedHasMedia = hasQuotedMedia;
 					}
 				}
 
-				if (!hasDirectMedia && !hasQuotedMedia) {
+				// Se não há mídia direta nem mídia na mensagem citada, tenta usar foto de perfil de menção
+				if (!hasDirectMedia && !actualQuotedHasMedia) {
+					const isAudioOnly = ["stt", "transcrever"].includes(command.name);
+					const isMediaCategory = command.category === "midia";
+
+					if (isMediaCategory && !isAudioOnly) {
+						const botJids = [bot.id, bot.phoneNumber, bot.client?.info?.wid?._serialized].filter(
+							Boolean
+						);
+
+						const mentions = ProfilePictureHelper.extractMentions(message, botJids);
+
+						if (mentions.length > 0) {
+							const profileMedia = await ProfilePictureHelper.fetchFirstValidProfilePicture(
+								bot,
+								mentions
+							);
+
+							if (profileMedia && profileMedia.data) {
+								this.logger.debug(
+									`[CommandHandler] Usando foto de perfil de usuário mencionado como entrada para ${command.name}`
+								);
+								message.type = "image";
+								message.content = profileMedia;
+								message.downloadMedia = async () => profileMedia;
+								if (message.origin) {
+									message.origin.type = "image";
+									message.origin.hasMedia = true;
+									message.origin.downloadMedia = async () => profileMedia;
+								}
+							} else {
+								// Tinha menção, mas não conseguiu pegar foto (privada/inexistente).
+								// Permite que o comando responda com a mensagem de feedback/dica
+								hasQuotedMedia = true;
+							}
+						}
+					}
+				}
+
+				if (!hasDirectMedia && !hasQuotedMedia && message.type === "text") {
 					this.logger.debug(`Comando ${command.name} requer mídia, mas nenhuma foi fornecida`);
 					return null; // Ignora o comando silenciosamente
 				}
@@ -1220,15 +1403,26 @@ class CommandHandler {
 						// Adiciona reação "depois" nas mensagens se não estiver definida
 
 						const messages = Array.isArray(result) ? result : [result];
-						const requesterId = message.authorAlt || message.author;
+						const requesterId =
+							message.originReaction?.senderId || message.authorAlt || message.author;
 
 						messages.forEach((msg) => {
 							if (!msg.reactions && command.reactions?.after) {
 								msg.reaction = command.reactions?.after;
 							}
 
-							// Auto-mention do usuário que pediu o comando (apenas em grupos)
-							if (requesterId && msg instanceof ReturnMessage && message.group) {
+							if (command.reply === false && msg.options) {
+								delete msg.options.quotedMessageId;
+								delete msg.options.goReply;
+							}
+
+							// Auto-mention do usuário que pediu o comando (apenas em grupos e no mesmo grupo da mensagem de origem)
+							if (
+								requesterId &&
+								msg instanceof ReturnMessage &&
+								message.group &&
+								msg.chatId === message.group
+							) {
 								if (!msg.options) msg.options = {};
 								if (!msg.options.mentions) msg.options.mentions = [];
 								if (!msg.options.mentions.includes(requesterId)) {
@@ -1592,15 +1786,15 @@ class CommandHandler {
 	}
 
 	processCustomIgnoresPrefix(textContent, bot, message, group) {
-		const command = `${textContent}`;
+		const [command, ...args] = `${textContent}`.trim().split(/\s+/);
 
 		//this.logger.debug(`[processCustomIgnoresPrefix][${group.name}] Buscando comando '${command}'`);
-		const matchResult = this.findCustomCommand(command, this.customCommands[group.id]);
+		const matchResult = this.findCustomCommand(command, this.customCommands[group.id], args);
 
 		if (matchResult) {
 			const { customCommand, newArgs } = matchResult;
-			this.logger.debug(`[processCustomIgnoresPrefix] `, customCommand);
-			this.executeCustomCommand(bot, message, customCommand, newArgs, group);
+			// this.logger.debug(`[processCustomIgnoresPrefix] `, customCommand);
+			return this.executeCustomCommand(bot, message, customCommand, newArgs, group);
 		}
 	}
 
@@ -1616,18 +1810,19 @@ class CommandHandler {
 	async processCustomCommandResponse(bot, message, responseText, command, group, args) {
 		try {
 			this.logger.debug(
-				`Processando resposta para comando ${command.startsWith}: ${responseText.substring(0, 50)}${responseText.length > 50 ? "..." : ""}`
+				`Processando resposta para comando ${command.startsWith} (${responseText.length} caracteres)`
 			);
 
 			// Processa variáveis na resposta
 			const options = {};
-			const processedResponse = await this.variableProcessor.process(responseText, {
+			const context = {
 				message,
 				group,
-				command,
+				command: { ...command, args: args ?? [] },
 				options,
 				bot // Incluindo o bot no contexto para processar variáveis de arquivo
-			});
+			};
+			const processedResponse = await this.variableProcessor.process(responseText, context);
 
 			this.logger.debug(
 				`Processando resposta: '${processedResponse}', options ${JSON.stringify(options)}`
@@ -1754,7 +1949,7 @@ class CommandHandler {
 			}
 
 			// Verifica se a resposta é um objeto MessageMedia (caso de variável {file-...}, api de arquivo como {reddit-})
-			console.log(processedResponse, typeof processedResponse);
+			this.logger.debug("Processed response for command:", processedResponse);
 			if (
 				processedResponse &&
 				typeof processedResponse === "object" &&
@@ -1765,7 +1960,7 @@ class CommandHandler {
 				);
 
 				return new ReturnMessage({
-					chatId: message.group,
+					chatId: message.group ?? message.author,
 					content: processedResponse,
 					options: {
 						quotedMessageId: command.reply ? message.origin.id._serialized : undefined,
@@ -1776,9 +1971,11 @@ class CommandHandler {
 			}
 
 			// Verifica se é uma resposta de mídia (formato: "{img-filename.png} Legenda\nlegenda 2...")
-			const mediaMatch = processedResponse.match(
-				/^\{(audio|voice|image|video|gif|document|sticker|stickerGif)-([^}]+)\}\s*(.*)/s
-			);
+			const mediaMatch =
+				!context.hasQuotedText &&
+				processedResponse.match(
+					/^\{(audio|voice|image|video|gif|document|sticker|stickerGif)-([^}]+)\}\s*(.*)/s
+				);
 
 			if (mediaMatch) {
 				const [, mediaType, fileName, caption] = mediaMatch;
@@ -1883,8 +2080,11 @@ class CommandHandler {
 				const now = Date.now();
 				const lastInteraction = group.interact.lastInteraction ?? 0;
 				let cdMinutos = group.interact.cooldown ?? 60;
-				if (cdMinutos < 30) {
-					cdMinutos = 30; // Limite 30
+				if (cdMinutos < 1) {
+					cdMinutos = 1; // Limite mínimo 1 minuto
+				}
+				if (cdMinutos > 720) {
+					cdMinutos = 720; // Limite máximo 12 horas (720 minutos)
 				}
 				const cooldown = cdMinutos * 60 * 1000; // Converte minutos para milissegundos
 
@@ -1892,8 +2092,11 @@ class CommandHandler {
 					// Gera número aleatório entre 1 e 10000
 					const randomValue = Math.floor(Math.random() * 10000) + 1;
 					let interactionChance = group.interact.chance ?? 100; // Padrão 1% de chance (100/10000)
-					if (interactionChance > 500) {
-						interactionChance = 500; // Limite 5%
+					if (interactionChance < 100 && interactionChance > 0) {
+						interactionChance = interactionChance * 100; // Suporte caso salvo como porcentagem direta (ex: 5 -> 500)
+					}
+					if (interactionChance > 10000) {
+						interactionChance = 10000; // Limite 100%
 					}
 
 					//this.logger.debug(`Verificação de interação automática: ${randomValue} <= ${interactionChance}`);
@@ -1943,8 +2146,11 @@ class CommandHandler {
 					text.toLowerCase().includes(command.startsWith.toLowerCase())
 				) {
 					this.logger.debug(`Encontrado comando auto-acionado: ${command.startsWith}`);
+					const triggerIndex = text.toLowerCase().indexOf(command.startsWith.toLowerCase());
+					const argumentText = text.slice(triggerIndex + command.startsWith.length).trim();
+					const args = argumentText ? argumentText.split(/\s+/) : [];
 					// Executa o comando, mas não espera para evitar bloqueio
-					this.executeCustomCommand(bot, message, command, [], group, false, true).catch(
+					this.executeCustomCommand(bot, message, command, args, group, false, true).catch(
 						(error) => {
 							this.logger.error(
 								`Erro no comando auto-acionado ${command.startsWith}:`,

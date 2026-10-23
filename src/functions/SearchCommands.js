@@ -31,7 +31,12 @@ async function searchAircraftRAB(bot, message, args, group) {
 	try {
 		const chatId = message.group ?? message.author;
 
-		if (args.length === 0) {
+		const cleanArgs = args
+			.join("")
+			.toUpperCase()
+			.replace(/[^A-Z0-9-]/g, "");
+
+		if (!cleanArgs) {
 			return new ReturnMessage({
 				chatId,
 				content: "Por favor, forneça a matrícula da aeronave. Exemplo: !rab PT-XYZ",
@@ -42,28 +47,51 @@ async function searchAircraftRAB(bot, message, args, group) {
 			});
 		}
 
-		const marca = args[0].toUpperCase();
+		const marca = cleanArgs;
 		logger.info(`Consultando aeronave com matrícula: ${marca}`);
 
-		// URL da consulta RAB
-		const url = `https://sistemas.anac.gov.br/aeronaves/cons_rab_resposta.asp?textMarca=${marca}`;
+		// URL da consulta RAB (ANAC migrou para aeronaves.anac.gov.br)
+		const currentUrl = `https://aeronaves.anac.gov.br/aeronaves/cons_rab_resposta.asp?textMarca=${encodeURIComponent(marca)}`;
 
 		// Realiza a requisição com timeout de 10 segundos
-		const response = await axios.get(url, {
+		let response = await axios.get(currentUrl, {
 			responseType: "arraybuffer",
-			timeout: 10000
+			timeout: 10000,
+			headers: {
+				"User-Agent":
+					"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+			}
 		});
 
 		// Decodifica a resposta usando ISO-8859-1 (padrão para sites brasileiros antigos)
 		const decoder = new TextDecoder("iso-8859-1");
-		const html = decoder.decode(response.data);
+		let html = decoder.decode(response.data);
+
+		// Se houver meta refresh redirect, segue o redirecionamento
+		const refreshMatch = html.match(
+			/<meta[^>]*http-equiv=["']refresh["'][^>]*content=["'][^"']*url=([^"']+)["']/i
+		);
+		if (refreshMatch && refreshMatch[1]) {
+			let redirectUrl = refreshMatch[1].trim();
+			if (!redirectUrl.startsWith("http")) {
+				redirectUrl = new URL(redirectUrl, currentUrl).href;
+			}
+			response = await axios.get(redirectUrl, {
+				responseType: "arraybuffer",
+				timeout: 10000,
+				headers: {
+					"User-Agent":
+						"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+				}
+			});
+			html = decoder.decode(response.data);
+		}
 
 		// Carrega o HTML para parsing
 		const $ = cheerio.load(html);
 
-		// Verifica se a aeronave foi encontrada
-		if (html.includes("encontrado")) {
-			// alert("Registro não encontrado!");
+		// Verifica se a aeronave não foi encontrada via alerta do script da ANAC
+		if (html.toLowerCase().includes("encontrado")) {
 			logger.info(`Matrícula ${marca} não encontrada.`);
 			return new ReturnMessage({
 				chatId,
@@ -77,21 +105,35 @@ async function searchAircraftRAB(bot, message, args, group) {
 
 		// Encontra a tabela com os dados da aeronave
 		const table = $(".table.table-hover");
+		const rows = [];
 
-		// Inicializa a mensagem de retorno
-		let retorno = `🛄 *Consulta RAB - Matrícula ${marca}*\n\n`;
-
-		// Itera sobre cada linha da tabela
 		table.find("tr").each((index, element) => {
-			// Extrai a propriedade e o valor de cada linha
 			const property = $(element).find("th:nth-child(1)").text().trim();
-			const value = $(element).find("td:nth-child(2)").text().trim();
+			const value = $(element).find("td:nth-child(2)").text().trim().replace(/\s+/g, " ");
 
-			// Adiciona à mensagem de retorno se houver conteúdo
 			if (property && value) {
-				retorno += `*${property}*: ${value}\n`;
+				// Ignora avisos de campos descontinuados da ANAC
+				if (value.includes("descontinuado") || value.includes("ConsultaRAB NOVO")) {
+					return;
+				}
+				const cleanProperty = property.replace(/:$/, "").trim();
+				rows.push(`*${cleanProperty}*: ${value}`);
 			}
 		});
+
+		if (rows.length === 0) {
+			logger.info(`Matrícula ${marca} não retornou dados.`);
+			return new ReturnMessage({
+				chatId,
+				content: `🛄 Consulta RAB - Matrícula '${marca}' não encontrada!`,
+				options: {
+					quotedMessageId: message.origin.id._serialized,
+					goReply: message.origin
+				}
+			});
+		}
+
+		const retorno = `🛄 *Consulta RAB - Matrícula ${marca}*\n\n` + rows.join("\n");
 
 		logger.info(`Dados da aeronave ${marca} encontrados e processados.`);
 
@@ -120,8 +162,10 @@ async function searchAircraftRAB(bot, message, args, group) {
 	}
 }
 
+const LLMService = require("../services/LLMService");
+
 /**
- * Busca na web usando DuckDuckGo
+ * Busca na web usando DuckDuckGo com fallbacks (Bing e DDG API)
  * @param {WhatsAppBot} bot - Instância do bot
  * @param {Object} message - Dados da mensagem
  * @param {Array} args - Argumentos do comando
@@ -146,68 +190,8 @@ async function searchWeb(bot, message, args, group) {
 		const query = args.join(" ");
 		logger.info(`Buscando na web por: ${query}`);
 
-		// Usa API DuckDuckGo
-		const response = await axios.get("https://api.duckduckgo.com/", {
-			params: {
-				q: query,
-				format: "json",
-				skip_disambig: 1,
-				no_html: 1,
-				no_redirect: 1
-			},
-			timeout: 10000
-		});
-
-		const data = response.data;
-
-		// Constrói mensagem de resultados da busca
-		let resultsMessage = `🔍 *Resultados para "${query}":*\n\n`;
-
-		// Adiciona resumo se disponível
-		if (data.AbstractText) {
-			resultsMessage += `*${data.AbstractSource}:*\n${decodeHtmlEntities(data.AbstractText)}\n\n`;
-		}
-
-		// Adiciona tópicos relacionados
-		if (data.RelatedTopics && data.RelatedTopics.length > 0) {
-			const topResults = data.RelatedTopics.slice(0, 5);
-			topResults.forEach((result, index) => {
-				if (result.Text) {
-					resultsMessage += `${index + 1}. ${decodeHtmlEntities(result.Text)}\n`;
-					if (result.FirstURL) {
-						resultsMessage += `   🔗 ${result.FirstURL}\n\n`;
-					}
-				}
-			});
-		} else if (data.Results && data.Results.length > 0) {
-			// Alternativa: usa Results se disponível
-			const topResults = data.Results.slice(0, 5);
-			topResults.forEach((result, index) => {
-				if (result.Text) {
-					resultsMessage += `${index + 1}. ${decodeHtmlEntities(result.Text)}\n`;
-					if (result.FirstURL) {
-						resultsMessage += `   🔗 ${result.FirstURL}\n\n`;
-					}
-				}
-			});
-		} else {
-			// Se não houver resultados claros, tenta usar as informações que temos
-			if (data.Infobox && data.Infobox.content) {
-				const infoItems = data.Infobox.content.slice(0, 5);
-				infoItems.forEach((item, index) => {
-					if (item.label && item.value) {
-						resultsMessage += `${item.label}: ${item.value}\n`;
-					}
-				});
-				resultsMessage += "\n";
-			}
-
-			// Se ainda não houver resultados, fornece uma mensagem alternativa
-			if (resultsMessage === `🔍 *Resultados para "${query}":*\n\n`) {
-				resultsMessage += "Não foram encontrados resultados específicos para esta busca.\n\n";
-				resultsMessage += `Tente buscar diretamente: https://duckduckgo.com/?q=${encodeURIComponent(query)}`;
-			}
-		}
+		const llmService = LLMService.getInstance();
+		const resultsMessage = await llmService.searchWeb(query);
 
 		logger.info(`Resultados de busca enviados com sucesso para "${query}"`);
 
@@ -512,4 +496,34 @@ const commands = [
 // Registra os comandos sendo exportados
 //logger.debug(`Exportando ${commands.length} comandos:`, commands.map(cmd => cmd.name));
 
-module.exports = { commands };
+const helper = {
+	about: "Mecanismo de busca na web, imagens e Registro Aeronáutico Brasileiro (RAB)",
+	implementation:
+		"Integra com engines de busca na web, DuckDuckGo/Google e banco de dados de aeronaves da ANAC",
+	tags: "busca,pesquisa,google,web,imagens,rab,aviao,aeronave",
+	cmds: [
+		{
+			cmd: "!buscar",
+			desc: "Realiza uma pesquisa rápida na internet",
+			usage: ["!buscar historia do brasil", "!buscar receita de bolo"],
+			category: "busca"
+		},
+		{
+			cmd: "!buscar-img",
+			desc: "Pesquisa e envia imagens encontradas na web",
+			usage: ["!buscar-img paisagem da serra", "!buscar-img wallpaper 4k"],
+			category: "busca"
+		},
+		{
+			cmd: "!rab",
+			desc: "Consulta dados de aeronaves pelo prefixo no Registro Aeronáutico Brasileiro da ANAC",
+			usage: ["!rab PT-ABC", "!rab PR-XYZ"],
+			category: "utilidades"
+		}
+	]
+};
+
+module.exports = {
+	helper,
+	commands
+};

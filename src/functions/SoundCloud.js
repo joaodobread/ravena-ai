@@ -4,6 +4,9 @@ const ReturnMessage = require("../models/ReturnMessage");
 const SoundCacheManager = require("../utils/SoundCacheManager");
 const Command = require("../models/Command");
 const Database = require("../utils/Database");
+const Logger = require("../utils/Logger");
+
+const logger = new Logger("soundcloud");
 
 const TEMP_FOLDER = process.env.DL_FOLDER ?? "./temp";
 const soundcloud = new SoundCloud.default(
@@ -58,12 +61,12 @@ async function soundCloudSearchAndDownload(bot, message, args, group) {
 		const selectedTrackIndex = trackIndex > 0 && trackIndex <= tracks.length ? trackIndex - 1 : 0;
 		const selectedTrack = tracks[selectedTrackIndex];
 
-		console.log("baixad");
+		logger.debug("Iniciando download SoundCloud...");
 		const downloadResult = await cacheManager.downloadTrackWithCache(selectedTrack, {
 			path: TEMP_FOLDER
 		});
 
-		console.log("downloadResult", downloadResult);
+		logger.debug("downloadResult", downloadResult);
 
 		if (!downloadResult || !downloadResult.lastDownloadLocation) {
 			return new ReturnMessage({
@@ -134,4 +137,22 @@ const commands = [
 	})
 ];
 
-//module.exports = { commands  };
+const helper = {
+	about: "Busca e download direto de músicas da plataforma SoundCloud",
+	implementation:
+		"Utiliza soundcloud.ts para buscar faixas, baixar o stream de áudio e converter para MP3 com metadados",
+	tags: "soundcloud,musica,audio,musicas,streaming,baixar",
+	cmds: [
+		{
+			cmd: "!sc",
+			desc: "Pesquisa e faz download de uma música do SoundCloud",
+			usage: ["!sc nome da musica ou artista", "!sc https://soundcloud.com/..."],
+			category: "downloaders"
+		}
+	]
+};
+
+module.exports = {
+	helper,
+	commands
+};

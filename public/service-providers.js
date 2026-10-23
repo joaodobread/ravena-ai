@@ -8,13 +8,16 @@ document.addEventListener('DOMContentLoaded', () => {
     
     let config = {};
     let costData = {};
-    const categories = ['llm', 'whisper', 'comfyui', 'sdwebui', 'f5tts'];
+    const categories = ['llm', 'laya', 'whisper', 'comfyui', 'bonsai', 'sdwebui', 'f5tts', 'nudenet'];
     const categoryNames = {
         'llm': 'Inteligência Artificial (LLM)',
+        'laya': 'Decisão Rápida / Intenção (Laya System One)',
         'whisper': 'Transcrição de Áudio (Whisper)',
         'comfyui': 'Geração de Imagens (ComfyUI)',
+        'bonsai': 'Geração de Imagens (Bonsai)',
         'sdwebui': 'Geração de Imagens (SD WebUI)',
-        'f5tts': 'Conversão de Texto em Fala (F5-TTS)'
+        'f5tts': 'Conversão de Texto em Fala (F5-TTS)',
+        'nudenet': 'Detecção de Conteúdo NSFW (NudeNet)'
     };
 
     // Basic auth is handled by the browser since the page itself is protected.
@@ -109,7 +112,7 @@ document.addEventListener('DOMContentLoaded', () => {
             <div class="provider-card ${isEnabled ? '' : 'disabled'}">
                 <div class="provider-info">
                     <div class="provider-name">${p.name} ${statusHtml}</div>
-                    <div class="provider-type">${p.url} ${p.model ? `(${p.model})` : ''}</div>
+                    <div class="provider-type">${p.url} ${p.model ? `(${p.model})` : ''} ${p.contextLength ? `[Ctx: ${p.contextLength}]` : ''} ${p.maxTokens ? `[MaxOut: ${p.maxTokens}]` : ''} ${p.circuitBreakerDuration ? `[CB: ${Math.round(p.circuitBreakerDuration / 1000)}s]` : ''}</div>
                 </div>
                 <div>
                   <input type="checkbox" ${isEnabled ? 'checked' : ''} onchange="toggleProvider('${cat}', ${index})"> Ativo
@@ -136,6 +139,12 @@ document.addEventListener('DOMContentLoaded', () => {
         const llmFields = document.getElementById('llm-extra-fields');
         llmFields.classList.toggle('hidden', category !== 'llm');
 
+        const layaFields = document.getElementById('laya-extra-fields');
+        if (layaFields) layaFields.classList.toggle('hidden', category !== 'laya');
+
+        const nudenetFields = document.getElementById('nudenet-extra-fields');
+        if (nudenetFields) nudenetFields.classList.toggle('hidden', category !== 'nudenet');
+
         if (isEdit) {
             const p = config[category][index];
             document.getElementById('prov-name').value = p.name || '';
@@ -149,6 +158,20 @@ document.addEventListener('DOMContentLoaded', () => {
                 document.getElementById('prov-timeout').value = p.timeout_multiplier || '';
                 document.getElementById('prov-text-only').checked = !!p.textOnly;
                 document.getElementById('prov-ignore-video').checked = !!p.ignoreVideo;
+                document.getElementById('prov-tool-calling').checked = !!p.toolCalling;
+                document.getElementById('prov-context-length').value = p.contextLength || '';
+                document.getElementById('prov-max-tokens').value = p.maxTokens || '';
+            } else if (category === 'laya') {
+                const modelInput = document.getElementById('prov-laya-model');
+                if (modelInput) modelInput.value = p.model || 'ravena-bgem3';
+                const timeoutInput = document.getElementById('prov-laya-timeout');
+                if (timeoutInput) timeoutInput.value = p.timeoutMs || p.timeout || 3000;
+            } else if (category === 'nudenet') {
+                const cbSeconds = p.circuitBreakerDuration !== undefined
+                    ? Math.round(p.circuitBreakerDuration / 1000)
+                    : (p.circuitBreaker || 15);
+                const cbInput = document.getElementById('prov-circuit-breaker');
+                if (cbInput) cbInput.value = cbSeconds;
             }
            } else {
             document.getElementById('prov-name').value = '';
@@ -160,6 +183,15 @@ document.addEventListener('DOMContentLoaded', () => {
             document.getElementById('prov-timeout').value = '';
             document.getElementById('prov-text-only').checked = false;
             document.getElementById('prov-ignore-video').checked = false;
+            document.getElementById('prov-tool-calling').checked = false;
+            document.getElementById('prov-context-length').value = '';
+            document.getElementById('prov-max-tokens').value = '';
+            const layaModelInput = document.getElementById('prov-laya-model');
+            if (layaModelInput) layaModelInput.value = 'ravena-bgem3';
+            const layaTimeoutInput = document.getElementById('prov-laya-timeout');
+            if (layaTimeoutInput) layaTimeoutInput.value = 3000;
+            const cbInput = document.getElementById('prov-circuit-breaker');
+            if (cbInput) cbInput.value = 15;
            }
 
         providerModal.classList.remove('hidden');
@@ -195,7 +227,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
     document.getElementById('btn-save-prov').onclick = () => {
         const category = document.getElementById('edit-category').value;
-        const index = parseInt(document.getElementById('edit-index').value);
+        const index = parseInt(document.getElementById('edit-index').value, 10);
+        const isEdit = index !== -1;
         
         const provider = {
             name: document.getElementById('prov-name').value,
@@ -211,6 +244,41 @@ document.addEventListener('DOMContentLoaded', () => {
             if (!isNaN(timeout)) provider.timeout_multiplier = timeout;
             provider.textOnly = document.getElementById('prov-text-only').checked;
             provider.ignoreVideo = document.getElementById('prov-ignore-video').checked;
+            provider.toolCalling = document.getElementById('prov-tool-calling').checked;
+
+            const contextLen = parseInt(document.getElementById('prov-context-length').value, 10);
+            if (!isNaN(contextLen) && contextLen > 0) {
+                provider.contextLength = contextLen;
+            }
+            const maxToks = parseInt(document.getElementById('prov-max-tokens').value, 10);
+            if (!isNaN(maxToks) && maxToks > 0) {
+                provider.maxTokens = maxToks;
+            }
+
+            if (isEdit) {
+                const p = config[category][index];
+                if (p.repetition_penalty !== undefined) provider.repetition_penalty = p.repetition_penalty;
+                if (p.frequency_penalty !== undefined) provider.frequency_penalty = p.frequency_penalty;
+                if (p.presence_penalty !== undefined) provider.presence_penalty = p.presence_penalty;
+                if (p.min_p !== undefined) provider.min_p = p.min_p;
+                if (p.top_p !== undefined) provider.top_p = p.top_p;
+                if (p.top_k !== undefined) provider.top_k = p.top_k;
+                if (p.temperature !== undefined) provider.temperature = p.temperature;
+            }
+        } else if (category === 'laya') {
+            const modelInput = document.getElementById('prov-laya-model');
+            provider.model = modelInput && modelInput.value ? modelInput.value.trim() : 'ravena-bgem3';
+            const timeoutInput = document.getElementById('prov-laya-timeout');
+            const timeoutVal = timeoutInput ? parseInt(timeoutInput.value, 10) : 3000;
+            if (!isNaN(timeoutVal) && timeoutVal > 0) {
+                provider.timeoutMs = timeoutVal;
+            }
+        } else if (category === 'nudenet') {
+            const cbInput = document.getElementById('prov-circuit-breaker');
+            const cbVal = cbInput ? parseFloat(cbInput.value) : 15;
+            if (!isNaN(cbVal) && cbVal > 0) {
+                provider.circuitBreakerDuration = cbVal * 1000;
+            }
         }
 
         if (index === -1) {
@@ -423,9 +491,10 @@ document.addEventListener('DOMContentLoaded', () => {
             Object.keys(pData.by_type || {}).forEach(type => {
                 const targetType = type === 'video' ? 'text' : type;
                 if (!mergedByType[targetType]) {
-                    mergedByType[targetType] = { requests: 0, input_tokens: 0, output_tokens: 0, duration_sec: 0 };
+                    mergedByType[targetType] = { requests: 0, failures: 0, input_tokens: 0, output_tokens: 0, duration_sec: 0 };
                 }
                 mergedByType[targetType].requests += pData.by_type[type].requests;
+                mergedByType[targetType].failures += (pData.by_type[type].failures || 0);
                 mergedByType[targetType].input_tokens += pData.by_type[type].input_tokens;
                 mergedByType[targetType].output_tokens += pData.by_type[type].output_tokens;
                 if (pData.by_type[type].duration_sec) mergedByType[targetType].duration_sec += pData.by_type[type].duration_sec;
@@ -483,6 +552,30 @@ document.addEventListener('DOMContentLoaded', () => {
 
         const elTotalCost = document.getElementById('stat-total-cost');
         if (elTotalCost) elTotalCost.innerText = '$ ' + totalEstimatedCost.toFixed(2);
+
+        // Render External API Users table
+        const extBody = document.getElementById('external-users-body');
+        if (extBody) {
+            extBody.innerHTML = '';
+            const apiUsers = Object.keys(data.by_api_user || {});
+            if (apiUsers.length === 0) {
+                extBody.innerHTML = '<tr><td colspan="6" class="text-center" style="color: #888;">Nenhuma requisição de API externa registrada no período.</td></tr>';
+            } else {
+                apiUsers.forEach(user => {
+                    const uData = data.by_api_user[user] || {};
+                    const tr = document.createElement('tr');
+                    tr.innerHTML = `
+                        <td style="font-weight: bold; color: #a29bfe;"><i class="fas fa-user-circle"></i> ${user}</td>
+                        <td style="font-weight: bold;">${(uData.total || 0).toLocaleString()}</td>
+                        <td>${(uData.llm || 0).toLocaleString()}</td>
+                        <td>${(uData.image || 0).toLocaleString()}</td>
+                        <td>${(uData.stt || 0).toLocaleString()}</td>
+                        <td>${(uData.tts || 0).toLocaleString()}</td>
+                    `;
+                    extBody.appendChild(tr);
+                });
+            }
+        }
     }
 
     // Auto-refresh stats and queue every 30 seconds

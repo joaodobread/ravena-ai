@@ -290,7 +290,8 @@ async function handleJpeg(bot, message, args, group) {
 			}
 			return new ReturnMessage({
 				chatId,
-				content: "Por favor, forneça uma imagem ou responda a uma imagem com este comando."
+				content:
+					"Por favor, forneça uma imagem, responda a uma imagem ou mencione alguém com @ para usar sua foto de perfil."
 			});
 		}
 
@@ -378,7 +379,8 @@ async function handleRemoveBg(bot, message, args, group) {
 			}
 			return new ReturnMessage({
 				chatId,
-				content: "Por favor, forneça uma imagem ou responda a uma imagem com este comando."
+				content:
+					"Por favor, forneça uma imagem, responda a uma imagem ou mencione alguém com @ para usar sua foto de perfil."
 			});
 		}
 
@@ -478,7 +480,8 @@ async function handleDistort(bot, message, args, group) {
 			}
 			return new ReturnMessage({
 				chatId,
-				content: "Por favor, forneça uma imagem ou responda a uma imagem com este comando."
+				content:
+					"Por favor, forneça uma imagem, responda a uma imagem ou mencione alguém com @ para usar sua foto de perfil."
 			});
 		}
 
@@ -568,7 +571,8 @@ async function handleStickerBg(bot, message, args, group) {
 			}
 			return new ReturnMessage({
 				chatId,
-				content: "Por favor, forneça uma imagem ou responda a uma imagem com este comando."
+				content:
+					"Por favor, forneça uma imagem, responda a uma imagem ou mencione alguém com @ para usar sua foto de perfil."
 			});
 		}
 
@@ -587,7 +591,18 @@ async function handleStickerBg(bot, message, args, group) {
 		logger.debug(`Imagem recortada, salva em ${trimmedPath}`);
 		filePaths.push(trimmedPath);
 
-		const resultMedia = await bot.createMedia(trimmedPath);
+		// Padroniza para dimensões de sticker do WhatsApp (512x512, fundo transparente, WebP)
+		const stickerPath = inputPath.replace(/\.[^/.]+$/, "") + "_sticker.webp";
+		await sharp(trimmedPath)
+			.resize(512, 512, {
+				fit: "contain",
+				background: { r: 0, g: 0, b: 0, alpha: 0 }
+			})
+			.webp({ quality: 80, effort: 6 })
+			.toFile(stickerPath);
+		filePaths.push(stickerPath);
+
+		const resultMedia = await bot.createMedia(stickerPath);
 
 		// Limpa arquivos temporários
 		cleanupTempFiles(filePaths).catch((error) => {
@@ -603,7 +618,7 @@ async function handleStickerBg(bot, message, args, group) {
 			args: args.join(" "),
 			info: {
 				cropType: "nobg",
-				mimeType: "image/png"
+				mimeType: "image/webp"
 			}
 		});
 
@@ -612,8 +627,8 @@ async function handleStickerBg(bot, message, args, group) {
 			content: resultMedia,
 			options: {
 				sendMediaAsSticker: true,
-				stickerAuthor: "ravena",
-				stickerName: args.join(" ") || "ravena sticker",
+				stickerAuthor: bot?.nomeExibir || "ravena",
+				stickerName: args.join(" ") || `${bot?.nomeExibir || "ravena"} sticker`,
 				quotedMessageId: message.origin.id._serialized,
 				goReply: message.origin
 			}
@@ -666,7 +681,8 @@ async function handleArtisticEffect(bot, message, args, group, effect) {
 			}
 			return new ReturnMessage({
 				chatId,
-				content: "Por favor, forneça uma imagem ou responda a uma imagem com este comando."
+				content:
+					"Por favor, forneça uma imagem, responda a uma imagem ou mencione alguém com @ para usar sua foto de perfil."
 			});
 		}
 
@@ -758,7 +774,7 @@ const commands = [
 	new Command({
 		name: "stickerbg",
 		description: "Cria um sticker após remover o fundo",
-		category: "midia",
+		category: "stickers",
 		group: "stickerbg",
 		aliases: ["sbg"],
 		needsMedia: true,
@@ -772,7 +788,7 @@ const commands = [
 	new Command({
 		name: "sbg",
 		description: "Envia sticker sem fundo",
-		category: "midia",
+		category: "stickers",
 		group: "stickerbg",
 		needsMedia: true,
 		reactions: {
@@ -834,4 +850,52 @@ const commands = [
 // Registra os comandos sendo exportados
 logger.info(`Módulo ImageManipulation carregado. Exportados ${commands.length} comandos.`);
 
-module.exports = { commands };
+const helper = {
+	about: "Efeitos visuais, filtros e manipulação artística em imagens e fotos",
+	implementation:
+		"Aplica transformações gráficas com Sharp e ImageMagick (remoção de fundo, pixelate, distorção, neon, pintura a óleo, sketch)",
+	tags: "imagem,efeitos,filtros,removebg,neon,pixelate,oil,sketch,distorcer,fotos",
+	cmds: [
+		{
+			cmd: "!removebg",
+			desc: "Remove o fundo de uma imagem usando inteligência artificial",
+			usage: ["!removebg (em resposta a uma foto)"],
+			category: "midia"
+		},
+		{
+			cmd: "!distort",
+			desc: "Aplica distorção cômica e deformação na imagem",
+			usage: ["!distort (em resposta a uma foto)"],
+			category: "midia"
+		},
+		{
+			cmd: "!neon",
+			desc: "Aplica efeito de iluminação neon sobre a imagem",
+			usage: ["!neon (em resposta a uma foto)"],
+			category: "midia"
+		},
+		{
+			cmd: "!oil",
+			desc: "Transforma a imagem em efeito de pintura a óleo",
+			usage: ["!oil (em resposta a uma foto)"],
+			category: "midia"
+		},
+		{
+			cmd: "!pixelate",
+			desc: "Aplica efeito retrô de pixelização na imagem",
+			usage: ["!pixelate (em resposta a uma foto)"],
+			category: "midia"
+		},
+		{
+			cmd: "!sketch",
+			desc: "Converte a imagem em um desenho a lápis / esboço",
+			usage: ["!sketch (em resposta a uma foto)"],
+			category: "midia"
+		}
+	]
+};
+
+module.exports = {
+	helper,
+	commands
+};

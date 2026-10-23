@@ -40,6 +40,14 @@ CREATE TABLE IF NOT EXISTS anagram_scores (
   last_updated INTEGER,
   PRIMARY KEY (group_id, user_id)
 );
+CREATE TABLE IF NOT EXISTS anagram_history (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  group_id TEXT,
+  user_id TEXT,
+  user_name TEXT,
+  points INTEGER,
+  timestamp INTEGER
+);
 `
 );
 
@@ -200,6 +208,15 @@ async function updateUserStats(groupId, userId, userName, updates) {
 
 		// Concatena os valores para o INSERT com os valores para o UPDATE
 		await database.dbRun(dbName, sql, [...insertValues, ...values]);
+
+		if (updates.points && updates.points > 0) {
+			await database.dbRun(
+				dbName,
+				`INSERT INTO anagram_history (group_id, user_id, user_name, points, timestamp)
+				 VALUES (?, ?, ?, ?, ?)`,
+				[groupId, userId, userName, updates.points, timestamp]
+			);
+		}
 	} catch (error) {
 		logger.error("Erro ao atualizar estatísticas do usuário:", error);
 	}
@@ -347,7 +364,7 @@ async function startNewRound(bot, message, group, isFirstRound = true) {
 	clearTimeout(game.timer);
 
 	const word = WORD_LIST[Math.floor(Math.random() * WORD_LIST.length)];
-	console.log(`[Anagrama] Grupo: ${groupId}, Palavra: ${word}`);
+	logger.debug(`[Anagrama] Grupo: ${groupId}, Palavra: ${word}`);
 	const scrambledWord = scrambleWord(word);
 
 	// Calcula dicas permitidas: Base + 1 a cada 3 rodadas completas (iniciando do zero ou 1?)
@@ -389,7 +406,11 @@ async function startNewRound(bot, message, group, isFirstRound = true) {
 		new ReturnMessage({
 			chatId: groupId,
 			content: media,
-			options: { sendMediaAsSticker: true, stickerAuthor: "Ravena", stickerName: group.name }
+			options: {
+				sendMediaAsSticker: true,
+				stickerAuthor: bot?.nomeExibir || "Ravena",
+				stickerName: group.name
+			}
 		}),
 		group
 	);
@@ -786,6 +807,87 @@ const commands = [
 	})
 ];
 
+const helper = {
+	about: "Jogo de palavras em que os jogadores devem adivinhar o anagrama embaralhado",
+	implementation:
+		"Gerencia partidas por grupo em memória com dicas, contagem regressiva, persistência de pontuação e ranking em banco SQLite",
+	tags: "jogos,anagrama,palavras,game,ranking,adivinhar",
+	cmds: [
+		{
+			cmd: "!anagrama",
+			desc: "Inicia uma partida de Anagrama no grupo",
+			usage: ["!anagrama"],
+			category: "jogos"
+		},
+		{
+			cmd: "!ana",
+			desc: "Envia um palpite para a palavra embaralhada",
+			usage: ["!ana computador", "!ana teclado"],
+			category: "jogos"
+		},
+		{
+			cmd: "!ana-dica",
+			desc: "Solicita uma dica sobre a palavra atual",
+			usage: ["!ana-dica"],
+			category: "jogos"
+		},
+		{
+			cmd: "!ana-pular",
+			desc: "Pula a palavra atual da rodada",
+			usage: ["!ana-pular"],
+			category: "jogos"
+		},
+		{
+			cmd: "!anagrama-ranking",
+			desc: "Exibe o ranking de jogadores com mais pontos no Anagrama",
+			usage: ["!anagrama-ranking"],
+			category: "jogos"
+		},
+		{
+			cmd: "!anagrama-reset",
+			desc: "Reseta o ranking do jogo no grupo (Apenas Administradores)",
+			usage: ["!anagrama-reset"],
+			category: "jogos"
+		}
+	]
+};
+
+/**
+ * Obtém o ranking semanal do Anagrama para o resumo semanal
+ * @param {number} sinceMs
+ * @returns {Promise<Array<Object>>}
+ */
+async function getWeeklyAnagramStats(sinceMs) {
+	try {
+		const rows = await database.dbAll(
+			dbName,
+			`SELECT user_id,
+			        MAX(user_name) as user_name,
+			        SUM(points) as points
+			 FROM anagram_history
+			 WHERE timestamp >= ?
+			   AND user_id NOT LIKE 'user_%'
+			   AND user_id NOT IN ('user1', 'user2')
+			   AND group_id != '123@g.us'
+			   AND group_id NOT LIKE 'test_%'
+			 GROUP BY user_id
+			 ORDER BY points DESC
+			 LIMIT 10`,
+			[sinceMs]
+		);
+		return (rows || []).map((r) => ({
+			user_id: r.user_id,
+			user_name: r.user_name || "Jogador",
+			points: Number(r.points) || 0
+		}));
+	} catch (error) {
+		logger.error("Erro ao buscar estatísticas semanais do Anagrama:", error);
+		return [];
+	}
+}
+
 module.exports = {
-	commands
+	helper,
+	commands,
+	getWeeklyAnagramStats
 };

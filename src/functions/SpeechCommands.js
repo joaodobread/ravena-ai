@@ -31,7 +31,8 @@ database.getSQLiteDb(
         duration_sec REAL,
         char_count INTEGER,
         word_count INTEGER,
-        processing_time_ms INTEGER
+        processing_time_ms INTEGER,
+        api_user TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_transcr_ts ON speech_transcription_stats(timestamp);
 
@@ -41,11 +42,20 @@ database.getSQLiteDb(
         char_count INTEGER,
         word_count INTEGER,
         duration_sec REAL,
-        processing_time_ms INTEGER
+        processing_time_ms INTEGER,
+        api_user TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_gen_ts ON speech_generation_stats(timestamp);
 `
 );
+
+// Migrations for api_user column
+database
+	.dbRun("media_stats", `ALTER TABLE speech_transcription_stats ADD COLUMN api_user TEXT`)
+	.catch(() => {});
+database
+	.dbRun("media_stats", `ALTER TABLE speech_generation_stats ADD COLUMN api_user TEXT`)
+	.catch(() => {});
 
 const ffmpegPath = process.env.FFMPEG_PATH || "ffmpeg";
 
@@ -362,8 +372,7 @@ async function textToSpeech(bot, message, args, group, char = "ravena") {
 
 		return returnMessage;
 	} catch (error) {
-		logger.error("Erro na conversão de texto para voz:");
-		console.log(error);
+		logger.error("Erro na conversão de texto para voz:", error);
 		const chatId = message.group ?? message.author;
 
 		return new ReturnMessage({
@@ -560,11 +569,15 @@ async function speechToText(bot, message, args, group, optimizeWithLLM = true) {
 					logger.info(`[stt] ETA ${estimatedTime}s.`);
 
 					// Avisa só se for demorar um pouquinho a mais
-					if (estimatedTime > 15) {
+					if (estimatedTime > 15 || audioDuration > 900) {
+						let etaContent = `🔉 Transcrevendo áudio com _${audioDuration}s_, estimativa de _${estimatedTime}s_ até concluir.`;
+						if (audioDuration > 900) {
+							etaContent += `\n\n> Ps.: Você pode transcrever diretamente no site da ravena! Útil pra áudios grandes assim: https://ravena.moothz.win/?app=stt`;
+						}
 						bot.sendReturnMessages(
 							new ReturnMessage({
 								chatId,
-								content: `🔉 Transcrevendo áudio com _${audioDuration}s_, estimativa de _${estimatedTime}s_ até concluir.`,
+								content: etaContent,
 								options: {
 									quotedMessageId: message.origin.id._serialized,
 									goReply: message.origin
@@ -884,7 +897,7 @@ const commands = [
 	new Command({
 		name: "stt",
 		description: "Converte voz para texto",
-		category: "utilidades",
+		category: "voz",
 		group: "transcr",
 		needsMedia: true, // Verificará mídia direta ou mídia de mensagem citada
 		reactions: {
@@ -897,7 +910,7 @@ const commands = [
 	new Command({
 		name: "transcrever",
 		description: "Converte voz para texto",
-		category: "utilidades",
+		category: "voz",
 		group: "transcr",
 		needsMedia: true, // Verificará mídia direta ou mídia de mensagem citada
 		reactions: {
@@ -911,7 +924,7 @@ const commands = [
 		name: "tts",
 		cooldown: 30,
 		description: `Converte texto para voz usando personagem 'ravena'`,
-		category: "tts",
+		category: "voz",
 		reactions: {
 			trigger: ["🗣️", "🦇"],
 			before: process.env.LOADING_EMOJI ?? "⌛️",
@@ -924,7 +937,7 @@ const commands = [
 		cooldown: 30,
 		description: `Converte texto para voz usando personagem feminina`,
 		group: "ttsMulher",
-		category: "tts",
+		category: "voz",
 		reactions: {
 			trigger: "👩",
 			before: process.env.LOADING_EMOJI ?? "⌛️",
@@ -937,7 +950,7 @@ const commands = [
 		cooldown: 30,
 		description: `Converte texto para voz usando personagem feminina`,
 		group: "ttsMulher",
-		category: "tts",
+		category: "voz",
 		reactions: {
 			before: process.env.LOADING_EMOJI ?? "⌛️",
 			after: "🔊"
@@ -950,7 +963,7 @@ const commands = [
 		cooldown: 30,
 		description: `Converte texto para voz usando personagem masculino`,
 		group: "ttsHomem",
-		category: "tts",
+		category: "voz",
 		reactions: {
 			before: process.env.LOADING_EMOJI ?? "⌛️",
 			after: "🔊"
@@ -963,7 +976,7 @@ const commands = [
 		cooldown: 30,
 		description: `Converte texto para voz usando personagem feminina`,
 		group: "ttsMulher",
-		category: "tts",
+		category: "voz",
 		reactions: {
 			trigger: "💋",
 			before: process.env.LOADING_EMOJI ?? "⌛️",
@@ -975,7 +988,7 @@ const commands = [
 		name: "tts-sensuel",
 		cooldown: 30,
 		description: `Converte texto para voz usando personagem masculino`,
-		category: "tts",
+		category: "voz",
 		group: "ttsHomem",
 		reactions: {
 			before: process.env.LOADING_EMOJI ?? "⌛️",
@@ -988,7 +1001,7 @@ const commands = [
 		name: "tts-homem",
 		cooldown: 30,
 		description: `Converte texto para voz usando personagem masculino`,
-		category: "tts",
+		category: "voz",
 		group: "ttsHomem",
 		reactions: {
 			trigger: "👨",
@@ -1001,7 +1014,7 @@ const commands = [
 		name: "tts-clint",
 		cooldown: 30,
 		description: `Converte texto para voz usando personagem masculino`,
-		category: "tts",
+		category: "voz",
 		group: "ttsHomem",
 		reactions: {
 			before: process.env.LOADING_EMOJI ?? "⌛️",
@@ -1014,7 +1027,7 @@ const commands = [
 		name: "tts-morgan",
 		cooldown: 30,
 		description: `Converte texto para voz usando personagem masculino`,
-		category: "tts",
+		category: "voz",
 		group: "ttsHomem",
 		reactions: {
 			before: process.env.LOADING_EMOJI ?? "⌛️",
@@ -1028,7 +1041,7 @@ const commands = [
 		cooldown: 30,
 		description: `Converte texto para voz usando personagem masculino`,
 		group: "ttsHomem",
-		category: "tts",
+		category: "voz",
 		reactions: {
 			trigger: "🎙️",
 			before: process.env.LOADING_EMOJI ?? "⌛️",
@@ -1042,7 +1055,7 @@ const commands = [
 		cooldown: 30,
 		description: `Converte texto para voz usando do Rubão do Pontaço`,
 		group: "ttsHomem",
-		category: "tts",
+		category: "voz",
 		reactions: {
 			trigger: "🎙️",
 			before: process.env.LOADING_EMOJI ?? "⌛️",
@@ -1053,6 +1066,53 @@ const commands = [
 ];
 
 // Exporta função para ser usada em EventHandler
+const helper = {
+	about: "Síntese de voz (TTS) com diferentes personagens e transcrição de áudio (STT)",
+	implementation:
+		"Executa TTS com vozes locais/remotas e modelos Whisper para Speech-To-Text com estatísticas em SQLite",
+	tags: "tts,stt,voz,falar,transcrever,audio,narrador,rubao,ravena",
+	cmds: [
+		{
+			cmd: "!stt",
+			desc: "Transcreve uma mensagem de voz ou áudio para texto",
+			usage: ["!stt (em resposta a um áudio de voz)"],
+			category: "voz"
+		},
+		{
+			cmd: "!tts",
+			desc: "Converte texto em áudio falado com voz padrão (Ravena)",
+			usage: ["!tts Olá pessoal do grupo!"],
+			category: "voz"
+		},
+		{
+			cmd: "!tts-mulher",
+			desc: "Converte texto em áudio com voz feminina",
+			usage: ["!tts-mulher Bom dia a todos!"],
+			category: "voz"
+		},
+		{
+			cmd: "!tts-homem",
+			desc: "Converte texto em áudio com voz masculina",
+			usage: ["!tts-homem Atenção para o recado!"],
+			category: "voz"
+		},
+		{
+			cmd: "!tts-rubao",
+			desc: "Converte texto em áudio com a voz cômica do Rubão do Pontaço",
+			usage: ["!tts-rubao Fala minha galera do zapzap!"],
+			category: "voz"
+		},
+		{
+			cmd: "!tts-narrador",
+			desc: "Converte texto em áudio com voz de narrador de documentário",
+			usage: ["!tts-narrador E assim a história começou..."],
+			category: "voz"
+		}
+	]
+};
+
+module.exports.helper = helper;
 module.exports.commands = commands;
 module.exports.processAutoSTT = processAutoSTT;
 module.exports.transcribeViaAPI = transcribeViaAPI;
+module.exports.getAudioDuration = getAudioDuration;

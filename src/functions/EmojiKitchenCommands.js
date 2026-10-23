@@ -244,7 +244,7 @@ const commands = [
 	new Command({
 		name: "emojik",
 		description: "Cria um sticker combinando dois emojis",
-		category: "midia",
+		category: "stickers",
 		group: "emojik",
 		caseSensitive: false,
 		cooldown: 5, // 5 segundos entre usos
@@ -259,7 +259,7 @@ const commands = [
 	new Command({
 		name: "memoji",
 		description: "Alias para o comando emojik",
-		category: "midia",
+		category: "stickers",
 		group: "emojik",
 		caseSensitive: false,
 		cooldown: 5,
@@ -272,4 +272,22 @@ const commands = [
 	})
 ];
 
-module.exports = { commands };
+const helper = {
+	about: "Combinação e fusão de emojis (Emoji Kitchen do Google)",
+	implementation:
+		"Consulta o repositório de assets do Google Emoji Kitchen e gera figurinhas transparentes com a fusão de dois emojis",
+	tags: "emoji,emojis,figurinha,sticker,kitchen,misturar,combinar",
+	cmds: [
+		{
+			cmd: "!emojikitchen",
+			desc: "Funde dois emojis em uma figurinha única e criativa",
+			usage: ["!emojikitchen 🐱 🚀", "!emojikitchen 🐶 🍕"],
+			category: "stickers"
+		}
+	]
+};
+
+module.exports = {
+	helper,
+	commands
+};

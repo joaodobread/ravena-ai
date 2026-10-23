@@ -1,10 +1,18 @@
 const axios = require("axios");
+const cheerio = require("cheerio");
 const Logger = require("../utils/Logger");
 const fs = require("fs");
 const path = require("path");
 const Database = require("../utils/Database");
 const Queue = require("./Queue");
 const ServiceProviderService = require("./ServiceProviderService");
+const CommandsHelper = require("../utils/CommandsHelper");
+
+const TOOL_CALLING_POLICY = `### POLÍTICA OBRIGATÓRIA DE USO DE FERRAMENTAS:
+1. SEMPRE que o usuário fizer uma pergunta ou solicitação que possa ser respondida, enriquecida ou executada por uma ferramenta disponível (ex: previsão do tempo, horário/data, pesquisas na web, notícias, cotações/preços, wikipedia, filmes/séries no IMDb, animes, dados de placa de veículo, letras de música, jogos grátis, horóscopo, rankings do chat ou executar comandos nativos do bot via execute_bot_command), você DEVE chamar a ferramenta correspondente diretamente.
+2. Priorize executar a ferramenta para trazer a resposta ou ação pronta ao usuário; você pode complementar sua resposta sugerindo e ensinando o comando correspondente do bot (ex: '!clima <cidade>').
+3. Não peça confirmação prévia nem faça perguntas antes de buscar informações de leitura ou executar comandos. Invoque a ferramenta imediatamente.
+4. Para eventos recentes, dados em tempo real ou informações fora do seu conhecimento prévio, SEMPRE use as ferramentas de busca na web (web_search / fetch_web_content).`;
 
 /**
  * Serviço para interagir com APIs de LLM
@@ -35,7 +43,9 @@ class LLMService {
 		this.DB_NAME = "llm_stats";
 
 		// Queue System
-		this.queue = new Queue({ concurrency: 1 });
+		const queueConcurrency = config.concurrency ?? 2;
+		const queueTaskTimeout = config.taskTimeout ?? 20000;
+		this.queue = new Queue({ concurrency: queueConcurrency, taskTimeout: queueTaskTimeout });
 
 		this.database.getSQLiteDb(
 			this.DB_NAME,
@@ -48,17 +58,21 @@ class LLMService {
 				request_type TEXT,
 				input_tokens INTEGER,
 				output_tokens INTEGER,
-				is_success INTEGER DEFAULT 1
+				is_success INTEGER DEFAULT 1,
+				api_user TEXT
 			);
 			CREATE INDEX IF NOT EXISTS idx_timestamp ON usage_stats(timestamp);
 			`,
 			true
 		);
 
-		// Migration: Add is_success column if it doesn't exist
+		// Migration: Add is_success and api_user columns if they don't exist
 		try {
 			this.database
 				.dbRun(this.DB_NAME, `ALTER TABLE usage_stats ADD COLUMN is_success INTEGER DEFAULT 1`)
+				.catch(() => {}); // Ignore error if column already exists
+			this.database
+				.dbRun(this.DB_NAME, `ALTER TABLE usage_stats ADD COLUMN api_user TEXT`)
 				.catch(() => {}); // Ignore error if column already exists
 		} catch (e) {
 			// Silent fail on migration error
@@ -68,7 +82,1430 @@ class LLMService {
 		this.buildProviders();
 
 		this.lastQueueChangeTimestamp = 0;
-		this.resetQueueTimeout = 60 * 1000; // 60 segundos
+		this.resetQueueTimeout = 30 * 1000; // 30 segundos
+	}
+
+	/**
+	 * Definição das ferramentas/functions disponíveis para o LLM.
+	 * @returns {Array<Object>}
+	 */
+	getTools() {
+		return [
+			{
+				type: "function",
+				function: {
+					name: "web_search",
+					description:
+						"Pesquisa na web por informações atualizadas, notícias, preços, fatos recentes ou respostas para perguntas gerais quando o link exato não for conhecido.",
+					parameters: {
+						type: "object",
+						properties: {
+							query: {
+								type: "string",
+								description: "Termos ou frase de busca (ex: 'peugeot 207 preco tabela fipe hoje')"
+							}
+						},
+						required: ["query"]
+					}
+				}
+			},
+			{
+				type: "function",
+				function: {
+					name: "fetch_web_content",
+					description:
+						"Busca e extrai o conteúdo textual ou markdown de uma URL da web para obter informações detalhadas ou consultar links completos.",
+					parameters: {
+						type: "object",
+						properties: {
+							url: {
+								type: "string",
+								description: "A URL completa da página web (ex: https://exemplo.com/noticia)"
+							}
+						},
+						required: ["url"]
+					}
+				}
+			},
+			{
+				type: "function",
+				function: {
+					name: "list_commands",
+					description:
+						"Lista comandos reais do bot Ravena e suas instruções de uso. Permite listar todas as categorias disponíveis, ver todos os comandos de uma categoria específica, detalhar a sintaxe e exemplos de uso de um comando específico, ou buscar por funcionalidade.",
+					parameters: {
+						type: "object",
+						properties: {
+							category: {
+								type: "string",
+								description:
+									"Nome da categoria para listar todos os seus comandos (ex: 'stickers', 'ia', 'jogos', 'downloaders', 'voz', 'utilidades', 'gerenciamento', 'mudae', 'busca', 'geral', 'midia', 'interacao', 'all')."
+							},
+							command: {
+								type: "string",
+								description:
+									"Nome de um comando específico para ver seus detalhes, descrição e exemplos de uso (ex: 'pescar', 'imagine', 'g-addCmd', 's', 'stt', 'clima', 'roletarussa', 'mu-roll')."
+							},
+							query: {
+								type: "string",
+								description: "Termo ou palavra-chave para buscar comandos e recursos relacionados."
+							}
+						},
+						required: []
+					}
+				}
+			},
+			{
+				type: "function",
+				function: {
+					name: "commands_helper",
+					description:
+						"Consulta informações, sintaxe, exemplos de uso, categorias, tags e detalhes técnicos de implementação de comandos e recursos do bot Ravena e de gerenciamento de grupos (!g-).",
+					parameters: {
+						type: "object",
+						properties: {
+							query: {
+								type: "string",
+								description:
+									"Termo de busca, nome do comando ou funcionalidade (ex: 'pesca', 'criar comando personalizado', 'filtros de grupo', 'tts', 'clima')"
+							},
+							category: {
+								type: "string",
+								description: "Categoria opcional para filtrar os comandos."
+							},
+							command: {
+								type: "string",
+								description: "Nome de comando específico para buscar detalhes e exemplos de uso."
+							}
+						},
+						required: []
+					}
+				}
+			},
+			{
+				type: "function",
+				function: {
+					name: "get_current_time",
+					description:
+						"Retorna a data atual, horário preciso em tempo real, dia da semana, mês, ano e fuso horário oficial (America/Sao_Paulo / UTC-3). Use sempre que precisar saber que dia ou hora é hoje.",
+					parameters: {
+						type: "object",
+						properties: {},
+						required: []
+					}
+				}
+			},
+			{
+				type: "function",
+				function: {
+					name: "get_weather",
+					description:
+						"Consulta a previsão do tempo meteorológica detalhada e atualizada em tempo real (temperatura atual, sensação térmica, umidade, vento, chuva e previsão dos próximos dias) para uma cidade ou estado.",
+					parameters: {
+						type: "object",
+						properties: {
+							city: {
+								type: "string",
+								description:
+									"Nome da cidade e opcionalmente estado/país (ex: 'São Paulo', 'Belo Horizonte - MG', 'Lisboa')"
+							}
+						},
+						required: ["city"]
+					}
+				}
+			},
+			{
+				type: "function",
+				function: {
+					name: "search_wikipedia",
+					description:
+						"Pesquisa na enciclopédia Wikipédia em português por resumos confiáveis, artigos históricos, biografias, conceitos científicos e fatos.",
+					parameters: {
+						type: "object",
+						properties: {
+							query: {
+								type: "string",
+								description:
+									"Termo, nome ou assunto a pesquisar na Wikipedia (ex: 'Albert Einstein', 'Inteligência Artificial', 'Segunda Guerra Mundial')"
+							}
+						},
+						required: ["query"]
+					}
+				}
+			},
+			{
+				type: "function",
+				function: {
+					name: "search_imdb",
+					description:
+						"Pesquisa informações detalhadas sobre filmes, séries e programas de TV no IMDb (ano, nota, sinopse, diretor, elenco, gênero, duração).",
+					parameters: {
+						type: "object",
+						properties: {
+							title: {
+								type: "string",
+								description:
+									"Título do filme ou série a pesquisar (ex: 'Interestelar', 'Breaking Bad', 'O Poderoso Chefão')"
+							}
+						},
+						required: ["title"]
+					}
+				}
+			},
+			{
+				type: "function",
+				function: {
+					name: "search_anime",
+					description:
+						"Pesquisa informações detalhadas sobre animes japoneses no MyAnimeList (episódios, estúdio, nota, ranking, status de exibição, sinopse em português).",
+					parameters: {
+						type: "object",
+						properties: {
+							name: {
+								type: "string",
+								description:
+									"Nome do anime a pesquisar (ex: 'Naruto', 'Frieren', 'Attack on Titan', 'Death Note')"
+							}
+						},
+						required: ["name"]
+					}
+				}
+			},
+			{
+				type: "function",
+				function: {
+					name: "query_vehicle_plate",
+					description:
+						"Consulta dados cadastrais, modelo, ano de fabricação, cor, município e histórico de preços na Tabela FIPE de um veículo brasileiro através de sua placa (antiga ou Mercosul).",
+					parameters: {
+						type: "object",
+						properties: {
+							plate: {
+								type: "string",
+								description: "Placa do veículo a consultar (ex: 'ABC1234' ou 'ABC1D23')"
+							}
+						},
+						required: ["plate"]
+					}
+				}
+			},
+			{
+				type: "function",
+				function: {
+					name: "check_live_streams",
+					description:
+						"Verifica o status em tempo real das transmissões e canais de streamers monitorados pelo bot (Twitch, Kick e YouTube), exibindo quem está ao vivo, jogo, título e espectadores.",
+					parameters: {
+						type: "object",
+						properties: {
+							platform: {
+								type: "string",
+								description:
+									"Plataforma opcional para filtrar: 'twitch', 'kick', 'youtube' ou 'all' (padrão: 'all')"
+							}
+						},
+						required: []
+					}
+				}
+			},
+			{
+				type: "function",
+				function: {
+					name: "query_metar_aviation",
+					description:
+						"Consulta o boletim meteorológico oficial de aeródromos e aeroportos (METAR/TAF) para aviação a partir do código ICAO do aeroporto (ex: SBGR para Guarulhos, SBRJ para Santos Dumont, SBPA para Porto Alegre).",
+					parameters: {
+						type: "object",
+						properties: {
+							icao: {
+								type: "string",
+								description:
+									"Código ICAO de 4 letras do aeroporto (ex: 'SBGR', 'SBSP', 'SBGL', 'SBRJ', 'SBPA')"
+							}
+						},
+						required: ["icao"]
+					}
+				}
+			},
+			{
+				type: "function",
+				function: {
+					name: "search_lyrics",
+					description:
+						"Pesquisa e retorna a letra completa de uma música (com nome da faixa, artista e letra sincronizada/original).",
+					parameters: {
+						type: "object",
+						properties: {
+							query: {
+								type: "string",
+								description:
+									"Nome da música e opcionalmente o artista (ex: 'Bohemian Rhapsody Queen', 'Tempo Perdido Legião Urbana')"
+							}
+						},
+						required: ["query"]
+					}
+				}
+			},
+			{
+				type: "function",
+				function: {
+					name: "get_gaming_freebies",
+					description:
+						"Consulta e lista jogos gratuitos, brindes, DLCs e promoções de 100% de desconto disponíveis no momento para resgate (Steam, Epic Games, GOG, PC, consoles) e o valor total economizado.",
+					parameters: {
+						type: "object",
+						properties: {
+							platform: {
+								type: "string",
+								description:
+									"Plataforma opcional para filtrar: 'pc', 'steam', 'epic-games-store', 'gog', 'ps4', 'ps5', 'xbox-one', 'all' (padrão: 'all')"
+							}
+						},
+						required: []
+					}
+				}
+			},
+			{
+				type: "function",
+				function: {
+					name: "search_steam",
+					description:
+						"Pesquisa informações, preços atuais em Reais (BRL), porcentagens de desconto e detalhes de jogos na loja da Steam (Steam Store), ou consulta conquistas/platinas de um usuário.",
+					parameters: {
+						type: "object",
+						properties: {
+							query: {
+								type: "string",
+								description:
+									"Nome do jogo para pesquisar o preço/dados, ou nome de usuário da Steam"
+							},
+							type: {
+								type: "string",
+								description:
+									"Tipo de consulta: 'game' (padrão) para pesquisar jogo/preço na loja, ou 'profile' para platinas de usuário",
+								enum: ["game", "profile"]
+							}
+						},
+						required: ["query"]
+					}
+				}
+			},
+			{
+				type: "function",
+				function: {
+					name: "get_daily_horoscope",
+					description:
+						"Consulta a previsão diária do horóscopo e astrologia para um signo específico do zodíaco ou para todos os signos (Áries, Touro, Gêmeos, Câncer, Leão, Virgem, Libra, Escorpião, Sagitário, Capricórnio, Aquário, Peixes).",
+					parameters: {
+						type: "object",
+						properties: {
+							signo: {
+								type: "string",
+								description:
+									"Nome do signo do zodíaco (ex: 'Áries', 'Touro', 'Gêmeos', 'Câncer', 'Leão', 'Virgem', 'Libra', 'Escorpião', 'Sagitário', 'Capricórnio', 'Aquário', 'Peixes') ou vazio para todos"
+							}
+						},
+						required: []
+					}
+				}
+			},
+			{
+				type: "function",
+				function: {
+					name: "get_group_ranking_stats",
+					description:
+						"Consulta o ranking e estatísticas dos membros mais ativos e com mais mensagens enviadas no grupo do WhatsApp atual.",
+					parameters: {
+						type: "object",
+						properties: {},
+						required: []
+					}
+				}
+			},
+			{
+				type: "function",
+				function: {
+					name: "execute_bot_command",
+					description:
+						"Executa um comando ou funcionalidade nativa do bot Ravena no chat (ex: 'pescar', 'd20', 'roll', 'slots', 'audio', 's', 'tarot', 'figrandom', etc.) ou comando personalizado do grupo quando o usuário solicitar para realizar uma ação, jogar ou invocar um recurso em vez de apenas tirar uma dúvida.",
+					parameters: {
+						type: "object",
+						properties: {
+							command: {
+								type: "string",
+								description:
+									"Nome do comando a ser executado sem o prefixo '!' (ex: 'pescar', 'd20', 'roll', 'slots', 'audio', 'tarot', 'figrandom', 's')"
+							},
+							args: {
+								type: "string",
+								description:
+									"Argumentos adicionais do comando, se houver (ex: '20' para rolar d20, 'gemidão' para áudio, etc.)"
+							}
+						},
+						required: ["command"]
+					}
+				}
+			}
+		];
+	}
+
+	/**
+	 * Decodifica URLs redirecionadas do Bing (formato /ck/a?&u=a1<base64>).
+	 * @param {string} rawUrl - URL bruta do Bing
+	 * @returns {string} - URL real decodificada
+	 * @private
+	 */
+	_decodeBingUrl(rawUrl) {
+		if (!rawUrl) return "";
+		if (rawUrl.startsWith("http://") || rawUrl.startsWith("https://")) {
+			if (rawUrl.includes("bing.com/ck/a?")) {
+				const uMatch = rawUrl.match(/[?&]u=a1([^&]+)/);
+				if (uMatch) {
+					try {
+						let base64 = uMatch[1].replace(/[-_]/g, (m) => (m === "-" ? "+" : "/"));
+						while (base64.length % 4 !== 0) base64 += "=";
+						return Buffer.from(base64, "base64").toString("utf8");
+					} catch (e) {}
+				}
+			}
+			return rawUrl;
+		}
+		return rawUrl;
+	}
+
+	/**
+	 * Realiza pesquisa na web usando DuckDuckGo com fallbacks para Bing e DDG Instant Answer.
+	 * @param {string} query - Termo de busca
+	 * @returns {Promise<string>} - Resultados formatados ou mensagem amigável
+	 */
+	async searchWeb(query) {
+		if (!query || typeof query !== "string") {
+			return "Nenhum termo de pesquisa fornecido.";
+		}
+
+		const cleanQuery = query.trim();
+		this.logger.info(`[searchWeb] Iniciando busca web para: "${cleanQuery}"`);
+
+		// Tentativa 1: DuckDuckGo HTML
+		try {
+			this.logger.info(`[searchWeb] [Tentativa 1 - DuckDuckGo] Buscando "${cleanQuery}"`);
+			const res = await axios.get("https://html.duckduckgo.com/html/", {
+				params: { q: cleanQuery },
+				headers: {
+					"User-Agent":
+						"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/119.0",
+					Accept:
+						"text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+					"Accept-Language": "pt-BR,pt;q=0.8,en-US;q=0.5,en;q=0.3",
+					"Sec-Fetch-Dest": "document",
+					"Sec-Fetch-Mode": "navigate",
+					"Sec-Fetch-Site": "none",
+					"Sec-Fetch-User": "?1",
+					"Upgrade-Insecure-Requests": "1"
+				},
+				timeout: 10000
+			});
+
+			const $ = cheerio.load(res.data);
+			const results = [];
+			$(".result").each((i, el) => {
+				if (results.length >= 5) return;
+				const title = $(el).find(".result__title a").text().trim();
+				let rawUrl = $(el).find(".result__title a").attr("href");
+				const snippet = $(el).find(".result__snippet").text().trim();
+				if (rawUrl && rawUrl.includes("uddg=")) {
+					const match = rawUrl.match(/uddg=([^&]+)/);
+					if (match) rawUrl = decodeURIComponent(match[1]);
+				}
+				if (title && rawUrl) {
+					results.push({ title, url: rawUrl, snippet });
+				}
+			});
+
+			if (results.length > 0) {
+				this.logger.info(
+					`[searchWeb] [Tentativa 1 - DuckDuckGo] Sucesso! ${results.length} resultados encontrados.`
+				);
+				let formatted = `Resultados da busca web para "${cleanQuery}":\n\n`;
+				results.forEach((r, idx) => {
+					formatted += `${idx + 1}. **${r.title}**\n   Link: ${r.url}\n`;
+					if (r.snippet) formatted += `   Resumo: ${r.snippet}\n`;
+					formatted += `\n`;
+				});
+				return formatted.trim();
+			}
+		} catch (ddgErr) {
+			this.logger.warn(
+				`[searchWeb] [Tentativa 1 - DuckDuckGo] Falhou (${ddgErr.message}). Tentando fallback (Bing)...`
+			);
+		}
+
+		// Tentativa 2: Bing
+		try {
+			this.logger.info(`[searchWeb] [Tentativa 2 - Bing] Buscando "${cleanQuery}"`);
+			const res = await axios.get("https://www.bing.com/search", {
+				params: { q: cleanQuery, setlang: "pt-br", setmkt: "pt-BR" },
+				headers: {
+					"User-Agent":
+						"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+					"Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7"
+				},
+				timeout: 10000
+			});
+
+			const $ = cheerio.load(res.data);
+			const results = [];
+			$(".b_algo").each((i, el) => {
+				if (results.length >= 5) return;
+				const title = $(el).find("h2 a").text().trim();
+				const rawUrl = $(el).find("h2 a").attr("href");
+				const url = this._decodeBingUrl(rawUrl);
+				const snippet = $(el).find(".b_caption p, .b_algoSlug, .b_lineclamp2, p").text().trim();
+				if (title && url) {
+					results.push({ title, url, snippet });
+				}
+			});
+
+			if (results.length > 0) {
+				this.logger.info(
+					`[searchWeb] [Tentativa 2 - Bing] Sucesso! ${results.length} resultados encontrados.`
+				);
+				let formatted = `Resultados da busca web para "${cleanQuery}":\n\n`;
+				results.forEach((r, idx) => {
+					formatted += `${idx + 1}. **${r.title}**\n   Link: ${r.url}\n`;
+					if (r.snippet) formatted += `   Resumo: ${r.snippet}\n`;
+					formatted += `\n`;
+				});
+				return formatted.trim();
+			}
+		} catch (bingErr) {
+			this.logger.warn(`[searchWeb] [Tentativa 2 - Bing] Falhou (${bingErr.message}).`);
+		}
+
+		// Tentativa 3: DuckDuckGo Instant Answer API
+		try {
+			this.logger.info(`[searchWeb] [Tentativa 3 - DDG Instant Answer] Buscando "${cleanQuery}"`);
+			const res = await axios.get("https://api.duckduckgo.com/", {
+				params: { q: cleanQuery, format: "json", no_html: 1, skip_disambig: 1 },
+				headers: {
+					"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+				},
+				timeout: 8000
+			});
+
+			const results = [];
+			if (res.data.AbstractText) {
+				results.push({
+					title: res.data.Heading || "Resumo",
+					url: res.data.AbstractURL || "",
+					snippet: res.data.AbstractText
+				});
+			}
+			if (Array.isArray(res.data.RelatedTopics)) {
+				for (const topic of res.data.RelatedTopics) {
+					if (results.length >= 5) break;
+					if (topic.Text) {
+						results.push({
+							title: topic.Text.slice(0, 50),
+							url: topic.FirstURL || "",
+							snippet: topic.Text
+						});
+					}
+				}
+			}
+
+			if (results.length > 0) {
+				this.logger.info(
+					`[searchWeb] [Tentativa 3 - DDG Instant Answer] Sucesso! ${results.length} resultados encontrados.`
+				);
+				let formatted = `Resultados da busca web para "${cleanQuery}":\n\n`;
+				results.forEach((r, idx) => {
+					formatted += `${idx + 1}. **${r.title}**\n`;
+					if (r.url) formatted += `   Link: ${r.url}\n`;
+					if (r.snippet) formatted += `   Resumo: ${r.snippet}\n`;
+					formatted += `\n`;
+				});
+				return formatted.trim();
+			}
+		} catch (ddgApiErr) {
+			this.logger.error(`[searchWeb] [Tentativa 3 - DDG API] Falhou: ${ddgApiErr.message}`);
+		}
+
+		return `Não foi possível encontrar resultados na pesquisa web para "${cleanQuery}".`;
+	}
+
+	/**
+	 * Extrai conteúdo de uma URL usando Jina Reader com fallback para Cheerio.
+	 * @param {string} url - URL para extração de conteúdo
+	 * @returns {Promise<string>} - Conteúdo extraído ou mensagem de erro amigável
+	 */
+	async fetchWebContent(url) {
+		if (!url || typeof url !== "string") {
+			return "Não foi possível completar a extração de conteúdo desta URL.";
+		}
+
+		let targetUrl = url.trim();
+		if (!targetUrl.startsWith("http://") && !targetUrl.startsWith("https://")) {
+			targetUrl = `https://${targetUrl}`;
+		}
+
+		this.logger.info(`[fetchWebContent] Iniciando busca para URL: ${targetUrl}`);
+
+		// Tentativa 1: Jina Reader (https://r.jina.ai/<URL>)
+		try {
+			this.logger.info(
+				`[fetchWebContent] [Tentativa 1 - Jina Reader] Requisitando https://r.jina.ai/${targetUrl}`
+			);
+			const headers = {
+				"User-Agent":
+					"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+			};
+			if (process.env.JINA_API_KEY) {
+				headers.Authorization = `Bearer ${process.env.JINA_API_KEY.trim()}`;
+			}
+
+			const jinaResponse = await axios.get(`https://r.jina.ai/${targetUrl}`, {
+				headers,
+				timeout: 15000
+			});
+
+			if (jinaResponse.status === 200 && jinaResponse.data) {
+				const content =
+					typeof jinaResponse.data === "string"
+						? jinaResponse.data.trim()
+						: JSON.stringify(jinaResponse.data);
+
+				if (content.length > 0) {
+					this.logger.info(
+						`[fetchWebContent] [Tentativa 1 - Jina Reader] Sucesso! Conteúdo extraído (${content.length} caracteres)`
+					);
+					this.logger.debug(
+						`[fetchWebContent] Amostra do conteúdo Jina: ${this.summarizeString(content)}`
+					);
+					// Limita tamanho para não estourar contexto do modelo
+					return content.length > 20000
+						? `${content.slice(0, 20000)}\n\n[Conteúdo truncado...]`
+						: content;
+				}
+			}
+			throw new Error(`Resposta vazia ou status inválido: ${jinaResponse.status}`);
+		} catch (jinaError) {
+			this.logger.warn(
+				`[fetchWebContent] [Tentativa 1 - Jina Reader] Falhou (${jinaError.message}). Acionando Tentativa 2 (Cheerio)...`
+			);
+
+			// Tentativa 2: Cheerio (GET direto na URL e parsing de HTML)
+			try {
+				this.logger.info(
+					`[fetchWebContent] [Tentativa 2 - Cheerio] Requisitando diretamente ${targetUrl}`
+				);
+				const directResponse = await axios.get(targetUrl, {
+					headers: {
+						"User-Agent":
+							"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+						Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+					},
+					timeout: 15000
+				});
+
+				if (directResponse.status === 200 && directResponse.data) {
+					const html = typeof directResponse.data === "string" ? directResponse.data : "";
+					if (html.length > 0) {
+						const $ = cheerio.load(html);
+
+						// Remover tags de lixo
+						$("script, style, nav, footer, header, noscript, iframe, svg").remove();
+
+						// Extrair texto útil
+						let extractedText = "";
+						const article = $("article, main");
+						if (article.length > 0) {
+							extractedText = article.text();
+						} else {
+							extractedText = $("body").text();
+						}
+
+						// Limpar espaços em branco excessivos
+						const cleanedText = extractedText
+							.replace(/[ \t]+/g, " ")
+							.replace(/\n\s*\n+/g, "\n\n")
+							.trim();
+
+						if (cleanedText.length > 0) {
+							this.logger.info(
+								`[fetchWebContent] [Tentativa 2 - Cheerio] Sucesso! Conteúdo extraído (${cleanedText.length} caracteres)`
+							);
+							this.logger.debug(
+								`[fetchWebContent] Amostra do conteúdo Cheerio: ${this.summarizeString(cleanedText)}`
+							);
+							return cleanedText.length > 20000
+								? `${cleanedText.slice(0, 20000)}\n\n[Conteúdo truncado...]`
+								: cleanedText;
+						}
+					}
+				}
+				throw new Error(
+					`Cheerio não conseguiu extrair texto da página (status ${directResponse.status})`
+				);
+			} catch (cheerioError) {
+				this.logger.error(
+					`[fetchWebContent] [Tentativa 2 - Cheerio] Falhou (${cheerioError.message}). Acionando Fallback Seguro...`
+				);
+
+				// Tentativa 3: Fallback Seguro
+				return "Não foi possível completar a extração de conteúdo desta URL.";
+			}
+		}
+	}
+
+	/**
+	 * Consulta a documentação de comandos e funcionalidades da Ravena via CommandsHelper
+	 * @param {string} query - Termo de busca
+	 * @returns {Promise<string>}
+	 */
+	async searchCommands(query) {
+		try {
+			this.logger.info(`[searchCommands] Consultando CommandsHelper para: "${query}"`);
+			const helperInstance = CommandsHelper.getInstance();
+			const result = helperInstance.listCommands({ query });
+			return result;
+		} catch (error) {
+			this.logger.error(`[searchCommands] Erro ao consultar comandos: ${error.message}`);
+			return "Erro ao consultar informações dos comandos no momento.";
+		}
+	}
+
+	/**
+	 * Consulta comandos, categorias e instruções de uso no CommandsHelper
+	 * @param {Object} args - Argumentos ({ category, command, query })
+	 * @returns {Promise<string>}
+	 */
+	async listCommands(args = {}) {
+		try {
+			this.logger.info(`[listCommands] Consultando CommandsHelper com args:`, args);
+			const helperInstance = CommandsHelper.getInstance();
+			const result = helperInstance.listCommands(args);
+			return result;
+		} catch (error) {
+			this.logger.error(`[listCommands] Erro ao consultar comandos: ${error.message}`);
+			return "Erro ao consultar informações dos comandos no momento.";
+		}
+	}
+
+	/**
+	 * Despacha e executa uma chamada de ferramenta com tratamento unificado de erros
+	 * @param {string} fnName - Nome da função chamada pelo modelo
+	 * @param {Object} args - Argumentos passados
+	 * @param {Object} [options] - Opções originais da requisição (contexto do grupo, chatId, etc.)
+	 * @returns {Promise<string>}
+	 */
+	/**
+	 * Extrai chamadas de ferramentas a partir de respostas em XML/MiniMax nativo quando não vêm no JSON.
+	 * @param {string} content - Conteúdo da mensagem retornado pelo modelo
+	 * @returns {Array<Object>|null} - Lista de tool_calls no padrão OpenAI ou null se não houver
+	 * @private
+	 */
+	_extractXmlToolCalls(content) {
+		if (typeof content !== "string") return null;
+
+		// Checagem rápida de gatilhos
+		if (
+			!content.includes("minimax") &&
+			!content.includes("<tool_call") &&
+			!content.includes("<invoke")
+		) {
+			return null;
+		}
+
+		// Remove tokens de controle do MiniMax
+		const normalized = content
+			.replace(/\]<\]minimax\[>[\][]?/gi, "")
+			.replace(/<\|minimax:[^>]*\|>/gi, "")
+			.replace(/\[minimax\]/gi, "");
+
+		const invokeRegex =
+			/<invoke\s+name=["']([^"']+)["']>([\s\S]*?)(?:<\/invoke>|(?=<\/?invoke|<\/(?:minimax:)?tool_call>|$))/gi;
+		const toolCalls = [];
+		let match;
+
+		while ((match = invokeRegex.exec(normalized)) !== null) {
+			let fnName = match[1].trim();
+			const body = match[2];
+
+			// Normalização de aliases comuns
+			if (fnName === "web_fetch" || fnName === "get") {
+				fnName = "fetch_web_content";
+			} else if (fnName === "google_search" || fnName === "search") {
+				fnName = "web_search";
+			}
+
+			const args = {};
+
+			// Tenta extrair tags do tipo <parameter name="key">val</parameter>
+			const paramRegex = /<parameter\s+name=["']([^"']+)["']>([\s\S]*?)<\/parameter>/gi;
+			let paramMatch;
+			let foundParams = false;
+			while ((paramMatch = paramRegex.exec(body)) !== null) {
+				foundParams = true;
+				const key = paramMatch[1].trim();
+				const val = paramMatch[2].trim();
+				args[key] = val;
+			}
+
+			// Se não encontrou parâmetros nomeados, extrai tags diretas como <query>val</query>, <url>val</url>
+			if (!foundParams) {
+				const tagRegex = /<([a-zA-Z0-9_-]+)>([\s\S]*?)<\/\1>/gi;
+				let tagMatch;
+				while ((tagMatch = tagRegex.exec(body)) !== null) {
+					const key = tagMatch[1].trim();
+					const val = tagMatch[2].trim();
+					if (val || !args[key]) {
+						args[key] = val;
+					}
+				}
+			}
+
+			// Se corpo tiver formato JSON direto
+			if (Object.keys(args).length === 0 && body.trim().startsWith("{")) {
+				try {
+					Object.assign(args, JSON.parse(body.trim()));
+				} catch (e) {}
+			}
+
+			toolCalls.push({
+				id: `call_xml_${Date.now()}_${toolCalls.length}`,
+				type: "function",
+				function: {
+					name: fnName,
+					arguments: JSON.stringify(args)
+				}
+			});
+		}
+
+		return toolCalls.length > 0 ? toolCalls : null;
+	}
+
+	/**
+	 * Despacha e executa uma chamada de ferramenta com tratamento unificado de erros
+	 * @param {string} fnName - Nome da função chamada pelo modelo
+	 * @param {Object} args - Argumentos passados
+	 * @param {Object} [options] - Opções originais da requisição (contexto do grupo, chatId, etc.)
+	 * @returns {Promise<string>}
+	 */
+	async executeToolCall(fnName, args = {}, options = {}) {
+		try {
+			let normalizedName = fnName;
+			if (normalizedName === "web_fetch" || (normalizedName === "get" && args.url)) {
+				normalizedName = "fetch_web_content";
+			} else if (normalizedName === "google_search" || normalizedName === "search") {
+				normalizedName = "web_search";
+			}
+
+			if (normalizedName === "web_search") {
+				this.logger.info(`[LLMService] Executando web_search para: "${args.query}"`);
+				const res = await this.searchWeb(args.query);
+				this.logger.info(`[LLMService] Resultado do web_search (${res.length} caracteres)`);
+				return res;
+			}
+
+			if (normalizedName === "fetch_web_content") {
+				this.logger.info(`[LLMService] Executando fetch_web_content para URL: ${args.url}`);
+				const res = await this.fetchWebContent(args.url);
+				this.logger.info(`[LLMService] Resultado do fetch_web_content (${res.length} caracteres)`);
+				return res;
+			}
+
+			if (normalizedName === "list_commands") {
+				this.logger.info("[LLMService] Executando list_commands com args:", args);
+				const res = await this.listCommands(args);
+				this.logger.info(`[LLMService] Resultado do list_commands (${res.length} caracteres)`);
+				return res;
+			}
+
+			if (normalizedName === "commands_helper") {
+				this.logger.info("[LLMService] Executando commands_helper com args:", args);
+				const helperArgs = args?.query ? { query: args.query, ...args } : args;
+				const res = await this.listCommands(helperArgs);
+				this.logger.info(`[LLMService] Resultado do commands_helper (${res.length} caracteres)`);
+				return res;
+			}
+
+			if (normalizedName === "get_current_time") {
+				this.logger.info("[LLMService] Executando get_current_time");
+				const res = this.getCurrentTime();
+				this.logger.info(`[LLMService] Resultado de get_current_time: ${res}`);
+				return res;
+			}
+
+			if (normalizedName === "get_weather") {
+				this.logger.info(`[LLMService] Executando get_weather para: "${args.city}"`);
+				const res = await this.getWeather(args.city);
+				this.logger.info(`[LLMService] Resultado de get_weather (${res.length} caracteres)`);
+				return res;
+			}
+
+			if (normalizedName === "search_wikipedia") {
+				this.logger.info(`[LLMService] Executando search_wikipedia para: "${args.query}"`);
+				const res = await this.searchWikipedia(args.query);
+				this.logger.info(`[LLMService] Resultado de search_wikipedia (${res.length} caracteres)`);
+				return res;
+			}
+
+			if (normalizedName === "search_imdb") {
+				const queryTitle = args.title || args.query;
+				this.logger.info(`[LLMService] Executando search_imdb para: "${queryTitle}"`);
+				const res = await this.searchImdb(queryTitle);
+				this.logger.info(`[LLMService] Resultado de search_imdb (${res.length} caracteres)`);
+				return res;
+			}
+
+			if (normalizedName === "search_anime") {
+				const animeName = args.name || args.query;
+				this.logger.info(`[LLMService] Executando search_anime para: "${animeName}"`);
+				const res = await this.searchAnime(animeName);
+				this.logger.info(`[LLMService] Resultado de search_anime (${res.length} caracteres)`);
+				return res;
+			}
+
+			if (normalizedName === "query_vehicle_plate") {
+				const plate = args.plate || args.placa || args.query;
+				this.logger.info(`[LLMService] Executando query_vehicle_plate para: "${plate}"`);
+				const res = await this.queryVehiclePlate(plate);
+				this.logger.info(
+					`[LLMService] Resultado de query_vehicle_plate (${res.length} caracteres)`
+				);
+				return res;
+			}
+
+			if (normalizedName === "check_live_streams") {
+				const platform = args.platform || "all";
+				this.logger.info(`[LLMService] Executando check_live_streams para platform: "${platform}"`);
+				const res = await this.checkLiveStreams(platform);
+				this.logger.info(`[LLMService] Resultado de check_live_streams (${res.length} caracteres)`);
+				return res;
+			}
+
+			if (normalizedName === "query_metar_aviation") {
+				const icao = args.icao || args.code || args.query;
+				this.logger.info(`[LLMService] Executando query_metar_aviation para icao: "${icao}"`);
+				const res = await this.queryMetar(icao);
+				this.logger.info(
+					`[LLMService] Resultado de query_metar_aviation (${res.length} caracteres)`
+				);
+				return res;
+			}
+
+			if (normalizedName === "search_lyrics") {
+				const queryMusic = args.query || args.song || args.music || args.title;
+				this.logger.info(`[LLMService] Executando search_lyrics para: "${queryMusic}"`);
+				const res = await this.searchMusicLyrics(queryMusic);
+				this.logger.info(`[LLMService] Resultado de search_lyrics (${res.length} caracteres)`);
+				return res;
+			}
+
+			if (normalizedName === "get_gaming_freebies") {
+				const platform = args.platform || "all";
+				this.logger.info(
+					`[LLMService] Executando get_gaming_freebies para platform: "${platform}"`
+				);
+				const res = await this.getGamingFreebies(platform);
+				this.logger.info(
+					`[LLMService] Resultado de get_gaming_freebies (${res.length} caracteres)`
+				);
+				return res;
+			}
+
+			if (normalizedName === "search_steam") {
+				const query = args.query || args.game || args.user;
+				const type = args.type || "game";
+				this.logger.info(`[LLMService] Executando search_steam (${type}) para: "${query}"`);
+				const res = await this.searchSteam(query, type);
+				this.logger.info(`[LLMService] Resultado de search_steam (${res.length} caracteres)`);
+				return res;
+			}
+
+			if (normalizedName === "get_daily_horoscope") {
+				const signo = args.signo || args.sign || "";
+				this.logger.info(`[LLMService] Executando get_daily_horoscope para signo: "${signo}"`);
+				const res = await this.getDailyHoroscope(signo);
+				this.logger.info(
+					`[LLMService] Resultado de get_daily_horoscope (${res.length} caracteres)`
+				);
+				return res;
+			}
+
+			if (normalizedName === "get_group_ranking_stats") {
+				const chatId = args.chatId || options.chatId || options.groupId || options.group?.id;
+				this.logger.info(
+					`[LLMService] Executando get_group_ranking_stats para chatId: "${chatId}"`
+				);
+				const res = await this.getGroupRankingStats(chatId);
+				this.logger.info(
+					`[LLMService] Resultado de get_group_ranking_stats (${res.length} caracteres)`
+				);
+				return res;
+			}
+
+			if (normalizedName === "execute_bot_command") {
+				this.logger.info("[LLMService] Executando execute_bot_command:", args);
+				const res = await this.executeBotCommand(args, options);
+				this.logger.info(
+					`[LLMService] Resultado de execute_bot_command (${res.length} caracteres)`
+				);
+				return res;
+			}
+
+			if (typeof this[normalizedName] === "function") {
+				return await this[normalizedName](args);
+			}
+
+			return "Ferramenta não reconhecida.";
+		} catch (err) {
+			this.logger.error(`[LLMService] Erro ao executar tool ${fnName}:`, err.message);
+			return `Erro ao executar ferramenta ${fnName}: ${err.message}`;
+		}
+	}
+
+	/**
+	 * Executa um comando real do bot Ravena a pedido da LLM
+	 * @param {Object} args - Argumentos da ferramenta ({ command: string, args?: string })
+	 * @param {Object} options - Opções da requisição (contém bot, message, group)
+	 * @returns {Promise<string>} - Resultado em texto para a LLM
+	 */
+	async executeBotCommand(args, options = {}) {
+		const bot = options.bot;
+		const message = options.message;
+		const group = options.group;
+
+		if (!bot || !message) {
+			return "Erro: Contexto de chat/bot não disponível para executar o comando.";
+		}
+
+		const rawCmd = args?.command || args?.cmd || "";
+		const cmdName = String(rawCmd)
+			.replace(/^[!/.]/, "")
+			.trim()
+			.toLowerCase();
+		const argsStr = args?.args ? String(args.args).trim() : "";
+
+		if (!cmdName) {
+			return "Erro: Nome do comando não especificado.";
+		}
+
+		// Bloqueia comandos de IA e comandos dependentes de LLM para evitar auto-recursão e deadlock de fila
+		const llmAliases = [
+			"ai",
+			"ia",
+			"gemini",
+			"gpt",
+			"ajuda",
+			"help",
+			"traduza",
+			"traduzir",
+			"tr",
+			"translate",
+			"ocr",
+			"tarot",
+			"anagrama",
+			"stop",
+			"resumo",
+			"resumir",
+			"anoni",
+			"anonimo",
+			"anonima"
+		];
+		if (llmAliases.includes(cmdName)) {
+			return `Comando de IA não pode ser executado recursivamente por outra IA. O comando '!${cmdName}' utiliza o modelo de linguagem.`;
+		}
+
+		const fixedCommands = bot.eventHandler?.commandHandler?.fixedCommands;
+		if (!fixedCommands) {
+			return "Erro: Módulo de comandos fixos não inicializado no bot.";
+		}
+
+		const fixedCmd = fixedCommands.getCommand(cmdName);
+		if (!fixedCmd) {
+			// Verifica se é um comando personalizado do grupo
+			if (group && group.id && bot.eventHandler?.commandHandler) {
+				const commandHandler = bot.eventHandler.commandHandler;
+				const customCommands = commandHandler.customCommands?.[group.id] || [];
+				const cmdArgs = argsStr.length > 0 ? argsStr.split(" ").filter((a) => a.length > 0) : [];
+				const matchResult = commandHandler.findCustomCommand(cmdName, customCommands, cmdArgs);
+
+				if (matchResult) {
+					const { customCommand, newArgs } = matchResult;
+					this.logger.info(
+						`[LLMService] Invocando comando personalizado '!${customCommand.startsWith}' com args: "${newArgs.join(" ")}"`
+					);
+
+					// Clona a mensagem de forma rasa para configurar a invocação do comando
+					const cmdMessage = Object.assign(Object.create(Object.getPrototypeOf(message)), message);
+					const fullCommandString = `!${customCommand.startsWith} ${newArgs.join(" ")}`.trim();
+
+					if (cmdMessage.type === "image" || cmdMessage.type === "video" || cmdMessage.hasMedia) {
+						cmdMessage.caption = fullCommandString;
+					} else {
+						cmdMessage.body = fullCommandString;
+						cmdMessage.content = fullCommandString;
+					}
+
+					const result = await commandHandler.executeCustomCommand(
+						bot,
+						cmdMessage,
+						customCommand,
+						newArgs,
+						group,
+						true
+					);
+
+					let textOutput = "";
+					const items = Array.isArray(result) ? result : result ? [result] : [];
+
+					for (const item of items) {
+						if (typeof item === "string") {
+							textOutput += (textOutput ? "\n" : "") + item;
+						} else if (item && typeof item === "object") {
+							if (typeof item.content === "string" && item.content.trim()) {
+								textOutput += (textOutput ? "\n" : "") + item.content.trim();
+							}
+							if (typeof item.options?.caption === "string" && item.options.caption.trim()) {
+								textOutput += (textOutput ? "\n" : "") + item.options.caption.trim();
+							}
+							// Se o comando gerou mídia (sticker, imagem, etc.), preserva para envio
+							if (item.options?.sendMediaAsSticker || item.media || item.options?.sendAsDocument) {
+								if (!options.pendingReturnMessages) options.pendingReturnMessages = [];
+								options.pendingReturnMessages.push(item);
+							}
+						}
+					}
+
+					if (!textOutput) {
+						if (items.length > 0) {
+							textOutput = `Comando personalizado !${customCommand.startsWith} executado com sucesso (resposta multimídia gerada).`;
+						} else {
+							textOutput = `Comando personalizado !${customCommand.startsWith} executado sem mensagens de retorno.`;
+						}
+					}
+
+					const customArgsStr = newArgs.length > 0 ? ` ${newArgs.join(" ")}` : "";
+					return `[Resultado da execução de comando personalizado !${customCommand.startsWith}${customArgsStr}]:\n${textOutput}`;
+				}
+			}
+
+			return `Comando '!${cmdName}' não encontrado no bot Ravena. Você pode usar a ferramenta 'list_commands' ou 'commands_helper' para verificar os comandos disponíveis.`;
+		}
+
+		try {
+			this.logger.info(`[LLMService] Invocando comando '!${cmdName}' com args: "${argsStr}"`);
+
+			// Clona a mensagem de forma rasa para configurar a invocação do comando
+			const cmdMessage = Object.assign(Object.create(Object.getPrototypeOf(message)), message);
+			const fullCommandString = `!${cmdName} ${argsStr}`.trim();
+
+			if (cmdMessage.type === "image" || cmdMessage.type === "video" || cmdMessage.hasMedia) {
+				cmdMessage.caption = fullCommandString;
+			} else {
+				cmdMessage.body = fullCommandString;
+				cmdMessage.content = fullCommandString;
+			}
+
+			const cmdArgs = argsStr.length > 0 ? argsStr.split(" ").filter((a) => a.length > 0) : [];
+			const result = await fixedCmd.execute(bot, cmdMessage, cmdArgs, group);
+
+			let textOutput = "";
+			const items = Array.isArray(result) ? result : result ? [result] : [];
+
+			for (const item of items) {
+				if (typeof item === "string") {
+					textOutput += (textOutput ? "\n" : "") + item;
+				} else if (item && typeof item === "object") {
+					if (typeof item.content === "string" && item.content.trim()) {
+						textOutput += (textOutput ? "\n" : "") + item.content.trim();
+					}
+					if (typeof item.options?.caption === "string" && item.options.caption.trim()) {
+						textOutput += (textOutput ? "\n" : "") + item.options.caption.trim();
+					}
+					// Se o comando gerou mídia (sticker, imagem, etc.), preserva para envio
+					if (item.options?.sendMediaAsSticker || item.media || item.options?.sendAsDocument) {
+						if (!options.pendingReturnMessages) options.pendingReturnMessages = [];
+						options.pendingReturnMessages.push(item);
+					}
+				}
+			}
+
+			if (!textOutput) {
+				if (items.length > 0) {
+					textOutput = `Comando !${cmdName} executado com sucesso (resposta multimídia gerada).`;
+				} else {
+					textOutput = `Comando !${cmdName} executado sem mensagens de retorno.`;
+				}
+			}
+
+			return `[Resultado da execução de !${cmdName} ${argsStr}]:\n${textOutput}`;
+		} catch (err) {
+			this.logger.error(`[LLMService] Erro ao executar !${cmdName}:`, err);
+			return `Erro ao executar o comando !${cmdName}: ${err.message}`;
+		}
+	}
+
+	/**
+	 * Consulta jogos gratuitos e promoções 100% off no GamingFreebies
+	 * @param {string} [platform]
+	 * @returns {Promise<string>}
+	 */
+	async getGamingFreebies(platform = "all") {
+		try {
+			const { fetchFreebiesSummary } = require("../functions/GamingFreebies");
+			return await fetchFreebiesSummary(platform);
+		} catch (error) {
+			this.logger.error("[getGamingFreebies] Erro ao buscar jogos grátis:", error.message);
+			return `Erro ao buscar jogos gratuitos: ${error.message}`;
+		}
+	}
+
+	/**
+	 * Consulta jogo ou platinas na Steam via SteamCommands
+	 * @param {string} query
+	 * @param {string} [type] - "game" ou "profile"
+	 * @returns {Promise<string>}
+	 */
+	async searchSteam(query, type = "game") {
+		try {
+			if (!query || typeof query !== "string" || query.trim().length === 0) {
+				return "Por favor, informe o nome do jogo ou usuário da Steam.";
+			}
+			const { fetchSteamGameInfo, fetchSteamPlatinums } = require("../functions/SteamCommands");
+			if (type === "profile" || type === "platina" || type === "platinas") {
+				return await fetchSteamPlatinums(query);
+			}
+			return await fetchSteamGameInfo(query);
+		} catch (error) {
+			this.logger.error(`[searchSteam] Erro ao consultar Steam para ${query}:`, error.message);
+			return `Erro ao consultar Steam: ${error.message}`;
+		}
+	}
+
+	/**
+	 * Consulta horóscopo do dia via HoroscopoCommands
+	 * @param {string} [signo]
+	 * @returns {Promise<string>}
+	 */
+	async getDailyHoroscope(signo = "") {
+		try {
+			const { fetchHoroscopeInfo } = require("../functions/HoroscopoCommands");
+			return await fetchHoroscopeInfo(signo);
+		} catch (error) {
+			this.logger.error("[getDailyHoroscope] Erro ao buscar horóscopo:", error.message);
+			return `Erro ao consultar horóscopo: ${error.message}`;
+		}
+	}
+
+	/**
+	 * Consulta estatísticas e ranking de faladores do grupo via RankingMessages
+	 * @param {string} [chatId]
+	 * @returns {Promise<string>}
+	 */
+	async getGroupRankingStats(chatId) {
+		try {
+			const { fetchGroupRankingSummary } = require("../functions/RankingMessages");
+			return await fetchGroupRankingSummary(chatId);
+		} catch (error) {
+			this.logger.error("[getGroupRankingStats] Erro ao buscar ranking do grupo:", error.message);
+			return `Erro ao consultar ranking do grupo: ${error.message}`;
+		}
+	}
+
+	/**
+	 * Consulta a letra de uma música via YoutubeDownloader/LRCLib
+	 * @param {string} query - Nome da música e artista
+	 * @returns {Promise<string>}
+	 */
+	async searchMusicLyrics(query) {
+		try {
+			if (!query || typeof query !== "string" || query.trim().length === 0) {
+				return "Por favor, informe o nome da música para buscar a letra.";
+			}
+			const { searchLyrics } = require("../functions/YoutubeDownloader");
+			const res = await searchLyrics(query.trim());
+			if (!res || !res.lyrics) {
+				return `Não foi possível encontrar a letra para a música "${query}".`;
+			}
+			return `🎵 **${res.title}** - *${res.artist}*\n\n${res.lyrics}`;
+		} catch (error) {
+			this.logger.error(`[searchMusicLyrics] Erro ao buscar letra para ${query}:`, error.message);
+			return `Erro ao buscar letra: ${error.message}`;
+		}
+	}
+
+	/**
+	 * Consulta boletim METAR aeronáutico via MetarStatistics
+	 * @param {string} icao - Código ICAO do aeroporto (ex: SBGR)
+	 * @returns {Promise<string>}
+	 */
+	async queryMetar(icao) {
+		try {
+			if (!icao || typeof icao !== "string" || icao.trim().length === 0) {
+				return "Por favor, informe o código ICAO do aeroporto (ex: SBGR, SBRJ, SBPA).";
+			}
+			const { buscarMetar } = require("../functions/MetarStatistics");
+			const cleanIcao = icao.trim().toUpperCase();
+			const metarData = await buscarMetar(cleanIcao);
+			if (!metarData || metarData.toLowerCase().includes("no data found")) {
+				return `Não foi possível encontrar dados meteorológicos METAR para o aeroporto "${cleanIcao}".`;
+			}
+			return `🌤️ **METAR (${cleanIcao}):**\n\`\`\`\n${metarData}\n\`\`\``;
+		} catch (error) {
+			this.logger.error(`[queryMetar] Erro ao consultar METAR para ${icao}:`, error.message);
+			return `Erro ao consultar METAR: ${error.message}`;
+		}
+	}
+
+	/**
+	 * Consulta o resumo das lives monitoradas via StreamCommands
+	 * @param {string} platform - Plataforma ('twitch', 'kick', 'youtube', 'all')
+	 * @returns {Promise<string>}
+	 */
+	async checkLiveStreams(platform = "all") {
+		try {
+			const { getMonitoredStreamsSummary } = require("../functions/StreamCommands");
+			return await getMonitoredStreamsSummary(platform);
+		} catch (error) {
+			this.logger.error(`[checkLiveStreams] Erro ao consultar streams:`, error.message);
+			return `Erro ao consultar transmissões ao vivo: ${error.message}`;
+		}
+	}
+
+	/**
+	 * Consulta informações veiculares e FIPE via PlacasCommands
+	 * @param {string} plate - Placa do veículo
+	 * @returns {Promise<string>}
+	 */
+	async queryVehiclePlate(plate) {
+		try {
+			if (!plate || typeof plate !== "string" || plate.trim().length === 0) {
+				return "Por favor, informe uma placa de veículo válida.";
+			}
+			const { fetchVehicleInfo } = require("../functions/PlacasCommands");
+			return await fetchVehicleInfo(plate);
+		} catch (error) {
+			this.logger.error(`[queryVehiclePlate] Erro ao consultar placa ${plate}:`, error.message);
+			return `Erro ao consultar veículo: ${error.message}`;
+		}
+	}
+
+	/**
+	 * Consulta animes no MyAnimeList via AnimeCommands
+	 * @param {string} name - Nome do anime
+	 * @returns {Promise<string>}
+	 */
+	async searchAnime(name) {
+		try {
+			if (!name || typeof name !== "string" || name.trim().length === 0) {
+				return "Por favor, informe o nome do anime para pesquisar.";
+			}
+			const { fetchAnimeInfo } = require("../functions/AnimeCommands");
+			return await fetchAnimeInfo(name);
+		} catch (error) {
+			this.logger.error(`[searchAnime] Erro ao consultar anime ${name}:`, error.message);
+			return `Erro ao consultar anime: ${error.message}`;
+		}
+	}
+
+	/**
+	 * Consulta filmes e séries via ImdbCommands
+	 * @param {string} title - Nome do filme ou série
+	 * @returns {Promise<string>}
+	 */
+	async searchImdb(title) {
+		try {
+			if (!title || typeof title !== "string" || title.trim().length === 0) {
+				return "Por favor, informe o título do filme ou série para buscar no IMDb.";
+			}
+			const { fetchImdbInfo } = require("../functions/ImdbCommands");
+			return await fetchImdbInfo(title);
+		} catch (error) {
+			this.logger.error(`[searchImdb] Erro ao consultar IMDb para ${title}:`, error.message);
+			return `Erro ao consultar IMDb: ${error.message}`;
+		}
+	}
+
+	/**
+	 * Consulta a Wikipedia via WikipediaCommands
+	 * @param {string} query - Termo de busca
+	 * @returns {Promise<string>}
+	 */
+	async searchWikipedia(query) {
+		try {
+			if (!query || typeof query !== "string" || query.trim().length === 0) {
+				return "Por favor, especifique um termo para pesquisar na Wikipedia.";
+			}
+			const { fetchWikiSummary } = require("../functions/WikipediaCommands");
+			return await fetchWikiSummary(query);
+		} catch (error) {
+			this.logger.error(
+				`[searchWikipedia] Erro ao pesquisar Wikipedia para ${query}:`,
+				error.message
+			);
+			return `Erro ao pesquisar Wikipedia: ${error.message}`;
+		}
+	}
+
+	/**
+	 * Consulta dados meteorológicos via WeatherMeteo
+	 * @param {string} city - Nome da cidade
+	 * @returns {Promise<string>}
+	 */
+	async getWeather(city) {
+		try {
+			if (!city || typeof city !== "string" || city.trim().length === 0) {
+				return "Por favor, especifique o nome de uma cidade para consultar o clima.";
+			}
+			const {
+				getCityCoordinates,
+				getWeatherData,
+				formatWeatherMessage
+			} = require("../functions/WeatherMeteo");
+			const location = await getCityCoordinates(city.trim());
+			const weather = await getWeatherData(location.lat, location.lon);
+			return formatWeatherMessage(location, weather);
+		} catch (error) {
+			this.logger.error(`[getWeather] Erro ao consultar clima para ${city}:`, error.message);
+			return `Não foi possível obter dados meteorológicos para "${city}": ${error.message}`;
+		}
+	}
+
+	/**
+	 * Retorna data, hora, dia da semana e fuso horário formatados
+	 * @returns {string}
+	 */
+	getCurrentTime() {
+		const now = new Date();
+		const tz = "America/Sao_Paulo";
+		const dateOptions = { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" };
+		const timeOptions = {
+			timeZone: tz,
+			hour: "2-digit",
+			minute: "2-digit",
+			second: "2-digit",
+			hour12: false
+		};
+		const weekdayOptions = { timeZone: tz, weekday: "long" };
+
+		const dateStr = new Intl.DateTimeFormat("pt-BR", dateOptions).format(now);
+		const timeStr = new Intl.DateTimeFormat("pt-BR", timeOptions).format(now);
+		const weekday = new Intl.DateTimeFormat("pt-BR", weekdayOptions).format(now);
+
+		return JSON.stringify(
+			{
+				date: dateStr,
+				time: timeStr,
+				day_of_week: weekday,
+				timezone: tz,
+				iso: now.toISOString()
+			},
+			null,
+			2
+		);
 	}
 
 	/**
@@ -81,27 +1518,159 @@ class LLMService {
 		for (const config of llmConfigs) {
 			// Store textOnly flag for use during provider selection
 			const textOnly = config.textOnly === true;
+			const toolCalling = config.toolCalling === true;
 
 			const providerDef = {
 				name: config.name,
 				textOnly,
+				toolCalling,
+				contextLength: config.contextLength,
+				maxTokens: config.maxTokens ?? config.max_tokens,
 				method: async (options) => {
-					// Apply config values
-					if (config.model) options.model = config.model;
-					if (config.temperature !== undefined) options.temperature = config.temperature;
-					if (config.top_k !== undefined) options.top_k = config.top_k;
-					if (config.top_p !== undefined) options.top_p = config.top_p;
-					if (config.apiKey) options.apiKey = config.apiKey;
+					// Clona para evitar mutar o objeto options compartilhado entre tentativas
+					const completionOptions = { ...options };
+
+					// Aplica valores da configuração respeitando se options já definiu
+					if (config.model && !completionOptions.model) completionOptions.model = config.model;
+					if (config.temperature !== undefined && completionOptions.temperature === undefined) {
+						completionOptions.temperature = config.temperature;
+					}
+					if (config.top_k !== undefined && completionOptions.top_k === undefined) {
+						completionOptions.top_k = config.top_k;
+					}
+					if (config.top_p !== undefined && completionOptions.top_p === undefined) {
+						completionOptions.top_p = config.top_p;
+					}
+					if (config.min_p !== undefined && completionOptions.min_p === undefined) {
+						completionOptions.min_p = config.min_p;
+					}
+					if (
+						config.frequency_penalty !== undefined &&
+						completionOptions.frequency_penalty === undefined
+					) {
+						completionOptions.frequency_penalty = config.frequency_penalty;
+					}
+					if (
+						config.presence_penalty !== undefined &&
+						completionOptions.presence_penalty === undefined
+					) {
+						completionOptions.presence_penalty = config.presence_penalty;
+					}
+					if (
+						config.repetition_penalty !== undefined &&
+						completionOptions.repetition_penalty === undefined
+					) {
+						completionOptions.repetition_penalty = config.repetition_penalty;
+					}
+					// Só define maxTokens do config caso a chamada não tenha especificado
+					if (completionOptions.maxTokens === undefined) {
+						if (config.maxTokens !== undefined) completionOptions.maxTokens = config.maxTokens;
+						else if (config.max_tokens !== undefined)
+							completionOptions.maxTokens = config.max_tokens;
+					}
+					if (config.contextLength !== undefined && completionOptions.contextLength === undefined) {
+						completionOptions.contextLength = config.contextLength;
+					}
+					if (config.apiKey && !completionOptions.apiKey) completionOptions.apiKey = config.apiKey;
 					if (config.timeout_multiplier) {
-						options.timeout = options.timeout
-							? options.timeout * config.timeout_multiplier
+						completionOptions.timeout = completionOptions.timeout
+							? completionOptions.timeout * config.timeout_multiplier
 							: 30000 * config.timeout_multiplier;
 					}
-					if (config.ignoreVideo !== undefined) options.ignoreVideo = config.ignoreVideo;
+					if (config.ignoreVideo !== undefined && completionOptions.ignoreVideo === undefined) {
+						completionOptions.ignoreVideo = config.ignoreVideo;
+					}
+					if (config.toolCalling !== undefined && completionOptions.toolCalling === undefined) {
+						completionOptions.toolCalling = config.toolCalling;
+					}
 
-					const completionOptions = {
-						customEndpoint: config.url,
-						...options
+					completionOptions.customEndpoint = config.url;
+					completionOptions.providerName = config.name;
+					if (completionOptions.toolCalling === undefined) {
+						completionOptions.toolCalling = toolCalling;
+					}
+
+					const validateJsonResponse = (content) => {
+						if (!content || typeof content !== "string") return content;
+
+						const hasImages =
+							(completionOptions.images && completionOptions.images.length > 0) ||
+							completionOptions.image;
+
+						if (hasImages) {
+							const lower = content.toLowerCase();
+							if (
+								lower.includes("no vision-capable provider") ||
+								lower.includes("unable to see the image") ||
+								lower.includes("could not process image") ||
+								lower.includes("cannot process this image")
+							) {
+								const err = new Error(
+									`Provedor (${config.name}) indicou incapacidade de processar visão: ${content.slice(0, 150)}...`
+								);
+								err.isFormatError = true;
+								throw err;
+							}
+						}
+
+						if (completionOptions.response_format) {
+							try {
+								let clean = this._cleanResponse(content);
+								if (clean.startsWith("```")) {
+									clean = clean.replace(/^```(?:json)?\n?|```$/g, "").trim();
+								}
+								const parsed = JSON.parse(clean);
+								if (parsed && typeof parsed === "object") {
+									if (
+										parsed.status === "error" ||
+										parsed.error ||
+										parsed.classification === null ||
+										parsed.classification === "UNAVAILABLE" ||
+										parsed.classification === "unknown"
+									) {
+										const err = new Error(
+											`Provedor (${config.name}) retornou status de erro/indisponibilidade no JSON: ${JSON.stringify(parsed)}`
+										);
+										err.isFormatError = true;
+										throw err;
+									}
+								}
+							} catch (jsonErr) {
+								if (jsonErr.isFormatError) {
+									throw jsonErr;
+								}
+								// Tenta extrair o bloco JSON caso haja texto ao redor
+								const jsonMatch = content.match(/\{[\s\S]*\}/);
+								if (jsonMatch) {
+									try {
+										const parsed = JSON.parse(jsonMatch[0]);
+										if (
+											parsed &&
+											(parsed.status === "error" ||
+												parsed.error ||
+												parsed.classification === null ||
+												parsed.classification === "UNAVAILABLE" ||
+												parsed.classification === "unknown")
+										) {
+											const err = new Error(
+												`Provedor (${config.name}) retornou status de erro/indisponibilidade no JSON: ${JSON.stringify(parsed)}`
+											);
+											err.isFormatError = true;
+											throw err;
+										}
+										return content;
+									} catch (innerErr) {
+										if (innerErr.isFormatError) throw innerErr;
+									}
+								}
+								const err = new Error(
+									`Provedor (${config.name}) retornou resposta fora do formato JSON esperado: ${content.slice(0, 150)}...`
+								);
+								err.isFormatError = true;
+								throw err;
+							}
+						}
+						return content;
 					};
 
 					let response;
@@ -109,7 +1678,7 @@ class LLMService {
 						case "ollama":
 							response = await this.ollamaCompletion(completionOptions);
 							if (response && response.message && response.message.content) {
-								return response.message.content;
+								return validateJsonResponse(response.message.content);
 							}
 							if (
 								response &&
@@ -117,7 +1686,7 @@ class LLMService {
 								response.choices[0] &&
 								response.choices[0].message
 							) {
-								return response.choices[0].message.content;
+								return validateJsonResponse(response.choices[0].message.content);
 							}
 							throw new Error(`Resposta inválida ou vazia do Ollama (${config.name})`);
 						case "openai":
@@ -132,7 +1701,7 @@ class LLMService {
 									response.choices[0] &&
 									response.choices[0].message
 								) {
-									return response.choices[0].message.content;
+									return validateJsonResponse(response.choices[0].message.content);
 								}
 								return response;
 							}
@@ -181,14 +1750,17 @@ class LLMService {
 		}
 
 		if (promptTokens > 0 || completionTokens > 0) {
+			const elapsedMs = options._startTime ? Date.now() - options._startTime : null;
+			const timeStr = elapsedMs !== null ? ` | Time: ${elapsedMs}ms` : "";
 			this.logger.info(
-				`[TokenUsage][${provider}] Type: ${requestType} | Model: ${model} | In: ${promptTokens} | Out: ${completionTokens}`
+				`[TokenUsage][${provider}] Type: ${requestType} | Model: ${model} | In: ${promptTokens} | Out: ${completionTokens}${timeStr}`
 			);
 
+			const apiUser = options.apiUser || null;
 			try {
 				await this.database.dbRun(
 					this.DB_NAME,
-					`INSERT INTO usage_stats (timestamp, provider, model, request_type, input_tokens, output_tokens, is_success) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+					`INSERT INTO usage_stats (timestamp, provider, model, request_type, input_tokens, output_tokens, is_success, api_user) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 					[
 						Date.now(),
 						provider,
@@ -196,7 +1768,8 @@ class LLMService {
 						requestType,
 						promptTokens,
 						completionTokens,
-						isSuccess ? 1 : 0
+						isSuccess ? 1 : 0,
+						apiUser
 					]
 				);
 			} catch (e) {
@@ -204,11 +1777,12 @@ class LLMService {
 			}
 		} else if (!isSuccess) {
 			// Track failure even with 0 tokens
+			const apiUser = options.apiUser || null;
 			try {
 				await this.database.dbRun(
 					this.DB_NAME,
-					`INSERT INTO usage_stats (timestamp, provider, model, request_type, input_tokens, output_tokens, is_success) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-					[Date.now(), provider, model, requestType, 0, 0, 0]
+					`INSERT INTO usage_stats (timestamp, provider, model, request_type, input_tokens, output_tokens, is_success, api_user) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+					[Date.now(), provider, model, requestType, 0, 0, 0, apiUser]
 				);
 			} catch (e) {
 				this.logger.error("Error saving LLM failure stats:", e);
@@ -222,6 +1796,19 @@ class LLMService {
 	 */
 	getQueueStatus() {
 		return this.queue.getStats();
+	}
+
+	/**
+	 * Limpa todas as requisições pendentes na fila do LLM.
+	 * @param {string} [reason="Fila limpa pelo administrador"] - Motivo do cancelamento
+	 * @returns {number} - Quantidade de requisições canceladas
+	 */
+	clearQueue(reason = "Fila limpa pelo administrador") {
+		const count = this.queue.clear(reason);
+		this.logger.warn(
+			`[LLMService] Fila limpa: ${count} requisições marcadas como falhas/canceladas.`
+		);
+		return count;
 	}
 
 	/**
@@ -247,16 +1834,40 @@ class LLMService {
 				total_failures: 0,
 				total_input_tokens: 0,
 				total_output_tokens: 0,
+				external_requests: 0,
 				first_record_timestamp: null,
 				by_type: {
-					text: { requests: 0, failures: 0, input_tokens: 0, output_tokens: 0 },
-					image: { requests: 0, failures: 0, input_tokens: 0, output_tokens: 0 },
-					video: { requests: 0, failures: 0, input_tokens: 0, output_tokens: 0 },
-					stt: { requests: 0, failures: 0, input_tokens: 0, output_tokens: 0 },
-					tts: { requests: 0, failures: 0, input_tokens: 0, output_tokens: 0 }
+					text: { requests: 0, failures: 0, input_tokens: 0, output_tokens: 0, external: 0 },
+					image: { requests: 0, failures: 0, input_tokens: 0, output_tokens: 0, external: 0 },
+					video: { requests: 0, failures: 0, input_tokens: 0, output_tokens: 0, external: 0 },
+					stt: { requests: 0, failures: 0, input_tokens: 0, output_tokens: 0, external: 0 },
+					tts: { requests: 0, failures: 0, input_tokens: 0, output_tokens: 0, external: 0 }
 				},
-				by_provider: {}
+				by_provider: {},
+				by_api_user: {}
 			};
+
+			// Query external requests breakdown for LLM
+			try {
+				let extQuery =
+					"SELECT api_user, COUNT(*) as count FROM usage_stats WHERE api_user IS NOT NULL";
+				const extParams = [];
+				if (timeframeMs) {
+					extQuery += " AND timestamp > ?";
+					extParams.push(Date.now() - timeframeMs);
+				}
+				extQuery += " GROUP BY api_user";
+				const extRows = await this.database.dbAll(this.DB_NAME, extQuery, extParams);
+				for (const extRow of extRows) {
+					const u = extRow.api_user;
+					if (!stats.by_api_user[u])
+						stats.by_api_user[u] = { total: 0, llm: 0, image: 0, stt: 0, tts: 0 };
+					stats.by_api_user[u].llm += extRow.count || 0;
+					stats.by_api_user[u].total += extRow.count || 0;
+					stats.external_requests += extRow.count || 0;
+					stats.by_type.text.external += extRow.count || 0;
+				}
+			} catch (extErr) {}
 
 			for (const row of rows) {
 				const type = row.request_type || "text";
@@ -303,25 +1914,37 @@ class LLMService {
 				};
 			}
 
-			// --- Audio Stats (Transcription & Generation) ---
+			// --- Audio & Image Stats ---
 			const speechProvider = "Speech System";
-			const speechParams = timeframeMs ? [Date.now() - timeframeMs] : [];
-			const speechFilter = timeframeMs ? " WHERE timestamp > ?" : "";
+			const mediaParams = timeframeMs ? [Date.now() - timeframeMs] : [];
+			const mediaFilter = timeframeMs ? " WHERE timestamp > ?" : "";
 
 			// ALWAYS query absolute earliest timestamps across all relevant tables
 			// to provide a correct 'since' date for the dashboard.
-			const [llmFirst, sttFirst, ttsFirst] = await Promise.all([
-				this.database.dbGet(this.DB_NAME, "SELECT MIN(timestamp) as ts FROM usage_stats"),
-				this.database.dbGet(
-					"media_stats",
-					"SELECT MIN(timestamp) as ts FROM speech_transcription_stats"
-				),
-				this.database.dbGet(
-					"media_stats",
-					"SELECT MIN(timestamp) as ts FROM speech_generation_stats"
-				)
+			const [llmFirst, sttFirst, ttsFirst, bonsaiFirst, comfyFirst] = await Promise.all([
+				this.database
+					.dbGet(this.DB_NAME, "SELECT MIN(timestamp) as ts FROM usage_stats")
+					.catch(() => null),
+				this.database
+					.dbGet("media_stats", "SELECT MIN(timestamp) as ts FROM speech_transcription_stats")
+					.catch(() => null),
+				this.database
+					.dbGet("media_stats", "SELECT MIN(timestamp) as ts FROM speech_generation_stats")
+					.catch(() => null),
+				this.database
+					.dbGet("bonsai_stats", "SELECT MIN(timestamp) as ts FROM bonsai_stats")
+					.catch(() => null),
+				this.database
+					.dbGet("media_stats", "SELECT MIN(timestamp) as ts FROM comfy_stats")
+					.catch(() => null)
 			]);
-			const absoluteTimestamps = [llmFirst?.ts, sttFirst?.ts, ttsFirst?.ts].filter((ts) => ts);
+			const absoluteTimestamps = [
+				llmFirst?.ts,
+				sttFirst?.ts,
+				ttsFirst?.ts,
+				bonsaiFirst?.ts,
+				comfyFirst?.ts
+			].filter((ts) => ts);
 			if (absoluteTimestamps.length > 0) {
 				const absoluteMin = Math.min(...absoluteTimestamps);
 				if (!stats.first_record_timestamp || absoluteMin < stats.first_record_timestamp) {
@@ -329,18 +1952,145 @@ class LLMService {
 				}
 			}
 
+			// 1. Bonsai Image Generation Stats
+			try {
+				const bonsaiAgg = await this.database.dbGet(
+					"bonsai_stats",
+					`SELECT SUM(CASE WHEN is_success IS NULL OR is_success = 1 THEN count ELSE 0 END) as requests,
+					        SUM(CASE WHEN is_success = 0 THEN count ELSE 0 END) as failures,
+					        MIN(timestamp) as min_ts FROM bonsai_stats${mediaFilter}`,
+					mediaParams
+				);
+
+				if (bonsaiAgg && ((bonsaiAgg.requests || 0) > 0 || (bonsaiAgg.failures || 0) > 0)) {
+					const provider = "Bonsai";
+					if (!stats.by_provider[provider]) {
+						stats.by_provider[provider] = {
+							requests: 0,
+							failures: 0,
+							input_tokens: 0,
+							output_tokens: 0,
+							by_type: {}
+						};
+					}
+
+					const requests = bonsaiAgg.requests || 0;
+					const failures = bonsaiAgg.failures || 0;
+
+					stats.total_requests += requests;
+					stats.total_failures += failures;
+					stats.by_type.image.requests += requests;
+					stats.by_type.image.failures += failures;
+
+					stats.by_provider[provider].requests += requests;
+					stats.by_provider[provider].failures += failures;
+					stats.by_provider[provider].by_type.image = {
+						requests,
+						failures,
+						input_tokens: 0,
+						output_tokens: 0
+					};
+
+					if (
+						bonsaiAgg.min_ts &&
+						(!stats.first_record_timestamp || bonsaiAgg.min_ts < stats.first_record_timestamp)
+					) {
+						stats.first_record_timestamp = bonsaiAgg.min_ts;
+					}
+				}
+
+				// Bonsai external users query
+				try {
+					let bonsaiExtQuery =
+						"SELECT api_user, SUM(count) as count FROM bonsai_stats WHERE api_user IS NOT NULL";
+					const bonsaiExtParams = [];
+					if (timeframeMs) {
+						bonsaiExtQuery += " AND timestamp > ?";
+						bonsaiExtParams.push(Date.now() - timeframeMs);
+					}
+					bonsaiExtQuery += " GROUP BY api_user";
+					const bonsaiExtRows = await this.database.dbAll(
+						"bonsai_stats",
+						bonsaiExtQuery,
+						bonsaiExtParams
+					);
+					for (const extRow of bonsaiExtRows) {
+						const u = extRow.api_user;
+						if (!stats.by_api_user[u])
+							stats.by_api_user[u] = { total: 0, llm: 0, image: 0, stt: 0, tts: 0 };
+						stats.by_api_user[u].image += extRow.count || 0;
+						stats.by_api_user[u].total += extRow.count || 0;
+						stats.external_requests += extRow.count || 0;
+						stats.by_type.image.external += extRow.count || 0;
+					}
+				} catch (e) {}
+			} catch (bonsaiErr) {
+				this.logger.error("Error getting Bonsai stats:", bonsaiErr);
+			}
+
+			// 2. ComfyUI Image Generation Stats
+			try {
+				const comfyAgg = await this.database.dbGet(
+					"media_stats",
+					`SELECT SUM(CASE WHEN is_success IS NULL OR is_success = 1 THEN count ELSE 0 END) as requests,
+					        SUM(CASE WHEN is_success = 0 THEN count ELSE 0 END) as failures,
+					        MIN(timestamp) as min_ts FROM comfy_stats${mediaFilter}`,
+					mediaParams
+				);
+
+				if (comfyAgg && ((comfyAgg.requests || 0) > 0 || (comfyAgg.failures || 0) > 0)) {
+					const provider = "ComfyUI";
+					if (!stats.by_provider[provider]) {
+						stats.by_provider[provider] = {
+							requests: 0,
+							failures: 0,
+							input_tokens: 0,
+							output_tokens: 0,
+							by_type: {}
+						};
+					}
+
+					const requests = comfyAgg.requests || 0;
+					const failures = comfyAgg.failures || 0;
+
+					stats.total_requests += requests;
+					stats.total_failures += failures;
+					stats.by_type.image.requests += requests;
+					stats.by_type.image.failures += failures;
+
+					stats.by_provider[provider].requests += requests;
+					stats.by_provider[provider].failures += failures;
+					stats.by_provider[provider].by_type.image = {
+						requests,
+						failures,
+						input_tokens: 0,
+						output_tokens: 0
+					};
+
+					if (
+						comfyAgg.min_ts &&
+						(!stats.first_record_timestamp || comfyAgg.min_ts < stats.first_record_timestamp)
+					) {
+						stats.first_record_timestamp = comfyAgg.min_ts;
+					}
+				}
+			} catch (comfyErr) {
+				this.logger.error("Error getting ComfyUI stats:", comfyErr);
+			}
+
 			try {
 				// STT Stats
 				const sttAgg = await this.database.dbGet(
 					"media_stats",
-					`SELECT COUNT(*) as requests, SUM(char_count) as input_tokens, SUM(duration_sec) as duration_sec, MIN(timestamp) as min_ts FROM speech_transcription_stats${speechFilter}`,
-					speechParams
+					`SELECT COUNT(*) as requests, SUM(char_count) as input_tokens, SUM(duration_sec) as duration_sec, MIN(timestamp) as min_ts FROM speech_transcription_stats${mediaFilter}`,
+					mediaParams
 				);
 
 				if (sttAgg && sttAgg.requests > 0) {
 					if (!stats.by_provider[speechProvider]) {
 						stats.by_provider[speechProvider] = {
 							requests: 0,
+							failures: 0,
 							input_tokens: 0,
 							output_tokens: 0,
 							by_type: {}
@@ -349,6 +2099,7 @@ class LLMService {
 
 					const data = {
 						requests: sttAgg.requests,
+						failures: 0,
 						input_tokens: sttAgg.input_tokens || 0,
 						output_tokens: 0,
 						duration_sec: sttAgg.duration_sec || 0
@@ -371,17 +2122,40 @@ class LLMService {
 					}
 				}
 
+				// STT external users query
+				try {
+					let sttExtQuery =
+						"SELECT api_user, COUNT(*) as count FROM speech_transcription_stats WHERE api_user IS NOT NULL";
+					const sttExtParams = [];
+					if (timeframeMs) {
+						sttExtQuery += " AND timestamp > ?";
+						sttExtParams.push(Date.now() - timeframeMs);
+					}
+					sttExtQuery += " GROUP BY api_user";
+					const sttExtRows = await this.database.dbAll("media_stats", sttExtQuery, sttExtParams);
+					for (const extRow of sttExtRows) {
+						const u = extRow.api_user;
+						if (!stats.by_api_user[u])
+							stats.by_api_user[u] = { total: 0, llm: 0, image: 0, stt: 0, tts: 0 };
+						stats.by_api_user[u].stt += extRow.count || 0;
+						stats.by_api_user[u].total += extRow.count || 0;
+						stats.external_requests += extRow.count || 0;
+						stats.by_type.stt.external += extRow.count || 0;
+					}
+				} catch (e) {}
+
 				// TTS Stats
 				const ttsAgg = await this.database.dbGet(
 					"media_stats",
-					`SELECT COUNT(*) as requests, SUM(char_count) as output_tokens, MIN(timestamp) as min_ts FROM speech_generation_stats${speechFilter}`,
-					speechParams
+					`SELECT COUNT(*) as requests, SUM(char_count) as output_tokens, MIN(timestamp) as min_ts FROM speech_generation_stats${mediaFilter}`,
+					mediaParams
 				);
 
 				if (ttsAgg && ttsAgg.requests > 0) {
 					if (!stats.by_provider[speechProvider]) {
 						stats.by_provider[speechProvider] = {
 							requests: 0,
+							failures: 0,
 							input_tokens: 0,
 							output_tokens: 0,
 							by_type: {}
@@ -390,6 +2164,7 @@ class LLMService {
 
 					const data = {
 						requests: ttsAgg.requests,
+						failures: 0,
 						input_tokens: 0,
 						output_tokens: ttsAgg.output_tokens || 0
 					};
@@ -410,6 +2185,28 @@ class LLMService {
 						stats.first_record_timestamp = ttsAgg.min_ts;
 					}
 				}
+
+				// TTS external users query
+				try {
+					let ttsExtQuery =
+						"SELECT api_user, COUNT(*) as count FROM speech_generation_stats WHERE api_user IS NOT NULL";
+					const ttsExtParams = [];
+					if (timeframeMs) {
+						ttsExtQuery += " AND timestamp > ?";
+						ttsExtParams.push(Date.now() - timeframeMs);
+					}
+					ttsExtQuery += " GROUP BY api_user";
+					const ttsExtRows = await this.database.dbAll("media_stats", ttsExtQuery, ttsExtParams);
+					for (const extRow of ttsExtRows) {
+						const u = extRow.api_user;
+						if (!stats.by_api_user[u])
+							stats.by_api_user[u] = { total: 0, llm: 0, image: 0, stt: 0, tts: 0 };
+						stats.by_api_user[u].tts += extRow.count || 0;
+						stats.by_api_user[u].total += extRow.count || 0;
+						stats.external_requests += extRow.count || 0;
+						stats.by_type.tts.external += extRow.count || 0;
+					}
+				} catch (e) {}
 			} catch (speechErr) {
 				this.logger.error("Error getting optimized speech stats:", speechErr);
 			}
@@ -419,6 +2216,112 @@ class LLMService {
 			this.logger.error("Error getting optimized LLM stats:", err);
 			return null;
 		}
+	}
+
+	/**
+	 * Executa POST com retry automático caso a API retorne HTTP 400 por estouro de contexto
+	 * (ajustando max_tokens para os tokens restantes disponíveis no contexto).
+	 *
+	 * @param {string} endpoint - URL do endpoint
+	 * @param {Object} payload - Payload JSON a enviar
+	 * @param {Object} headers - Headers HTTP
+	 * @param {number} timeout - Timeout em ms
+	 * @param {string} providerName - Nome do provedor para logs
+	 * @returns {Promise<Object>} - Resposta do axios
+	 * @private
+	 */
+	async _postWithContextRetry(endpoint, payload, headers, timeout, providerName = "OpenAI") {
+		try {
+			return await axios.post(endpoint, payload, { headers, timeout });
+		} catch (error) {
+			const errMsg =
+				error.response?.data?.error?.message ||
+				(typeof error.response?.data === "string" ? error.response.data : "") ||
+				"";
+
+			// Caso 1: Estouro de tokens de saída somados ao prompt
+			// Ex: "This model's maximum context length is 16384 tokens. However, you requested 2000 output tokens and your prompt contains at least 14385 input tokens..."
+			const tokenMatch = errMsg.match(
+				/maximum context length is (\d+) tokens.*?(?:requested|request) (\d+) output tokens.*?prompt contains (?:at least )?(\d+) input tokens/i
+			);
+
+			if (tokenMatch) {
+				const maxContext = parseInt(tokenMatch[1], 10);
+				const requestedTokens = parseInt(tokenMatch[2], 10);
+				const inputTokens = parseInt(tokenMatch[3], 10);
+				const availableTokens = maxContext - inputTokens - 20;
+
+				if (availableTokens >= 30) {
+					this.logger.warn(
+						`[LLMService][${providerName}] Contexto excedido: modelo suporta ${maxContext} tokens, prompt tem ${inputTokens} tokens. Ajustando max_tokens de ${requestedTokens} para ${availableTokens} e retentando...`
+					);
+					payload.max_tokens = availableTokens;
+					return await axios.post(endpoint, payload, { headers, timeout });
+				}
+			}
+
+			// Caso 2: Prompt excede limite de caracteres
+			// Ex: "This model's maximum context length is 16384 tokens. However, you requested 2000 output tokens and your prompt contains 604962 characters (more than 445904 characters, which is the upper bound for 14384 input tokens)..."
+			const charMatch = errMsg.match(
+				/maximum context length is (\d+) tokens.*?(?:requested|request) (\d+) output tokens.*?prompt contains (\d+) characters.*?upper bound for (\d+) input tokens/i
+			);
+
+			if (charMatch && Array.isArray(payload.messages) && payload.messages.length > 0) {
+				const maxContext = parseInt(charMatch[1], 10);
+				const boundTokens = parseInt(charMatch[4], 10);
+				this.logger.warn(
+					`[LLMService][${providerName}] Prompt em caracteres excede limite do contexto (${charMatch[3]} chars). Truncando mensagens do prompt e retentando...`
+				);
+
+				const charBudget = Math.floor(boundTokens * 2.5);
+				for (let i = payload.messages.length - 1; i >= 0; i--) {
+					const msg = payload.messages[i];
+					if (msg.role === "user" && typeof msg.content === "string") {
+						if (msg.content.length > charBudget) {
+							msg.content = msg.content.slice(-charBudget);
+						}
+						break;
+					}
+				}
+
+				payload.max_tokens = Math.max(100, maxContext - boundTokens - 50);
+				return await axios.post(endpoint, payload, { headers, timeout });
+			}
+
+			throw error;
+		}
+	}
+
+	/**
+	 * Sanitiza strings e objetos para garantir que todo texto seja UTF-8 válido e bem-formado,
+	 * eliminando surrogates isolados (ex: \uD83C sem par de baixa ordem que quebra emojis).
+	 * Surrogates isolados causam erros HTTP 400 (TextEncodeInput) em tokenizers Rust/HF (ex: vLLM).
+	 * @param {*} value
+	 * @returns {*}
+	 * @private
+	 */
+	_sanitizeUtf8(value) {
+		if (typeof value === "string") {
+			if (typeof value.isWellFormed === "function" && value.isWellFormed()) {
+				return value;
+			}
+			const cleaned = value.replace(
+				/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/gu,
+				""
+			);
+			return typeof cleaned.toWellFormed === "function" ? cleaned.toWellFormed() : cleaned;
+		}
+		if (Array.isArray(value)) {
+			return value.map((item) => this._sanitizeUtf8(item));
+		}
+		if (value && typeof value === "object") {
+			const result = {};
+			for (const [k, v] of Object.entries(value)) {
+				result[k] = this._sanitizeUtf8(v);
+			}
+			return result;
+		}
+		return value;
 	}
 
 	/**
@@ -432,6 +2335,7 @@ class LLMService {
 	 * @returns {Promise<Object>} - A resposta da API
 	 */
 	async openaiCompletion(options) {
+		const providerName = options?.providerName || "OpenAI";
 		try {
 			// Determina endpoint
 			let endpoint = "https://api.openai.com/v1/chat/completions";
@@ -449,26 +2353,25 @@ class LLMService {
 			}
 
 			const apiKey = `Bearer ${options.apiKey}`;
-
 			const model = options.model ?? "gpt-3.5-turbo";
 
-			this.logger.debug(`Enviando solicitação para API compatível com OpenAI:`, {
-				endpoint,
-				model,
-				promptLength: options.prompt.length,
-				maxTokens: options.maxTokens ?? 5000
-			});
+			const hasImages = !!(options.image || (options.images && options.images.length > 0));
+			const allowToolCalling =
+				options.toolCalling === true && !options.response_format && !hasImages;
 
-			const ctxInclude =
+			let ctxInclude =
 				options.systemContext ??
 				"Você é ravena, um bot de whatsapp criado por moothz. Não se apresente, a menos que solicitado pelo usuário.";
 
+			if (allowToolCalling && !ctxInclude.includes("POLÍTICA OBRIGATÓRIA DE USO DE FERRAMENTAS")) {
+				ctxInclude = `${ctxInclude}\n\n${TOOL_CALLING_POLICY}`;
+			}
+
 			// Monta o conteúdo do user message (texto simples ou array com imagens para vision)
 			let userContent;
-			const hasImages = !!(options.image || (options.images && options.images.length > 0));
 			if (hasImages) {
 				const imagesToProcess = options.images ? options.images : [options.image];
-				userContent = [{ type: "text", text: options.prompt }];
+				userContent = [{ type: "text", text: options.prompt || "" }];
 				for (const img of imagesToProcess) {
 					let base64;
 					if (img.startsWith("data:image")) {
@@ -492,37 +2395,234 @@ class LLMService {
 					}
 				}
 			} else {
-				userContent = options.prompt;
+				userContent = options.prompt || "";
+			}
+
+			let messages;
+			if (Array.isArray(options.messages) && options.messages.length > 0) {
+				messages = [...options.messages];
+				if (ctxInclude && !messages.some((m) => m.role === "system")) {
+					messages.unshift({ role: "system", content: ctxInclude });
+				}
+			} else {
+				messages = [
+					{ role: "system", content: ctxInclude },
+					{ role: "user", content: userContent }
+				];
+			}
+
+			messages = this._sanitizeUtf8(messages);
+
+			const initialTemperature =
+				options.toolTemperature ??
+				(options.temperature !== undefined
+					? allowToolCalling
+						? Math.min(options.temperature, 0.2)
+						: options.temperature
+					: allowToolCalling
+						? 0.1
+						: 0.7);
+
+			let maxTokens = options.maxTokens ?? 4096;
+
+			// Ajusta dinamicamente caso o contextLength do modelo seja conhecido e o prompt esteja próximo do limite
+			const contextLength = options.contextLength;
+			if (contextLength && typeof contextLength === "number") {
+				let estimatedPromptTokens = 0;
+				if (typeof userContent === "string") {
+					estimatedPromptTokens += Math.ceil(userContent.length / 3);
+				} else if (Array.isArray(userContent)) {
+					for (const item of userContent) {
+						if (item.type === "text" && item.text) {
+							estimatedPromptTokens += Math.ceil(item.text.length / 3);
+						} else if (item.type === "image_url") {
+							estimatedPromptTokens += 1000;
+						}
+					}
+				}
+				if (typeof ctxInclude === "string") {
+					estimatedPromptTokens += Math.ceil(ctxInclude.length / 3);
+				}
+
+				const available = contextLength - estimatedPromptTokens - 30;
+				if (available > 30 && available < maxTokens) {
+					this.logger.warn(
+						`[LLMService][${providerName}] Contexto do modelo (${contextLength} tokens) próximo do limite. Ajustando max_tokens de ${maxTokens} para ${available}.`
+					);
+					maxTokens = available;
+				}
 			}
 
 			const payload = {
 				model,
-				messages: [
-					{ role: "system", content: ctxInclude },
-					{ role: "user", content: userContent }
-				],
-				max_tokens: options.maxTokens ?? 5000,
-				temperature: options.temperature ?? 0.7,
+				messages,
+				max_tokens: maxTokens,
+				temperature: initialTemperature,
 				stream: false
 			};
+
+			if (options.top_p !== undefined) payload.top_p = options.top_p;
+			if (options.top_k !== undefined) payload.top_k = options.top_k;
+			if (options.min_p !== undefined) payload.min_p = options.min_p;
+			if (options.frequency_penalty !== undefined) {
+				payload.frequency_penalty = options.frequency_penalty;
+			}
+			if (options.presence_penalty !== undefined) {
+				payload.presence_penalty = options.presence_penalty;
+			}
+			if (options.repetition_penalty !== undefined) {
+				payload.repetition_penalty = options.repetition_penalty;
+			}
 
 			if (options.response_format) {
 				payload.response_format = options.response_format;
 			}
 
-			const response = await axios.post(endpoint, payload, {
-				headers: {
+			if (allowToolCalling) {
+				const availableTools = Array.isArray(options.tools) ? options.tools : this.getTools();
+				if (Array.isArray(availableTools) && availableTools.length > 0) {
+					payload.tools = availableTools;
+				}
+			}
+
+			// Garantia estrita: vLLM e outros endpoints OpenAI rejeitam tools se for array vazio
+			if (payload.tools && (!Array.isArray(payload.tools) || payload.tools.length === 0)) {
+				delete payload.tools;
+			}
+
+			const timeout = options.timeout ?? this.apiTimeout;
+
+			let currentResponse = await this._postWithContextRetry(
+				endpoint,
+				payload,
+				{
 					Authorization: apiKey,
 					"Content-Type": "application/json"
 				},
-				timeout: options.timeout ?? this.apiTimeout
-			});
+				timeout,
+				providerName
+			);
 
-			this._trackUsage("OpenAI", response.data, model, options);
+			this._trackUsage(providerName, currentResponse.data, model, options);
 
-			return response.data;
+			let turn = 0;
+			const maxTurns = 4;
+
+			// Loop do Agente (tool_calls estruturado ou fallback XML/MiniMax)
+			while (allowToolCalling && turn < maxTurns) {
+				const currentMessage = currentResponse.data?.choices?.[0]?.message;
+				if (!currentMessage) break;
+
+				let toolCalls = null;
+				if (Array.isArray(currentMessage.tool_calls) && currentMessage.tool_calls.length > 0) {
+					toolCalls = currentMessage.tool_calls;
+				} else if (typeof currentMessage.content === "string") {
+					toolCalls = this._extractXmlToolCalls(currentMessage.content);
+				}
+
+				if (!toolCalls || toolCalls.length === 0) {
+					break;
+				}
+
+				turn++;
+				this.logger.info(
+					`[LLMService][${providerName}] LLM solicitou ${toolCalls.length} tool call(s) (Turno ${turn}/${maxTurns})`
+				);
+
+				messages.push({
+					role: "assistant",
+					content: this._sanitizeUtf8(currentMessage.content || null),
+					tool_calls: toolCalls
+				});
+
+				for (const toolCall of toolCalls) {
+					const fnName = toolCall.function?.name;
+					let parsedArgs = {};
+					try {
+						parsedArgs =
+							typeof toolCall.function?.arguments === "string"
+								? JSON.parse(toolCall.function.arguments)
+								: toolCall.function?.arguments || {};
+					} catch (e) {
+						this.logger.error(
+							`[LLMService] Erro ao analisar argumentos de tool_call (${toolCall.function?.arguments}):`,
+							e.message
+						);
+					}
+
+					const toolOutput = await this.executeToolCall(fnName, parsedArgs, options);
+
+					messages.push({
+						role: "tool",
+						tool_call_id: toolCall.id,
+						name: fnName,
+						content: this._sanitizeUtf8(toolOutput)
+					});
+				}
+
+				this.logger.info(
+					`[LLMService][${providerName}] Enviando chamada subsequente ${turn + 1} ao LLM com os resultados das tools...`
+				);
+
+				const nextPayload = {
+					model,
+					messages,
+					max_tokens: options.maxTokens ?? 5000,
+					temperature: options.temperature ?? 0.7,
+					stream: false
+				};
+
+				if (options.top_p !== undefined) nextPayload.top_p = options.top_p;
+				if (options.top_k !== undefined) nextPayload.top_k = options.top_k;
+				if (options.min_p !== undefined) nextPayload.min_p = options.min_p;
+				if (options.frequency_penalty !== undefined) {
+					nextPayload.frequency_penalty = options.frequency_penalty;
+				}
+				if (options.presence_penalty !== undefined) {
+					nextPayload.presence_penalty = options.presence_penalty;
+				}
+				if (options.repetition_penalty !== undefined) {
+					nextPayload.repetition_penalty = options.repetition_penalty;
+				}
+
+				const nextTools = Array.isArray(options.tools) ? options.tools : this.getTools();
+				if (Array.isArray(nextTools) && nextTools.length > 0) {
+					nextPayload.tools = nextTools;
+				}
+
+				currentResponse = await this._postWithContextRetry(
+					endpoint,
+					nextPayload,
+					{
+						Authorization: apiKey,
+						"Content-Type": "application/json"
+					},
+					timeout,
+					providerName
+				);
+
+				this._trackUsage(providerName, currentResponse.data, model, options);
+			}
+
+			const finalMessage = currentResponse.data?.choices?.[0]?.message;
+			if (finalMessage && typeof finalMessage.content === "string") {
+				finalMessage.content = this._cleanResponse(finalMessage.content);
+			}
+
+			return currentResponse.data;
 		} catch (error) {
-			this.logger.error("Erro ao chamar API compatível com OpenAI:", error.message);
+			this.logger.error(
+				`Erro ao chamar API compatível com OpenAI (${providerName}):`,
+				error.message
+			);
+			if (error.response) {
+				this.logger.error(
+					`[LLMService][${providerName}] Detalhes do erro HTTP ${error.response.status}:`,
+					typeof error.response.data === "object"
+						? JSON.stringify(error.response.data)
+						: error.response.data
+				);
+			}
 			throw error;
 		}
 	}
@@ -538,6 +2638,7 @@ class LLMService {
 	 * @returns {Promise<Object>} - A resposta da API
 	 */
 	async openrouterCompletion(options) {
+		const providerName = options?.providerName || "OpenRouter";
 		try {
 			const apiKey = options.apiKey;
 			if (!apiKey) {
@@ -552,23 +2653,23 @@ class LLMService {
 
 			const model = options.model ?? "openai/gpt-3.5-turbo";
 
-			this.logger.debug("Enviando solicitação para API OpenRouter:", {
-				endpoint,
-				model,
-				promptLength: options.prompt.length,
-				maxTokens: options.maxTokens ?? 5000
-			});
+			const hasImages = !!(options.image || (options.images && options.images.length > 0));
+			const allowToolCalling =
+				options.toolCalling === true && !options.response_format && !hasImages;
 
-			const ctxInclude =
+			let ctxInclude =
 				options.systemContext ??
 				"Você é ravena, um bot de whatsapp criado por moothz. Não se apresente, a menos que solicitado pelo usuário.";
 
+			if (allowToolCalling && !ctxInclude.includes("POLÍTICA OBRIGATÓRIA DE USO DE FERRAMENTAS")) {
+				ctxInclude = `${ctxInclude}\n\n${TOOL_CALLING_POLICY}`;
+			}
+
 			// Monta o conteúdo do user message (texto simples ou array com imagens para vision)
 			let userContent;
-			const hasImages = !!(options.image || (options.images && options.images.length > 0));
 			if (hasImages) {
 				const imagesToProcess = options.images ? options.images : [options.image];
-				userContent = [{ type: "text", text: options.prompt }];
+				userContent = [{ type: "text", text: options.prompt || "" }];
 				for (const img of imagesToProcess) {
 					if (img.startsWith("data:image")) {
 						userContent.push({
@@ -588,39 +2689,234 @@ class LLMService {
 					}
 				}
 			} else {
-				userContent = options.prompt;
+				userContent = options.prompt || "";
+			}
+
+			let messages;
+			if (Array.isArray(options.messages) && options.messages.length > 0) {
+				messages = [...options.messages];
+				if (ctxInclude && !messages.some((m) => m.role === "system")) {
+					messages.unshift({ role: "system", content: ctxInclude });
+				}
+			} else {
+				messages = [
+					{ role: "system", content: ctxInclude },
+					{ role: "user", content: userContent }
+				];
+			}
+
+			messages = this._sanitizeUtf8(messages);
+
+			const initialTemperature =
+				options.toolTemperature ??
+				(options.temperature !== undefined
+					? allowToolCalling
+						? Math.min(options.temperature, 0.2)
+						: options.temperature
+					: allowToolCalling
+						? 0.1
+						: 0.7);
+
+			let maxTokens = options.maxTokens ?? 4096;
+
+			const contextLength = options.contextLength;
+			if (contextLength && typeof contextLength === "number") {
+				let estimatedPromptTokens = 0;
+				if (typeof userContent === "string") {
+					estimatedPromptTokens += Math.ceil(userContent.length / 3);
+				} else if (Array.isArray(userContent)) {
+					for (const item of userContent) {
+						if (item.type === "text" && item.text) {
+							estimatedPromptTokens += Math.ceil(item.text.length / 3);
+						} else if (item.type === "image_url") {
+							estimatedPromptTokens += 1000;
+						}
+					}
+				}
+				if (typeof ctxInclude === "string") {
+					estimatedPromptTokens += Math.ceil(ctxInclude.length / 3);
+				}
+
+				const available = contextLength - estimatedPromptTokens - 30;
+				if (available > 30 && available < maxTokens) {
+					this.logger.warn(
+						`[LLMService][${providerName}] Contexto do modelo (${contextLength} tokens) próximo do limite. Ajustando max_tokens de ${maxTokens} para ${available}.`
+					);
+					maxTokens = available;
+				}
 			}
 
 			const payload = {
 				model,
-				messages: [
-					{ role: "system", content: ctxInclude },
-					{ role: "user", content: userContent }
-				],
-				max_tokens: options.maxTokens ?? 5000,
-				temperature: options.temperature ?? 0.7,
+				messages,
+				max_tokens: maxTokens,
+				temperature: initialTemperature,
 				stream: false
 			};
+
+			if (options.top_p !== undefined) payload.top_p = options.top_p;
+			if (options.top_k !== undefined) payload.top_k = options.top_k;
+			if (options.min_p !== undefined) payload.min_p = options.min_p;
+			if (options.frequency_penalty !== undefined) {
+				payload.frequency_penalty = options.frequency_penalty;
+			}
+			if (options.presence_penalty !== undefined) {
+				payload.presence_penalty = options.presence_penalty;
+			}
+			if (options.repetition_penalty !== undefined) {
+				payload.repetition_penalty = options.repetition_penalty;
+			}
 
 			if (options.response_format) {
 				payload.response_format = options.response_format;
 			}
 
-			const response = await axios.post(endpoint, payload, {
-				headers: {
+			if (allowToolCalling) {
+				const availableTools = Array.isArray(options.tools) ? options.tools : this.getTools();
+				if (Array.isArray(availableTools) && availableTools.length > 0) {
+					payload.tools = availableTools;
+				}
+			}
+
+			// Garantia estrita: vLLM e outros endpoints OpenAI rejeitam tools se for array vazio
+			if (payload.tools && (!Array.isArray(payload.tools) || payload.tools.length === 0)) {
+				delete payload.tools;
+			}
+
+			const timeout = options.timeout ?? this.apiTimeout;
+
+			let currentResponse = await this._postWithContextRetry(
+				endpoint,
+				payload,
+				{
 					Authorization: `Bearer ${apiKey}`,
 					"Content-Type": "application/json",
 					"HTTP-Referer": "https://ravena.local",
 					"X-Title": "RavenaBot"
 				},
-				timeout: options.timeout ?? this.apiTimeout
-			});
+				timeout,
+				providerName
+			);
 
-			this._trackUsage("OpenRouter", response.data, model, options);
+			this._trackUsage(providerName, currentResponse.data, model, options);
 
-			return response.data;
+			let turn = 0;
+			const maxTurns = 4;
+
+			// Loop do Agente (tool_calls estruturado ou fallback XML/MiniMax)
+			while (allowToolCalling && turn < maxTurns) {
+				const currentMessage = currentResponse.data?.choices?.[0]?.message;
+				if (!currentMessage) break;
+
+				let toolCalls = null;
+				if (Array.isArray(currentMessage.tool_calls) && currentMessage.tool_calls.length > 0) {
+					toolCalls = currentMessage.tool_calls;
+				} else if (typeof currentMessage.content === "string") {
+					toolCalls = this._extractXmlToolCalls(currentMessage.content);
+				}
+
+				if (!toolCalls || toolCalls.length === 0) {
+					break;
+				}
+
+				turn++;
+				this.logger.info(
+					`[LLMService][${providerName}] LLM solicitou ${toolCalls.length} tool call(s) (Turno ${turn}/${maxTurns})`
+				);
+
+				messages.push({
+					role: "assistant",
+					content: this._sanitizeUtf8(currentMessage.content || null),
+					tool_calls: toolCalls
+				});
+
+				for (const toolCall of toolCalls) {
+					const fnName = toolCall.function?.name;
+					let parsedArgs = {};
+					try {
+						parsedArgs =
+							typeof toolCall.function?.arguments === "string"
+								? JSON.parse(toolCall.function.arguments)
+								: toolCall.function?.arguments || {};
+					} catch (e) {
+						this.logger.error(
+							`[LLMService] Erro ao analisar argumentos de tool_call (${toolCall.function?.arguments}):`,
+							e.message
+						);
+					}
+
+					const toolOutput = await this.executeToolCall(fnName, parsedArgs, options);
+
+					messages.push({
+						role: "tool",
+						tool_call_id: toolCall.id,
+						name: fnName,
+						content: this._sanitizeUtf8(toolOutput)
+					});
+				}
+
+				this.logger.info(
+					`[LLMService][${providerName}] Enviando chamada subsequente ${turn + 1} ao LLM com os resultados das tools...`
+				);
+
+				const nextPayload = {
+					model,
+					messages,
+					max_tokens: options.maxTokens ?? 5000,
+					temperature: options.temperature ?? 0.7,
+					stream: false
+				};
+
+				if (options.top_p !== undefined) nextPayload.top_p = options.top_p;
+				if (options.top_k !== undefined) nextPayload.top_k = options.top_k;
+				if (options.min_p !== undefined) nextPayload.min_p = options.min_p;
+				if (options.frequency_penalty !== undefined) {
+					nextPayload.frequency_penalty = options.frequency_penalty;
+				}
+				if (options.presence_penalty !== undefined) {
+					nextPayload.presence_penalty = options.presence_penalty;
+				}
+				if (options.repetition_penalty !== undefined) {
+					nextPayload.repetition_penalty = options.repetition_penalty;
+				}
+
+				const nextTools = Array.isArray(options.tools) ? options.tools : this.getTools();
+				if (Array.isArray(nextTools) && nextTools.length > 0) {
+					nextPayload.tools = nextTools;
+				}
+
+				currentResponse = await this._postWithContextRetry(
+					endpoint,
+					nextPayload,
+					{
+						Authorization: `Bearer ${apiKey}`,
+						"Content-Type": "application/json",
+						"HTTP-Referer": "https://ravena.local",
+						"X-Title": "RavenaBot"
+					},
+					timeout,
+					providerName
+				);
+
+				this._trackUsage(providerName, currentResponse.data, model, options);
+			}
+
+			const finalMessage = currentResponse.data?.choices?.[0]?.message;
+			if (finalMessage && typeof finalMessage.content === "string") {
+				finalMessage.content = this._cleanResponse(finalMessage.content);
+			}
+
+			return currentResponse.data;
 		} catch (error) {
-			this.logger.error("Erro ao chamar API OpenRouter:", error.message);
+			this.logger.error(`Erro ao chamar API OpenRouter (${providerName}):`, error.message);
+			if (error.response) {
+				this.logger.error(
+					`[LLMService][${providerName}] Detalhes do erro HTTP ${error.response.status}:`,
+					typeof error.response.data === "object"
+						? JSON.stringify(error.response.data)
+						: error.response.data
+				);
+			}
 			throw error;
 		}
 	}
@@ -648,16 +2944,34 @@ class LLMService {
 		if (typeof response !== "string") return response;
 
 		let cleaned = response
-			.replace(/<think>.*?<\/think>/gs, "")
-			.replace(/<\|think\|>.*?<channel\|>/gs, "")
-			.replace(/<\|thought\|>.*?<\|thought_end\|>/gs, "")
+			.replace(/<think>[\s\S]*?<\/think>/gi, "")
+			.replace(/<think>[\s\S]*/gi, "")
+			.replace(/<\|think\|>[\s\S]*?<channel\|>/gi, "")
+			.replace(/<\|thought\|>[\s\S]*?<\|thought_end\|>/gi, "")
+			.replace(
+				/<\|channel\|?>thought[\s\S]*?(?:<channel\|?>|<\|channel\|?>(?:response|call)?)/gi,
+				""
+			)
 			.replace(/<\/start_of_turn>/g, "")
 			.replace(/<\/end_of_turn>/g, "")
 			.replace(/<\/blockquote>/g, "")
-			.replace(/<\|channel\|>/g, "")
-			.replace(/<channel\|>/g, "")
-			.replace(/<\|turn\|>/g, "")
-			.replace(/<turn\|>/g, "")
+			.replace(/<\|channel\|?>thought/gi, "")
+			.replace(/<\|channel\|?>/gi, "")
+			.replace(/<channel\|?>/gi, "")
+			.replace(/<\|turn\|?>/gi, "")
+			.replace(/<turn\|?>/gi, "")
+			.replace(/<\|think\|?>/gi, "")
+			// Delimitadores e tags residuais MiniMax/tool_call
+			.replace(/\]<\]minimax\[>[\][]?/gi, "")
+			.replace(/<\|minimax:[^>]*\|>/gi, "")
+			.replace(/\[minimax\]/gi, "")
+			.replace(/<(?:minimax:)?tool_call>[\s\S]*?<\/(?:minimax:)?tool_call>/gi, "")
+			.replace(
+				/<invoke\s+name=["'][^"']+["']>[\s\S]*?(?:<\/invoke>|(?=<\/?invoke|<\/(?:minimax:)?tool_call>|$))/gi,
+				""
+			)
+			.replace(/<\/?(?:minimax:)?tool_call>/gi, "")
+			.replace(/<\/?invoke[^>]*>/gi, "")
 			.trim();
 
 		// Remove blocos de código Markdown (por exemplo, ```json ... ``` ou ``` ... ```) se existirem
@@ -666,6 +2980,69 @@ class LLMService {
 		}
 
 		return cleaned.replace(/^"|"$/g, "");
+	}
+
+	/**
+	 * Limita o conteúdo de texto do LLM para evitar loops de repetição ou respostas gigantescas.
+	 * Respeita o limite máximo de caracteres (padrão 3000), de linhas (padrão 200) e repetições consecutivas (máx 15).
+	 *
+	 * @param {string} text - Texto a ser validado e possivelmente truncado.
+	 * @param {number} [maxChars=3000] - Limite máximo de caracteres.
+	 * @param {number} [maxLines=200] - Limite máximo de linhas.
+	 * @param {number} [maxCharRepeats=15] - Limite máximo de repetições consecutivas do mesmo caractere.
+	 * @returns {string} - Texto original ou truncado com indicador.
+	 */
+	truncateText(text, maxChars = 3000, maxLines = 200, maxCharRepeats = 15) {
+		if (typeof text !== "string" || !text) {
+			return text;
+		}
+
+		let result = text;
+		let modified = false;
+
+		// Limita repetições consecutivas do mesmo caractere para no máximo 15 (ex: "KKK...KKK" -> 15 K's)
+		if (maxCharRepeats > 0) {
+			const repeatRegex =
+				maxCharRepeats === 15 ? /(.)\1{15,}/gu : new RegExp(`(.)\\1{${maxCharRepeats},}`, "gu");
+			if (repeatRegex.test(result)) {
+				result = result.replace(repeatRegex, (match, char) => char.repeat(maxCharRepeats));
+				modified = true;
+			}
+		}
+
+		const lines = result.split(/\r?\n/);
+		const exceedsLines = maxLines > 0 && lines.length > maxLines;
+		const exceedsChars = maxChars > 0 && result.length > maxChars;
+
+		if (exceedsLines || exceedsChars) {
+			modified = true;
+			const suffix = "\n... [truncado]";
+
+			if (exceedsLines) {
+				const targetLines = Math.max(1, maxLines - 1);
+				result = lines.slice(0, targetLines).join("\n") + suffix;
+			}
+
+			if (maxChars > 0 && result.length > maxChars) {
+				const targetChars = Math.max(0, maxChars - suffix.length);
+				let sliced = result.slice(0, targetChars);
+				if (typeof sliced.isWellFormed === "function" && !sliced.isWellFormed()) {
+					sliced = sliced.replace(
+						/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/gu,
+						""
+					);
+				}
+				result = sliced + suffix;
+			}
+		}
+
+		if (modified) {
+			this.logger.warn(
+				`[LLMService] Mensagem de texto ajustada por filtros de tamanho/repetição (${maxChars} chars / ${maxLines} linhas / máx ${maxCharRepeats} repetições).`
+			);
+		}
+
+		return this._sanitizeUtf8(result);
 	}
 
 	/**
@@ -682,15 +3059,38 @@ class LLMService {
 	 * @returns {Promise<Object>} - The response from the Ollama API.
 	 */
 	async ollamaCompletion(options) {
+		const providerName = options?.providerName || "Ollama";
 		try {
-			const debugPrompt = options.debugPrompt ?? true;
-
 			const endpoint = (options.customEndpoint ?? "http://localhost:11434") + "/api/chat";
 
-			const messages = [];
-			const systemContext =
+			let messages = [];
+			const hasImages = !!(options.images || options.image);
+
+			let ollamaFormat = null;
+			if (options.response_format) {
+				if (
+					options.response_format.type === "json_schema" &&
+					options.response_format.json_schema?.schema
+				) {
+					ollamaFormat = options.response_format.json_schema.schema;
+				} else {
+					ollamaFormat = options.response_format;
+				}
+			}
+
+			const allowToolCalling = options.toolCalling === true && !ollamaFormat && !hasImages;
+
+			let systemContext =
 				options.systemContext ??
 				"Você é ravena, um bot de whatsapp criado por moothz. Não se apresente, a menos que solicitado pelo usuário.";
+
+			if (
+				allowToolCalling &&
+				!systemContext.includes("POLÍTICA OBRIGATÓRIA DE USO DE FERRAMENTAS")
+			) {
+				systemContext = `${systemContext}\n\n${TOOL_CALLING_POLICY}`;
+			}
+
 			messages.push({ role: "system", content: systemContext });
 
 			const userMessage = {
@@ -698,7 +3098,7 @@ class LLMService {
 				content: options.prompt
 			};
 
-			if (options.images || options.image) {
+			if (hasImages) {
 				let imagesToProcess = options.images ? options.images : [options.image];
 				const processedImages = [];
 
@@ -728,17 +3128,17 @@ class LLMService {
 
 			messages.push(userMessage);
 
-			let ollamaFormat = null;
-			if (options.response_format) {
-				if (
-					options.response_format.type === "json_schema" &&
-					options.response_format.json_schema?.schema
-				) {
-					ollamaFormat = options.response_format.json_schema.schema;
-				} else {
-					ollamaFormat = options.response_format;
-				}
-			}
+			messages = this._sanitizeUtf8(messages);
+
+			const initialTemperature =
+				options.toolTemperature ??
+				(options.temperature !== undefined
+					? allowToolCalling
+						? Math.min(options.temperature, 0.2)
+						: options.temperature
+					: allowToolCalling
+						? 0.1
+						: 0.7);
 
 			const payload = {
 				model: options.model ?? "gemma3:12b",
@@ -746,40 +3146,126 @@ class LLMService {
 				format: ollamaFormat,
 				stream: false,
 				options: {
-					temperature: options.temperature ?? 0.7,
+					temperature: initialTemperature,
 					num_predict: options.maxTokens ?? 8096,
 					top_k: options.top_k,
 					top_p: options.top_p
 				}
 			};
 
-			const toTime = options.timeout ?? this.apiTimeout ?? 60000;
-
-			if (debugPrompt) {
-				this.logger.debug("[LLMService][ollamaCompletion] Sending request to Ollama API", {
-					size: options.prompt.length,
-					prompt: this.summarizeString(options.prompt)
-				});
-			} else {
-				this.logger.debug("[LLMService][ollamaCompletion] Sending request to Ollama API");
+			if (allowToolCalling) {
+				const availableTools = Array.isArray(options.tools) ? options.tools : this.getTools();
+				if (Array.isArray(availableTools) && availableTools.length > 0) {
+					payload.tools = availableTools;
+				}
 			}
 
-			const response = await axios.post(endpoint, payload, {
+			if (payload.tools && (!Array.isArray(payload.tools) || payload.tools.length === 0)) {
+				delete payload.tools;
+			}
+
+			const toTime = options.timeout ?? this.apiTimeout ?? 60000;
+
+			let currentResponse = await axios.post(endpoint, payload, {
 				headers: {
 					"Content-Type": "application/json"
 				},
 				timeout: toTime
 			});
 
-			this._trackUsage("Ollama", response.data, payload.model, options);
+			this._trackUsage(providerName, currentResponse.data, payload.model, options);
 
-			return response.data;
+			let turn = 0;
+			const maxTurns = 4;
+
+			while (allowToolCalling && turn < maxTurns) {
+				const currentMsg = currentResponse.data?.message;
+				if (!currentMsg) break;
+
+				let toolCalls = null;
+				if (Array.isArray(currentMsg.tool_calls) && currentMsg.tool_calls.length > 0) {
+					toolCalls = currentMsg.tool_calls;
+				} else if (typeof currentMsg.content === "string") {
+					toolCalls = this._extractXmlToolCalls(currentMsg.content);
+				}
+
+				if (!toolCalls || toolCalls.length === 0) {
+					break;
+				}
+
+				turn++;
+				this.logger.info(
+					`[LLMService][Ollama] LLM solicitou ${toolCalls.length} tool call(s) (Turno ${turn}/${maxTurns})`
+				);
+
+				messages.push({
+					role: "assistant",
+					content: this._sanitizeUtf8(currentMsg.content || null),
+					tool_calls: toolCalls
+				});
+
+				for (const toolCall of toolCalls) {
+					const fnName = toolCall.function?.name;
+					const parsedArgs =
+						typeof toolCall.function?.arguments === "string"
+							? JSON.parse(toolCall.function.arguments)
+							: toolCall.function?.arguments || {};
+
+					const toolOutput = await this.executeToolCall(fnName, parsedArgs, options);
+
+					messages.push({
+						role: "tool",
+						content: this._sanitizeUtf8(toolOutput)
+					});
+				}
+
+				this.logger.info(
+					`[LLMService][Ollama] Enviando chamada subsequente ${turn + 1} ao Ollama com os resultados das tools...`
+				);
+
+				const nextTemperature = options.temperature !== undefined ? options.temperature : 0.6;
+				const nextOptions = { ...payload.options, temperature: nextTemperature };
+
+				const nextPayload = {
+					model: payload.model,
+					messages,
+					format: ollamaFormat,
+					stream: false,
+					options: nextOptions
+				};
+
+				const nextTools = Array.isArray(options.tools) ? options.tools : this.getTools();
+				if (Array.isArray(nextTools) && nextTools.length > 0) {
+					nextPayload.tools = nextTools;
+				}
+
+				currentResponse = await axios.post(endpoint, nextPayload, {
+					headers: {
+						"Content-Type": "application/json"
+					},
+					timeout: toTime
+				});
+
+				this._trackUsage(providerName, currentResponse.data, payload.model, options);
+			}
+
+			const finalMsg = currentResponse.data?.message;
+			if (finalMsg && typeof finalMsg.content === "string") {
+				finalMsg.content = this._cleanResponse(finalMsg.content);
+			}
+
+			return currentResponse.data;
 		} catch (error) {
-			this.logger.error("[LLMService] Error calling Ollama API:", error.message);
+			this.logger.error(`[LLMService] Error calling Ollama API (${providerName}):`, error.message);
 			if (error.response) {
-				this.logger.error("[LLMService] Ollama API Response Error:", error.response.status);
+				this.logger.error(
+					`[LLMService][${providerName}] Detalhes do erro HTTP ${error.response.status}:`,
+					typeof error.response.data === "object"
+						? JSON.stringify(error.response.data)
+						: error.response.data
+				);
 			} else if (error.request) {
-				this.logger.error("[LLMService] Ollama API No Response Received.");
+				this.logger.error(`[LLMService][${providerName}] Ollama API No Response Received.`);
 			}
 			throw error;
 		}
@@ -799,85 +3285,78 @@ class LLMService {
 	async getCompletion(options) {
 		const EventHandler = require("../EventHandler");
 		EventHandler.getInstance().emit("activity", { type: "llm" });
+		options._startTime = options._startTime || Date.now();
+		if (typeof options.prompt === "string") {
+			options.prompt = this._sanitizeUtf8(options.prompt);
+		}
+		if (typeof options.systemContext === "string") {
+			options.systemContext = this._sanitizeUtf8(options.systemContext);
+		}
+		if (Array.isArray(options.messages)) {
+			options.messages = this._sanitizeUtf8(options.messages);
+		}
 		const priority = options.priority ?? 0;
-		const maxQueueRetries = 10; // Limit times we can send back to queue
+		const maxQueueRetries = 2; // Até 2 re-enfileiramentos na fila (3 tentativas totais)
 
 		const task = async () => {
 			try {
-				// Se um provedor específico for solicitado, use-o diretamente
+				let result;
 				if (options.provider) {
-					this.logger.debug("[LLMService] Obtendo completion com opções:", {
-						provider: options.provider,
-						promptLength: options.prompt.length,
-						temperature: options.temperature ?? 0.7
-					});
-
 					const response = await this.getCompletionFromSpecificProvider(options);
-					return this._cleanResponse(response);
+					result = this._cleanResponse(response);
 				}
 				// Caso contrário, tente múltiplos provedores em sequência
 				else {
 					const response = await this.getCompletionFromProviders(options, priority);
-					return this._cleanResponse(response);
+					result = this._cleanResponse(response);
 				}
+
+				if (options.maxChars !== undefined || options.truncate === true) {
+					result = this.truncateText(
+						result,
+						options.maxChars ?? 3000,
+						options.maxLines ?? 200,
+						options.maxCharRepeats ?? 15
+					);
+				}
+
+				return result;
 			} catch (error) {
 				this.logger.error("Erro ao obter completion:", error.message);
 				throw error;
 			}
 		};
 
-		const runWithInstantRetries = async () => {
-			let maxInstant = 0;
-			if (priority === 5) maxInstant = 5;
-			else if (priority === 4) maxInstant = 3;
+		// Se a chamada for sub-requisição ou explicitamente configurada para ignorar a fila, executa diretamente
+		if (options.bypassQueue || options.isSubRequest) {
+			return await task();
+		}
 
-			let lastErr;
-			for (let i = 0; i <= maxInstant; i++) {
-				try {
-					return await task();
-				} catch (e) {
-					lastErr = e;
-					if (i < maxInstant) {
-						this.logger.warn(`[LLMService] Instant retry ${i + 1}/${maxInstant} for P${priority}`);
-						await new Promise((r) => setTimeout(r, 1000));
-					}
-				}
-			}
-			throw lastErr;
-		};
-
-		const scheduleRequest = async (attempt, position) => {
+		const scheduleRequest = async (attempt = 0) => {
 			try {
-				if (position === undefined) {
-					return await this.queue.add(runWithInstantRetries, { priority });
-				} else {
-					return await this.queue.addAt(runWithInstantRetries, position, { priority });
-				}
+				return await this.queue.add(task, { priority });
 			} catch (err) {
-				if (attempt < maxQueueRetries) {
-					let nextPos = -1;
-					let shouldRetry = false;
-
-					if (priority >= 4) {
-						shouldRetry = true;
-						nextPos = this.queue.size;
-					} else if (priority === 3) {
-						shouldRetry = true;
-						nextPos = 3;
-					} else if (priority === 2) {
-						shouldRetry = true;
-						nextPos = 5;
-					}
-
-					if (shouldRetry) {
-						this.logger.warn(
-							`[LLMService] Request failed, re-queueing at pos ${nextPos}. (Queue Attempt ${attempt + 1}/${maxQueueRetries})`
-						);
-						await new Promise((r) => setTimeout(r, 2000));
-						return scheduleRequest(attempt + 1, nextPos);
-					}
+				if (
+					err.noRetry ||
+					err.message?.includes("Queue cleared") ||
+					err.message?.includes("QUEUE_CLEARED")
+				) {
+					this.logger.warn(`[LLMService] Requisição cancelada sem retry: ${err.message}`);
+					return "Solicitação cancelada ou fila reiniciada.";
 				}
 
+				if (attempt < maxQueueRetries) {
+					this.logger.warn(
+						`[LLMService] Request failed across providers, re-queueing at the end of priority ${priority} queue. (Queue Attempt ${attempt + 1}/${maxQueueRetries})`
+					);
+					// Pequeno delay antes de re-enfileirar para evitar loop acelerado em fila vazia
+					await new Promise((r) => setTimeout(r, 1500));
+					return scheduleRequest(attempt + 1);
+				}
+
+				this.logger.error(
+					`[LLMService] Requisição falhou definitivamente após ${attempt + 1} tentativas na fila (P${priority}).`
+				);
 				return "Erro: Não foi possível gerar uma resposta. Por favor, tente novamente mais tarde.";
 			}
 		};
@@ -897,6 +3376,9 @@ class LLMService {
 		switch (options.provider) {
 			case "ollama":
 				response = await this.ollamaCompletion(options);
+				if (response && response.message && response.message.content) {
+					return response.message.content;
+				}
 				if (
 					!response ||
 					!response.choices ||
@@ -946,6 +3428,26 @@ class LLMService {
 	 * @param {number} priority - Prioridade da requisição
 	 * @returns {Promise<string>} - O texto gerado pelo primeiro provedor disponível
 	 */
+	/**
+	 * Rebaixa um provedor movendo-o para o final da fila de provedores.
+	 * @param {string} providerName - Nome do provedor a ser rebaixado
+	 */
+	demoteProvider(providerName) {
+		const index = this.providerQueue.findIndex((p) => p.name === providerName);
+		if (index !== -1) {
+			const [removed] = this.providerQueue.splice(index, 1);
+			this.providerQueue.push(removed);
+			this.lastQueueChangeTimestamp = Date.now();
+			this.logger.warn(`[LLMService] Rebaixando provedor ${providerName} para o final da fila.`);
+		}
+	}
+
+	/**
+	 * Tenta múltiplos provedores em sequência até que um funcione
+	 * @param {Object} options - Opções de solicitação
+	 * @param {number} priority - Prioridade da requisição
+	 * @returns {Promise<string>} - O texto gerado pelo primeiro provedor disponível
+	 */
 	async getCompletionFromProviders(options, priority = 0) {
 		const now = Date.now();
 		if (
@@ -965,12 +3467,14 @@ class LLMService {
 			throw new Error("Erro: Nenhum provedor de IA configurado.");
 		}
 
-		// Priority <= 4: Try only the first available provider (no retry/fallback loop on this call).
-		// Priority 5: Try all providers (fallback loop).
-		let attempts = priority <= 4 ? 1 : totalProviders;
+		// Snapshot dos provedores no momento da requisição
+		const candidateProviders = [...this.providerQueue];
 
-		for (let i = 0; i < attempts; i++) {
-			const provider = this.providerQueue[0];
+		// Tenta os provedores disponíveis em sequência (fallback entre provedores)
+		let maxAttempts = candidateProviders.length;
+
+		for (let i = 0; i < maxAttempts && i < candidateProviders.length; i++) {
+			const provider = candidateProviders[i];
 
 			// Check if provider is textOnly and request has images
 			const hasImages = !!(options.image || (options.images && options.images.length > 0));
@@ -978,39 +3482,39 @@ class LLMService {
 				this.logger.info(
 					`[LLMService] Provedor ${provider.name} é textOnly, pulando para o próximo (requisição contém imagens).`
 				);
-				this.providerQueue.push(this.providerQueue.shift());
-				this.lastQueueChangeTimestamp = Date.now();
-				// If priority <= 4 (single attempt), give one more chance to try next provider
-				if (attempts === 1 && i < totalProviders - 1) {
-					attempts++;
+				// If single attempt, allow trying next candidate
+				if (maxAttempts <= i + 1 && i < candidateProviders.length - 1) {
+					maxAttempts = i + 2;
 				}
 				continue;
 			}
 
 			try {
-				this.logger.debug(`[LLMService] Tentando provedor: ${provider.name}`);
+				// this.logger.debug(`[LLMService] Tentando provedor: ${provider.name}`);
 				const result = await provider.method(options);
 
 				if (!result || typeof result !== "string" || result.trim() === "") {
 					throw new Error("Resposta vazia ou inválida do provedor");
 				}
 
-				if (!result.includes("Imagem[")) {
-					this.logger.debug(
-						`[LLMService] Provedor ${provider.name} retornou resposta com sucesso`,
-						{ result: this.summarizeString(result) }
-					);
-				}
-
 				return result;
 			} catch (error) {
-				this.logger.error(`Erro ao usar provedor ${provider.name}:`, error.message);
+				if (error.isFormatError) {
+					this.logger.warn(
+						`[LLMService] Provedor ${provider.name} retornou formato inválido (${error.message}). Repassando para o próximo modelo sem rebaixá-lo na fila global.`
+					);
+					this._trackUsage(provider.name, {}, "Unknown", options, false);
+					// Dá oportunidade ao próximo modelo de atender a requisição atual
+					if (maxAttempts <= i + 1 && i < candidateProviders.length - 1) {
+						maxAttempts = i + 2;
+					}
+				} else {
+					this.logger.error(`Erro ao usar provedor ${provider.name}:`, error.message);
 
-				// Rebaixa o provedor que falhou, movendo-o para o final da fila.
-				this.logger.warn(`[LLMService] Rebaixando provedor ${provider.name} para o final da fila.`);
-				this._trackUsage(provider.name, {}, "Unknown", options, false);
-				this.providerQueue.push(this.providerQueue.shift());
-				this.lastQueueChangeTimestamp = Date.now();
+					// Rebaixa o provedor que falhou por indisponibilidade/erro de execução, movendo-o para o final da fila global.
+					this.demoteProvider(provider.name);
+					this._trackUsage(provider.name, {}, "Unknown", options, false);
+				}
 			}
 		}
 

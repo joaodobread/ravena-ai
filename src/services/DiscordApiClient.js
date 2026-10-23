@@ -1,4 +1,5 @@
 const { Client, GatewayIntentBits, Partials } = require("discord.js");
+const Logger = require("../utils/Logger");
 
 /**
  * Wrapper para o cliente Discord.
@@ -11,22 +12,25 @@ class DiscordApiClient {
 			throw new Error("Discord API Client: o token é obrigatório.");
 		}
 
+		this.logger = new Logger("discord-api-client");
 		this.client = new Client({
 			intents: [
 				GatewayIntentBits.Guilds,
 				GatewayIntentBits.GuildMembers,
 				GatewayIntentBits.GuildMessages,
 				GatewayIntentBits.MessageContent,
-				GatewayIntentBits.DirectMessages
+				GatewayIntentBits.DirectMessages,
+				GatewayIntentBits.GuildMessageReactions,
+				GatewayIntentBits.DirectMessageReactions
 			],
-			partials: [Partials.Channel]
+			partials: [Partials.Channel, Partials.Message, Partials.Reaction, Partials.User]
 		});
 
 		this.token = token;
 
 		// Adiciona um listener de debug para diagnosticar problemas de conexão/eventos
 		if (process.env.DISCORD_DEBUG === "true") {
-			this.client.on("debug", (e) => console.log("[Discord.js Debug]", e));
+			this.client.on("debug", (e) => this.logger.debug("[Discord.js Debug]", e));
 		}
 	}
 

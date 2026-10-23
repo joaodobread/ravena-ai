@@ -223,8 +223,9 @@ async function tarotCommand(bot, message, args, group) {
 	const entrance = getRandom(ENTRANCE_PHRASES);
 	const drawIntro = getRandom(DRAW_PHRASES);
 	const cardNames = drawn.map((c) => `*${c.name}*`).join(", ");
+	const botDisplayName = bot?.nomeExibir || "ravenabot";
 
-	let response = `🔮 *Cartomante _ravenabot_* 🎩\n\n`;
+	let response = `🔮 *Cartomante _${botDisplayName}_* 🎩\n\n`;
 	response += `✨ _${entrance}_ 🪄\n\n`;
 	response += `🎴 ${drawIntro}\n${cardNames}\n\n`;
 
@@ -251,9 +252,9 @@ Responda em PORTUGUÊS BRASIL.`;
 		logger.debug(`[Tarot] Requesting IA analysis for ${userName}`);
 		analysis = await llmService.getCompletion({
 			prompt,
-			systemContext:
-				"Você é uma cartomante experiente, futurista e misteriosa chamada ravenabot. Suas respostas sempre são em 800 caracteres ou menos, sucintas mas poderosas.",
-			priority: 5
+			systemContext: `Você é uma cartomante experiente, futurista e misteriosa chamada ${botDisplayName}. Suas respostas sempre são em 800 caracteres ou menos, sucintas mas poderosas.`,
+			priority: 5,
+			maxTokens: 1000
 		});
 	} catch (error) {
 		logger.error("[Tarot] Error in IA analysis:", error);
@@ -366,4 +367,22 @@ const commands = [
 	})
 ];
 
-module.exports = { commands };
+const helper = {
+	about: "Tiragem de cartas de Tarô com previsões místicas e conselhos",
+	implementation:
+		"Sorteia cartas do baralho de tarô com significados completos, imagens e interpretações em SQLite",
+	tags: "tarot,taro,cartomante,misticismo,futuro,destino,jogos",
+	cmds: [
+		{
+			cmd: "!tarot",
+			desc: "Realiza uma tiragem de carta de Tarô com seu significado",
+			usage: ["!tarot"],
+			category: "jogos"
+		}
+	]
+};
+
+module.exports = {
+	helper,
+	commands
+};

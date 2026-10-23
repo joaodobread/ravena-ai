@@ -184,7 +184,8 @@ async function getCityCoordinates(query) {
 				count: 10,
 				language: "pt",
 				format: "json"
-			}
+			},
+			timeout: 8000
 		});
 
 		if (response.data && response.data.results && response.data.results.length > 0) {
@@ -237,7 +238,8 @@ async function getWeatherData(lat, lon) {
 					"weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset,uv_index_max,precipitation_probability_max",
 				timezone: "auto",
 				forecast_days: 7
-			}
+			},
+			timeout: 8000
 		});
 
 		return response.data;
@@ -362,4 +364,26 @@ const commands = [
 	})
 ];
 
-module.exports = { commands };
+const helper = {
+	about: "Previsão do tempo detalhada utilizando a API Open-Meteo",
+	implementation:
+		"Geocodifica a localização e extrai previsões horárias e diárias de alta precisão via Open-Meteo",
+	tags: "clima,tempo,previsao,open-meteo,meteorologia,chuva",
+	cmds: [
+		{
+			cmd: "!clima",
+			desc: "Consulta a previsão do tempo detalhada para uma cidade",
+			usage: ["!clima Belo Horizonte", "!clima Salvador", "!clima Lisboa"],
+			category: "utilidades"
+		}
+	]
+};
+
+module.exports = {
+	helper,
+	commands,
+	getCityCoordinates,
+	getWeatherData,
+	formatWeatherMessage,
+	WMO_MAPPING
+};

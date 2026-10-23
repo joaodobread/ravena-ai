@@ -12,17 +12,22 @@ const { PermissionsBitField } = require("discord.js");
 const NSFWPredict = require("./utils/NSFWPredict");
 const MuNewsCommands = require("./functions/MuNewsCommands");
 const HoroscopoCommands = require("./functions/HoroscopoCommands");
-const Copa2026 = require("./functions/Copa2026");
+const CanaisCommands = require("./functions/CanaisCommands");
+const RoletaRussaCommands = require("./functions/RoletaRussaCommands");
+// const Copa2026 = require("./functions/Copa2026");
 const RankingMessages = require("./functions/RankingMessages");
 const fs = require("fs").promises;
 const path = require("path");
 const Stickers = require("./functions/Stickers");
-const GeoGuesser = require("./functions/GeoguesserGame");
 const LembretesCommands = require("./functions/LembretesCommands");
+const AFKCommands = require("./functions/AFKCommands");
 const CorreiosCommands = require("./functions/CorreiosCommands");
+const GrupoAgendamentos = require("./commands/modules/GrupoAgendamentos");
+const RaffleMonitor = require("./services/RaffleMonitor");
 const ReturnMessage = require("./models/ReturnMessage");
 const SillyInteractionHandler = require("./SillyInteractionHandler");
 const EventEmitter = require("events");
+const { buildRegex } = require("./utils/RegexFilterValidator");
 const {
 	downloadHandler,
 	detectPlatform,
@@ -52,12 +57,14 @@ class EventHandler extends EventEmitter {
 			? process.env.CMD_WHITELIST.split(",")
 			: ["sa-", "anoni"];
 
-		this.recentlyLeft = [];
-		this.recentlyJoined = [];
 		this.PV_AI_DEBOUNCE_MS = 8000;
 		this.pvDebounce = {};
 		this.activeSpammers = new Set();
+		this.spammerPhoneMap = new Map();
 		this.spammerActiveWindowUntil = 0;
+		this.sentStickersByOriginalMsg = new Map();
+		this.recentSpammerLeaveNotices = new Map();
+		this.greetingTimers = new Map();
 
 		this.logger.info(`[EventHandler] CmdWhitelist:`, this.comandosWhitelist);
 		this.loadGroups();
@@ -78,6 +85,43 @@ class EventHandler extends EventEmitter {
 		} catch (error) {
 			this.logger.error("Erro ao carregar grupos:", error);
 		}
+	}
+
+	/**
+	 * Atualiza ou adiciona um grupo no cache em memória
+	 * @param {Group|Object} group - Objeto do grupo
+	 */
+	updateGroupCache(group) {
+		if (!group || !group.id) return;
+		if (group instanceof Group) {
+			this.groups[group.id] = group;
+		} else {
+			this.groups[group.id] = new Group(group);
+		}
+	}
+
+	/**
+	 * Verifica se um chat/grupo é o grupo de dossiês do bot
+	 * @param {WhatsAppBot} bot - Instância do bot
+	 * @param {string} groupId - ID do grupo
+	 * @returns {boolean}
+	 */
+	isDossieGroup(bot, groupId) {
+		if (!bot || !groupId) return false;
+		if (typeof bot.isDossieGroup === "function") {
+			return bot.isDossieGroup(groupId);
+		}
+		if (!bot.dossieGroups) return false;
+		const clean = (id) => String(id).split("@")[0].trim();
+		const targetClean = clean(groupId);
+		const groups = Array.isArray(bot.dossieGroups)
+			? bot.dossieGroups
+			: typeof bot.dossieGroups === "string" && bot.dossieGroups.includes(",")
+				? bot.dossieGroups.split(",").map((g) => g.trim())
+				: [bot.dossieGroups];
+		return groups.some(
+			(g) => clean(g) === targetClean || String(g).trim() === String(groupId).trim()
+		);
 	}
 
 	/**
@@ -113,13 +157,7 @@ class EventHandler extends EventEmitter {
 					this.groups[groupId] = new Group(existingGroup);
 				} else {
 					// Cria novo grupo
-					let displayName = name
-						? name.trim()
-						: groupId
-								.split("@")[0]
-								.toLowerCase()
-								.replace(/[^a-zA-Z0-9_\-.]/g, "")
-								.substring(0, 30);
+					let displayName = name || groupId.split("@")[0];
 
 					// Verifica se é Discord para formatar o nome como solicitado: nome-guild-nome-do-canal
 					if (bot && bot.useDiscord && message && message.guildId) {
@@ -129,24 +167,28 @@ class EventHandler extends EventEmitter {
 							if (guild && channel) {
 								const cleanGuild = guild.name.replace(/[^a-zA-Z0-9]/g, "").substring(0, 14);
 								const cleanChannel = channel.name.replace(/[^a-zA-Z0-9]/g, "").substring(0, 14);
-								displayName = `${cleanGuild}-${cleanChannel}`.toLowerCase();
+								displayName = `${cleanGuild}-${cleanChannel}`;
 							}
 						} catch (discordErr) {
 							this.logger.error("Erro ao buscar nomes no Discord para displayName:", discordErr);
 						}
 					}
 
-					// Verifica se já tem grupo com esse nome antes
-					let grupoExistente = await this.database.getGroupByName(displayName);
-					while (grupoExistente) {
-						const rndG = Math.floor(Math.random() * 100);
-						this.logger.info(
-							`[getOrCreateGroup] Tentei criar grupo '${displayName}', tentando agora '${displayName}${rndG}', mas já existe um!`,
-							grupoExistente
-						);
-						displayName = `${displayName}${rndG}`;
-						grupoExistente = await this.database.getGroupByName(displayName);
+					const normalizedTitle = String(displayName)
+						.normalize("NFD")
+						.replace(/[\u0300-\u036f]/g, "")
+						.toLowerCase()
+						.replace(/[^a-z0-9]/g, "");
+					const letterCount = (normalizedTitle.match(/[a-z]/g) || []).length;
+					const nameBase = letterCount >= 5 ? normalizedTitle.substring(0, 30) : "gp_estranho_";
+					let sequence = 1;
+					let candidate =
+						letterCount >= 5 ? nameBase : `${nameBase}${String(sequence++).padStart(3, "0")}`;
+					while (await this.database.getGroupByName(candidate)) {
+						const suffix = String(sequence++).padStart(3, "0");
+						candidate = `${nameBase.slice(0, 30 - suffix.length)}${suffix}`;
 					}
+					displayName = candidate;
 
 					const group = new Group({
 						id: groupId,
@@ -190,6 +232,23 @@ class EventHandler extends EventEmitter {
 		// Inicializa sistema de rastreio de encomendas
 		CorreiosCommands.inicializarRastreio(bot).catch((error) => {
 			this.logger.error("Erro ao inicializar rastreio correios:", error);
+		});
+
+		// Inicializa agendamentos de abrir/fechar grupos
+		GrupoAgendamentos.inicializarAgendamentos(bot).catch((error) => {
+			this.logger.error("Erro ao inicializar agendamentos de grupo:", error);
+		});
+
+		// Inicializa monitoramento de rifas
+		RaffleMonitor.getInstance()
+			.init(bot)
+			.catch((error) => {
+				this.logger.error("Erro ao inicializar monitoramento de rifas:", error);
+			});
+
+		// Inicializa temporizadores pendentes de acúmulo de saudações
+		this.initGreetingAccumulationTimers(bot).catch((error) => {
+			this.logger.error("Erro ao inicializar timers de acúmulo de saudações:", error);
 		});
 	}
 
@@ -235,6 +294,11 @@ class EventHandler extends EventEmitter {
 	 */
 	async processMessage(bot, message) {
 		try {
+			// Se o bot estiver explicitamente desativado, descarta processamento
+			if (bot && bot.enabled === false) {
+				return;
+			}
+
 			// Ignorar: Mensagens do bot e mensagens de broadcast ('status@broadcast')
 			if (
 				message.fromMe ||
@@ -299,7 +363,10 @@ class EventHandler extends EventEmitter {
 						// });
 					}
 
-					await Copa2026.detectCopaGif(message, bot);
+					// Canais genéricos cadastrados por grupos
+					await CanaisCommands.detectPost(bot, message);
+
+					//await Copa2026.detectCopaGif(message, bot);
 				} catch (error) {
 					this.logger.error("Erro ao verificar Newsletter:", error);
 				}
@@ -354,22 +421,26 @@ class EventHandler extends EventEmitter {
 				);
 				group = groupData.group;
 
-				if (!group.botNotInGroup) {
-					group.botNotInGroup = [];
+				if (bot.markInGroup) {
+					await bot.markInGroup(message.group);
 				} else {
-					// Verifica se o bot está marcada como fora do grupo - se ele recebeu msg aqui, é pq tá dentro!
-					if (group.botNotInGroup.includes(bot.id)) {
-						this.logger.info(
-							`[processMessage] O bot '${bot.id}' estava como fora do grupo '${group.name}', mas recebeu mensagem - atualizando`
-						);
-						group.botNotInGroup = group.botNotInGroup.filter((b) => b !== bot.id);
-						await this.database.saveGroup(group);
+					if (!group.botNotInGroup) {
+						group.botNotInGroup = [];
+					} else {
+						// Verifica se o bot está marcado como fora do grupo - se ele recebeu msg aqui, é pq tá dentro!
+						if (group.botNotInGroup.includes(bot.id)) {
+							this.logger.info(
+								`[processMessage] O bot '${bot.id}' estava como fora do grupo '${group.name}', mas recebeu mensagem - atualizando`
+							);
+							group.botNotInGroup = group.botNotInGroup.filter((b) => b !== bot.id);
+							await this.database.saveGroup(group);
+						}
 					}
-				}
 
-				// Como o bot recebeu mensagem do grupo, ele está nele. Remove do skip list.
-				if (bot.removeSkipGroup) {
-					await bot.removeSkipGroup(message.group);
+					// Como o bot recebeu mensagem do grupo, ele está nele. Remove do skip list.
+					if (bot.removeSkipGroup) {
+						await bot.removeSkipGroup(message.group);
+					}
 				}
 
 				// Verifica apelido do usuário e atualiza o nome se necessário
@@ -397,6 +468,7 @@ class EventHandler extends EventEmitter {
 				// Ajuda com recuperação de grupo
 				const botNameRecovery = (bot.nomeExibir || "ravena").toLowerCase();
 				if (
+					!this.isDossieGroup(bot, message.group) &&
 					textContent &&
 					typeof textContent === "string" &&
 					textContent.trim().toLowerCase() === `ravena, ajude a recuperar meu grupo!`
@@ -478,6 +550,14 @@ class EventHandler extends EventEmitter {
 					this.logger.error("Erro ao processar mensagem para ranking:", error);
 				}
 
+				// Processa rotinas de AFK (remoção automática ao falar e resposta a menções)
+				try {
+					await AFKCommands.checkReturnFromAFK(bot, message, group);
+					await AFKCommands.detectAFKMentions(bot, message, group);
+				} catch (error) {
+					this.logger.error("Erro ao processar verificações de AFK:", error);
+				}
+
 				// Verifica se o usuário está ignorado
 				if (group && group.ignoredNumbers && Array.isArray(group.ignoredNumbers)) {
 					// Check if any part of the author's number matches an ignored number
@@ -492,12 +572,44 @@ class EventHandler extends EventEmitter {
 				}
 
 				// Aplica filtros
+				if (group && (await RoletaRussaCommands.isUserSilenced(group.id, message.author))) {
+					this.logger.info(
+						`Mensagem de jogador morto na roleta removida no grupo ${group.id}: ${message.author}`
+					);
+					message.origin.delete(true).catch((error) => {
+						this.logger.error("Erro ao deletar mensagem de jogador morto na roleta:", error);
+					});
+					return;
+				}
+
 				if (await this.applyFilters(bot, message, group)) {
 					return; // Mensagem foi filtrada
+				}
+
+				// Se NUDENET_DETECT_ALL estiver ativo e a mídia não foi verificada pelo filtro do grupo (ex: grupo sem filtro nsfw ativo)
+				if (this.isNudenetDetectAll() && !group?.filters?.nsfw) {
+					this.checkNSFW(bot, message, group, true).catch((err) => {
+						this.logger.error("Erro em background checkNSFW (detectAll grupo):", err);
+					});
 				}
 			} else {
 				// Armazena mensagem para histórico de conversação no pv
 				SummaryCommands.storeMessage(message, message.group, bot);
+
+				// Se NUDENET_DETECT_ALL estiver ativo, verifica mídias no PV em background (sem bloquear autoSticker/comandos)
+				if (this.isNudenetDetectAll()) {
+					this.checkNSFW(bot, message, null, true).catch((err) => {
+						this.logger.error("Erro em background checkNSFW (detectAll PV):", err);
+					});
+				}
+			}
+
+			// Ignora todos os comandos se a mensagem for do grupo de dossiês
+			if (message.group && this.isDossieGroup(bot, message.group)) {
+				this.logger.debug(
+					`[${bot.id}] Mensagem recebida no grupo de dossiês (${message.group}). Comandos ignorados.`
+				);
+				return;
 			}
 
 			// Se não houver conteúdo de texto, não pode ser um comando ou menção
@@ -716,6 +828,24 @@ class EventHandler extends EventEmitter {
 
 		const filters = group.filters;
 
+		// Se o grupo permitir que administradores ignorem os filtros
+		if (filters.allowAdmins || filters.permitirAdm) {
+			const chatRaw = message.origin?.getChat
+				? await message.origin.getChat().catch(() => null)
+				: null;
+			const chat = chatRaw?.participants?.length ? chatRaw : null;
+			let isSenderAdmin = await this.adminUtils.isAdmin(message.author, group, chat, bot);
+			if (!isSenderAdmin && message.authorAlt) {
+				isSenderAdmin = await this.adminUtils.isAdmin(message.authorAlt, group, chat, bot);
+			}
+			if (isSenderAdmin) {
+				this.logger.debug(
+					`[applyFilters] Mensagem de ${message.author} ignorada pelos filtros pois o autor é admin no grupo ${group.id}.`
+				);
+				return false;
+			}
+		}
+
 		// Verifica filtro de palavras
 		if (filters.words && Array.isArray(filters.words) && filters.words.length > 0) {
 			if (textContent) {
@@ -737,16 +867,53 @@ class EventHandler extends EventEmitter {
 			}
 		}
 
+		// Verifica filtro de regex
+		const regexList = Array.isArray(filters.regexes)
+			? filters.regexes
+			: Array.isArray(filters.regex)
+				? filters.regex
+				: [];
+		if (regexList.length > 0 && textContent) {
+			for (const pattern of regexList) {
+				try {
+					const regex = buildRegex(pattern);
+					if (regex && regex.test(textContent)) {
+						this.logger.info(
+							`Mensagem filtrada no grupo ${group.id} - corresponde ao regex proibido: ${pattern}`
+						);
+
+						// Deleta a mensagem se possível - não bloqueia
+						message.origin.delete(true).catch((error) => {
+							this.logger.error("Erro ao deletar mensagem filtrada por regex:", error);
+						});
+
+						return true;
+					}
+				} catch (regexErr) {
+					this.logger.error(`Erro ao aplicar regex "${pattern}" no grupo ${group.id}:`, regexErr);
+				}
+			}
+		}
+
 		// Verifica filtro de links
-		if (filters.links && textContent && textContent.match(/https?:\/\/[^\s]+/g)) {
-			this.logger.info(`Mensagem filtrada no grupo ${group.id} - contém link`);
+		if (filters.links && textContent) {
+			const foundLinks = textContent.match(/(?:https?:\/\/|www\.)[^\s]+/gi);
+			if (foundLinks && foundLinks.length > 0) {
+				const allowedLinks = Array.isArray(filters.allowedLinks) ? filters.allowedLinks : [];
+				// Se todos os links encontrados estiverem na lista de permitidos, a mensagem é autorizada
+				const hasForbiddenLink = foundLinks.some((link) => !this.isLinkAllowed(link, allowedLinks));
 
-			// Deleta a mensagem se possível - não bloqueia
-			message.origin.delete(true).catch((error) => {
-				this.logger.error("Erro ao deletar mensagem filtrada:", error);
-			});
+				if (hasForbiddenLink) {
+					this.logger.info(`Mensagem filtrada no grupo ${group.id} - contém link não permitido`);
 
-			return true;
+					// Deleta a mensagem se possível - não bloqueia
+					message.origin.delete(true).catch((error) => {
+						this.logger.error("Erro ao deletar mensagem filtrada:", error);
+					});
+
+					return true;
+				}
+			}
 		}
 
 		// Verifica filtro de pessoas
@@ -793,90 +960,441 @@ class EventHandler extends EventEmitter {
 			}
 		}
 
-		// Verifica filtro NSFW para imagens e vídeos
+		// Verifica filtro NSFW para imagens, vídeos, gifs e stickers
 		if (
 			filters.nsfw &&
-			(message.type === "image" || message.type === "sticker" || message.type === "video")
+			(message.type === "image" ||
+				message.type === "sticker" ||
+				message.type === "video" ||
+				message.type === "gif" ||
+				message.content?.mimetype === "image/gif")
 		) {
-			this.logger.info(`Filtros: ${message.type} - Verificando NSFW`);
-			// Processa a imagem/vídeo para detecção NSFW
-			try {
-				// Primeiro salvamos a mídia temporariamente
-				const tempDir = path.join(__dirname, "../temp");
+			// Se for mensagem de sticker, ignora o check NSFW inicial e processa/envia o sticker imediatamente.
+			// Agenda verificação assíncrona pós-envio: se for NSFW, apaga a mensagem original e também o sticker enviado.
+			if (this.isStickerMessage(message, group, bot)) {
+				this.logger.info(
+					`[${group.name || group.id}] Mensagem de sticker detectada em grupo com filtro NSFW. Ignorando checagem inicial e agendando verificação pós-envio...`
+				);
+				this.schedulePostStickerNSFWCheck(bot, message, group);
+				return false;
+			}
 
-				// Garante que o diretório temporário exista
+			const isDetectAll = this.isNudenetDetectAll();
+			if (await this.checkNSFW(bot, message, group, isDetectAll)) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * Extrai e normaliza informações de um link para verificação contra filtros permitidos
+	 * @param {string} urlStr
+	 * @returns {{ hostname: string, pathname: string, full: string }}
+	 */
+	parseUrlInfo(urlStr) {
+		const clean = (urlStr || "").replace(/[.,;!?)]+$/, "");
+		try {
+			const formatted = /^[a-zA-Z][a-zA-Z\d+\-.]*:\/\//.test(clean) ? clean : `http://${clean}`;
+			const parsed = new URL(formatted);
+			const hostname = parsed.hostname.toLowerCase();
+			const pathname = parsed.pathname.toLowerCase();
+			return {
+				hostname,
+				pathname,
+				full: `${hostname}${pathname}`
+			};
+		} catch {
+			const fallbackHost = clean
+				.replace(/^https?:\/\//i, "")
+				.split(/[/?#]/)[0]
+				.toLowerCase();
+			return {
+				hostname: fallbackHost,
+				pathname: "",
+				full: fallbackHost
+			};
+		}
+	}
+
+	/**
+	 * Verifica se uma URL é permitida de acordo com a lista de links/padrões permitidos
+	 * @param {string} urlStr - URL encontrada na mensagem
+	 * @param {Array<string>} allowedList - Lista de domínios ou padrões permitidos
+	 * @returns {boolean} - True se for permitida
+	 */
+	isLinkAllowed(urlStr, allowedList) {
+		if (!Array.isArray(allowedList) || allowedList.length === 0) {
+			return false;
+		}
+
+		const urlInfo = this.parseUrlInfo(urlStr);
+		if (!urlInfo.hostname) return false;
+
+		return allowedList.some((rawPattern) => {
+			if (!rawPattern || typeof rawPattern !== "string") return false;
+			const pattern = rawPattern.trim().toLowerCase();
+			if (!pattern) return false;
+
+			// Suporte a wildcard (*)
+			if (pattern.includes("*")) {
+				const target = pattern.includes("/") ? urlInfo.full : urlInfo.hostname;
+				const regexStr =
+					"^" + pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*") + "$";
 				try {
-					await fs.access(tempDir);
-				} catch (error) {
-					await fs.mkdir(tempDir, { recursive: true });
-				}
-
-				// Obtém dados da mídia
-				let mediaData = message.content?.data;
-
-				// Se não tiver dados (comum em vídeos), tenta baixar
-				if (!mediaData && typeof message.downloadMedia === "function") {
-					this.logger.debug("Baixando mídia para verificação NSFW...");
-					try {
-						const media = await message.downloadMedia();
-						mediaData = media?.data;
-					} catch (dlErr) {
-						this.logger.error("Erro ao baixar mídia para verificação NSFW:", dlErr);
-					}
-				}
-
-				if (!mediaData) {
-					this.logger.warn(
-						"Não foi possível obter dados da mídia para verificação NSFW, ignorando."
-					);
+					return new RegExp(regexStr, "i").test(target);
+				} catch {
 					return false;
 				}
+			}
 
-				// Gera nome de arquivo temporário único
-				const fileExt = message.type === "image" || message.type === "sticker" ? "jpg" : "mp4";
+			// Se o padrão especifica um caminho (ex: domain.com/path)
+			if (pattern.includes("/")) {
+				return (
+					urlInfo.full === pattern ||
+					urlInfo.full.startsWith(pattern.endsWith("/") ? pattern : `${pattern}/`)
+				);
+			}
+
+			// Correspondência exata ou subdomínio (ex: 'terra.com.br' casa com 'terra.com.br' e 'sub.terra.com.br')
+			return urlInfo.hostname === pattern || urlInfo.hostname.endsWith(`.${pattern}`);
+		});
+	}
+
+	/**
+	 * Verifica se a detecção de NSFW em todas as mídias está ativada via .env
+	 * @returns {boolean}
+	 */
+	isNudenetDetectAll() {
+		const envVal = process.env.NUDENET_DETECT_ALL;
+		if (!envVal) return false;
+		const val = envVal.toString().trim().toLowerCase();
+		return val !== "0" && val !== "false" && val !== "undefined";
+	}
+
+	/**
+	 * Realiza verificação NSFW em imagem, vídeo ou GIF recebido
+	 * @param {WhatsAppBot} bot - Instância do bot
+	 * @param {Object} message - Mensagem recebida
+	 * @param {Group|null} group - Grupo (se houver)
+	 * @param {boolean} [isDetectAll=false] - Se foi disparado via NUDENET_DETECT_ALL
+	 * @returns {Promise<boolean>} - True se a mensagem foi filtrada (deletada)
+	 */
+	async checkNSFW(bot, message, group, isDetectAll = false) {
+		const isGroupFilter = Boolean(group?.filters?.nsfw);
+
+		// Stickers só são verificados se o filtro do grupo estiver ativo (NUDENET_DETECT_ALL não verifica stickers)
+		if (message.type === "sticker" && !isGroupFilter) {
+			return false;
+		}
+
+		const isGif =
+			message.type === "gif" ||
+			message.content?.mimetype === "image/gif" ||
+			message.content?._mediaDetails?.gifPlayback === true;
+		const isVideo = message.type === "video";
+		const isImage = message.type === "image";
+		const isSticker = message.type === "sticker";
+
+		if (!isImage && !isVideo && !isGif && !isSticker) {
+			return false;
+		}
+
+		if (!this.nsfwPredict.isAvailable()) {
+			return false;
+		}
+
+		try {
+			const tempDir = path.join(__dirname, "../temp");
+			try {
+				await fs.access(tempDir);
+			} catch (error) {
+				await fs.mkdir(tempDir, { recursive: true });
+			}
+
+			// Obtém dados da mídia (suporta tanto base64 quanto data)
+			let mediaData = message.content?.data || message.content?.base64;
+
+			// Se não tiver dados (comum em vídeos e mensagens WhatsGo), tenta baixar
+			if (!mediaData && typeof message.downloadMedia === "function") {
+				try {
+					const media = await message.downloadMedia();
+					mediaData = media?.data || media?.base64;
+				} catch (dlErr) {
+					this.logger.error("Erro ao baixar mídia para verificação NSFW:", dlErr);
+				}
+			}
+
+			if (!mediaData) {
+				const groupTag = group?.name ? `[${group.name}] ` : "";
+				this.logger.warn(
+					`${groupTag}Não foi possível obter dados da mídia para verificação NSFW, ignorando.`
+				);
+				return false;
+			}
+
+			// Stickers não devem ser marcados como detectAll
+			const isDetectAllForMedia = isDetectAll && !isSticker;
+			const isStickerCmd = this.isStickerMessage(message, group, bot);
+
+			const nsfwContext = {
+				groupName: group?.name || group?.id || (message.group ? message.group : "PV"),
+				groupTitle: group?.titulo || null,
+				bot,
+				botId: bot?.id || bot?.nome,
+				author: message.author || message.authorAlt || "desconhecido",
+				authorName:
+					message.name ||
+					message.pushName ||
+					message.authorName ||
+					message.author ||
+					"desconhecido",
+				threshold: group?.filters?.nsfwThreshold,
+				group,
+				detectAll: isDetectAllForMedia,
+				isDetectAll: isDetectAllForMedia,
+				isSticker: isSticker || isStickerCmd,
+				type: message.type
+			};
+
+			let result = { isNSFW: false, reason: "" };
+
+			if (isVideo || isGif) {
+				const isGifMime = isGif && message.content?.mimetype === "image/gif";
+				const fileExt = isGifMime ? "gif" : "mp4";
 				const tempFilePath = path.join(
 					tempDir,
 					`nsfw-check-${Date.now()}-${Math.floor(Math.random() * 1000)}.${fileExt}`
 				);
 
-				// Salva a mídia
 				const mediaBuffer = Buffer.from(mediaData, "base64");
 				await fs.writeFile(tempFilePath, mediaBuffer);
 
-				let result = { isNSFW: false, reason: "" };
-
-				// Apenas imagens são verificadas para NSFW
-				if (message.type === "image" || message.type === "sticker") {
-					// Verifica NSFW
-					result = await this.nsfwPredict.detectNSFW(mediaData);
-				} else if (message.type === "video") {
-					// Verifica NSFW em vídeo
-					result = await this.nsfwPredict.detectNSFWVideo(tempFilePath);
+				try {
+					result = await this.nsfwPredict.detectNSFWVideo(tempFilePath, nsfwContext);
+				} finally {
+					fs.unlink(tempFilePath).catch((error) => {
+						this.logger.error(`Erro ao excluir arquivo temporário ${tempFilePath}:`, error);
+					});
 				}
+			} else {
+				// Imagem ou Sticker
+				result = await this.nsfwPredict.detectNSFW(mediaData, nsfwContext);
+			}
 
-				// Limpa o arquivo temporário
-				fs.unlink(tempFilePath).catch((error) => {
-					this.logger.error(`Erro ao excluir arquivo temporário ${tempFilePath}:`, error);
-				});
-
-				if (result.isNSFW) {
+			if (result.isNSFW) {
+				if (isGroupFilter) {
 					this.logger.info(
-						`Mensagem filtrada no grupo ${group.id} - conteúdo NSFW detectado, motivo: ${result.reason}`
+						`[${nsfwContext.groupName}] Mensagem NSFW filtrada - motivo: ${result.reason} [enviado por ${nsfwContext.authorName}/${nsfwContext.author}]`
 					);
 
-					// Deleta a mensagem
+					// Deleta a mensagem se o filtro do grupo estiver ativo
 					message.origin.delete(true).catch((error) => {
 						this.logger.error("Erro ao deletar mensagem NSFW:", error);
 					});
 
 					return true;
+				} else {
+					this.logger.info(
+						`[${nsfwContext.groupName}] Mensagem NSFW detectada (detectAll) - motivo: ${result.reason} [enviado por ${nsfwContext.authorName}/${nsfwContext.author}]`
+					);
+					return false;
 				}
-			} catch (nsfwError) {
-				this.logger.error("Erro ao verificar conteúdo NSFW:", nsfwError);
+			}
+		} catch (nsfwError) {
+			this.logger.error("Erro ao verificar conteúdo NSFW:", nsfwError);
+		}
+
+		return false;
+	}
+
+	/**
+	 * Registra um sticker enviado pelo bot associado ao ID da mensagem original
+	 * @param {string} originalMsgId - ID da mensagem original
+	 * @param {Object} stickerInfo - { chatId, id }
+	 */
+	registerSentSticker(originalMsgId, stickerInfo) {
+		if (!originalMsgId || !stickerInfo) return;
+		const idsToRegister = [String(originalMsgId)];
+		if (typeof originalMsgId === "string" && originalMsgId.includes("_")) {
+			const parts = originalMsgId.split("_");
+			idsToRegister.push(parts[parts.length - 1]);
+		}
+
+		for (const id of idsToRegister) {
+			if (!this.sentStickersByOriginalMsg.has(id)) {
+				this.sentStickersByOriginalMsg.set(id, []);
+			}
+			this.sentStickersByOriginalMsg.get(id).push(stickerInfo);
+		}
+
+		// Expira após 15 minutos para evitar acúmulo de memória
+		setTimeout(
+			() => {
+				for (const id of idsToRegister) {
+					this.sentStickersByOriginalMsg.delete(id);
+				}
+			},
+			15 * 60 * 1000
+		);
+	}
+
+	/**
+	 * Obtém a lista de stickers enviados associados a uma mensagem original
+	 * @param {string} originalMsgId - ID da mensagem original
+	 * @returns {Array<Object>}
+	 */
+	getSentStickersForMessage(originalMsgId) {
+		if (!originalMsgId) return [];
+		const strId = String(originalMsgId);
+		let list = this.sentStickersByOriginalMsg.get(strId);
+		if (!list && strId.includes("_")) {
+			const parts = strId.split("_");
+			list = this.sentStickersByOriginalMsg.get(parts[parts.length - 1]);
+		}
+		return list || [];
+	}
+
+	/**
+	 * Limpa o registro de stickers enviados para uma mensagem
+	 * @param {string} originalMsgId
+	 */
+	clearSentStickersForMessage(originalMsgId) {
+		if (!originalMsgId) return;
+		const strId = String(originalMsgId);
+		this.sentStickersByOriginalMsg.delete(strId);
+		if (strId.includes("_")) {
+			const parts = strId.split("_");
+			this.sentStickersByOriginalMsg.delete(parts[parts.length - 1]);
+		}
+	}
+
+	/**
+	 * Verifica se uma mensagem é um comando de criação de sticker
+	 * @param {Object} message - Objeto da mensagem
+	 * @param {Object} group - Objeto do grupo
+	 * @param {WhatsAppBot} bot - Instância do bot
+	 * @returns {boolean}
+	 */
+	isStickerMessage(message, group, bot) {
+		const textContent = (message.type === "text" ? message.content : message.caption) ?? "";
+		if (!textContent || typeof textContent !== "string") return false;
+
+		const prefix = group?.prefix ?? bot?.prefix ?? "!";
+		const botPrefix = bot?.prefix ?? "!";
+		const prefixes = Array.from(new Set([prefix, botPrefix, "!"])).filter(Boolean);
+
+		const stickerCommands = new Set([
+			"s",
+			"fig",
+			"sticker",
+			"figurinha",
+			"sq",
+			"stickerq",
+			"sqc",
+			"stickerqc",
+			"sqb",
+			"stickerqb",
+			"sqe",
+			"stickerqe",
+			"sqi",
+			"stickerqi",
+			"sbg",
+			"stickerbg"
+		]);
+
+		const trimmed = textContent.trim();
+		for (const p of prefixes) {
+			if (trimmed.startsWith(p)) {
+				const afterPrefix = trimmed.substring(p.length).trim();
+				const cmd = afterPrefix.split(/\s+/)[0].toLowerCase();
+				if (stickerCommands.has(cmd)) {
+					return true;
+				}
 			}
 		}
 
 		return false;
+	}
+
+	/**
+	 * Executa verificação NSFW assíncrona pós-envio para comandos de sticker em grupos com filtro.
+	 * Se for detectado conteúdo NSFW, apaga a mensagem original do usuário e também o sticker enviado pelo bot.
+	 * @param {WhatsAppBot} bot - Instância do bot
+	 * @param {Object} message - Mensagem original do usuário
+	 * @param {Object} group - Grupo onde o comando foi enviado
+	 */
+	schedulePostStickerNSFWCheck(bot, message, group) {
+		const originalMsgId =
+			message.origin?.id?._serialized || message.origin?.id?.id || message.id || message.key?.id;
+		const chatId = group?.id || message.group;
+
+		(async () => {
+			try {
+				const isDetectAll = this.isNudenetDetectAll();
+				// Executa a checagem NSFW
+				const isNSFW = await this.checkNSFW(bot, message, group, isDetectAll);
+
+				if (isNSFW) {
+					this.logger.warn(
+						`[NSFW-Sticker-Purge] Conteúdo NSFW detectado no comando de sticker em [${group?.name || chatId}]. Deletando mensagem original e sticker enviado...`
+					);
+
+					// 1. Deleta a mensagem original do usuário (se ainda não deletada pelo checkNSFW)
+					try {
+						await message.origin.delete(true);
+						this.logger.info(`[NSFW-Sticker-Purge] Mensagem original ${originalMsgId} deletada.`);
+					} catch (delOrigErr) {
+						this.logger.error("Erro ao deletar mensagem original NSFW:", delOrigErr);
+					}
+
+					// 2. Aguarda até 15 segundos caso o sticker ainda esteja sendo gerado/enviado
+					const maxWaitMs = 15000;
+					const pollIntervalMs = 500;
+					const start = Date.now();
+					let stickersPurged = false;
+
+					while (Date.now() - start < maxWaitMs) {
+						const sentStickers = this.getSentStickersForMessage(originalMsgId);
+						if (sentStickers && sentStickers.length > 0) {
+							for (const stickerInfo of sentStickers) {
+								const stickerMsgId = stickerInfo.id;
+								this.logger.warn(
+									`[NSFW-Sticker-Purge] Deletando sticker enviado ${stickerMsgId} em ${chatId}...`
+								);
+								try {
+									if (typeof bot.deleteMessageByKey === "function") {
+										await bot.deleteMessageByKey({
+											remoteJid: chatId,
+											id: stickerMsgId,
+											fromMe: true
+										});
+										this.logger.info(
+											`[NSFW-Sticker-Purge] ✓ Sticker enviado ${stickerMsgId} deletado com sucesso!`
+										);
+									}
+								} catch (delStickerErr) {
+									this.logger.error("Erro ao deletar sticker enviado:", delStickerErr);
+								}
+							}
+							this.clearSentStickersForMessage(originalMsgId);
+							stickersPurged = true;
+							break;
+						}
+						await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+					}
+
+					if (!stickersPurged) {
+						this.logger.debug(
+							`[NSFW-Sticker-Purge] Nenhum sticker registrado para ${originalMsgId} após timeout de espera.`
+						);
+					}
+				}
+			} catch (err) {
+				this.logger.error("Erro na checagem assíncrona de NSFW para sticker:", err);
+			}
+		})();
 	}
 
 	/**
@@ -916,140 +1434,218 @@ class EventHandler extends EventEmitter {
 			data?.isBotJoining ||
 			data?.group?.isBotJoining ||
 			data?.user?.id?.startsWith(bot.phoneNumber);
-		if (bot.removeSkipGroup) {
+		if (bot.markInGroup) {
+			await bot.markInGroup(groupId);
+		} else if (bot.removeSkipGroup) {
 			await bot.removeSkipGroup(groupId);
 		}
 
 		if (data.isCommunity || data.group?.isCommunity) {
-			this.logger.debug(`[processGroupJoin] IGNORANDO evento de join em comunidade.`);
+			this.logger.debug(`[processGroupJoin] IGNORANDO evento de join em comunidade (${groupId}).`);
 			return;
 		}
 
-		if (data.isAnnounce || data.group?.isAnnounce) {
-			this.logger.debug(`[processGroupJoin] IGNORANDO evento de join em Announce Channel.`);
+		// Motivo da alteração: Grupos configurados como "Apenas administradores enviam mensagens" (isAnnounce / modo avisos)
+		// anteriormente tinham todos os eventos de entrada ignorados. Agora, se o grupo possuir mensagem de boas-vindas
+		// ou despedida definida, o evento NÃO é ignorado e a mensagem é enviada normalmente.
+		const initialGroupCheck = this.groups[groupId] ?? (await this.database.getGroup(groupId));
+		const initialHasGreetings =
+			initialGroupCheck?.greetings &&
+			Object.keys(initialGroupCheck.greetings).some((k) => initialGroupCheck.greetings[k]);
+		const initialHasFarewells =
+			initialGroupCheck?.farewells &&
+			Object.keys(initialGroupCheck.farewells).some((k) => initialGroupCheck.farewells[k]);
+		if (
+			(data.isAnnounce || data.group?.isAnnounce) &&
+			!initialHasGreetings &&
+			!initialHasFarewells
+		) {
+			this.logger.debug(
+				`[processGroupJoin] IGNORANDO evento de join em Announce Channel (${groupId}) (sem boas-vindas/despedida configuradas).`
+			);
 			return;
 		}
 
 		//this.logger.info(`[processGroupJoin] `, { data });
 
-		// Carrega o grupo para verificar se o usuário que entrou está bloqueado
+		// Verificação de banidos no grupo (bannedUsers - apenas bots privados)
 		try {
-			const group = await this.database.getGroup(groupId);
+			const group =
+				this.groups[groupId] || (await this.database?.getGroup(groupId).catch(() => null));
+
 			if (
+				!isBotJoining &&
 				group &&
-				group.filters &&
-				group.filters.people &&
-				Array.isArray(group.filters.people) &&
-				group.filters.people.length > 0
+				Array.isArray(group.bannedUsers) &&
+				group.bannedUsers.length > 0 &&
+				bot.privado
 			) {
-				const userId = data.user.id;
-				let userPn = userId.split("@")[0];
-				let userLid = null;
+				const userId = data.user?.id;
+				if (userId) {
+					let userPn = userId.split("@")[0].replace(/\D/g, "");
+					let userLid = userId.endsWith("@lid") ? userId.split("@")[0] : null;
 
-				try {
-					const contact = await bot.client.getContactById(userId);
-					if (contact) {
-						userPn = contact.id._serialized.split("@")[0];
-						if (contact.lid) {
-							userLid = contact.lid.split("@")[0];
+					try {
+						const contact = await bot.client?.getContactById?.(userId);
+						if (contact) {
+							if (contact.id?._serialized) {
+								userPn = contact.id._serialized.split("@")[0].replace(/\D/g, "");
+							}
+							if (contact.lid) {
+								userLid = contact.lid.split("@")[0];
+							}
 						}
+					} catch (contactErr) {
+						// Ignora erro ao buscar contato
 					}
-				} catch (contactErr) {
-					this.logger.error(
-						`[processGroupJoin] Erro ao obter contato ${userId} para validação de ban:`,
-						contactErr.message
-					);
-				}
 
-				const isBlocked = group.filters.people.some((blocked) => {
-					const blockedClean = blocked.split("@")[0];
-					return blockedClean === userPn || (userLid && blockedClean === userLid);
-				});
+					const isBanned = group.bannedUsers.some((ban) => {
+						if (!ban) return false;
+						if (typeof ban === "string") {
+							const cleanBan = ban.split("@")[0].replace(/\D/g, "");
+							return (
+								(cleanBan && cleanBan === userPn) || (userLid && ban.split("@")[0] === userLid)
+							);
+						}
+						const banPhone = ban.phone ? String(ban.phone).split("@")[0].replace(/\D/g, "") : null;
+						const banLid = ban.lid ? String(ban.lid).split("@")[0] : null;
+						const banId = ban.id ? String(ban.id).split("@")[0].replace(/\D/g, "") : null;
+						return (
+							(banPhone && banPhone === userPn) ||
+							(banLid && userLid && banLid === userLid) ||
+							(banId && banId === userPn)
+						);
+					});
 
-				if (isBlocked) {
-					this.logger.warn(
-						`[processGroupJoin] Usuário bloqueado detectado ao entrar no grupo: ${userId} (LID: ${userLid}) no grupo ${groupId}. Removendo imediatamente.`
-					);
-					await bot.removeFromGroup(groupId, [userId]);
-					return;
+					if (isBanned) {
+						this.logger.warn(
+							`[processGroupJoin] Usuário banido detectado ao entrar no grupo: ${userId} (Telefone: ${userPn}, LID: ${userLid}) no grupo ${groupId}. Removendo imediatamente.`
+						);
+						try {
+							await bot.removeFromGroup(groupId, [userId]);
+						} catch (remErr) {
+							this.logger.error(
+								`[processGroupJoin] Erro ao remover usuário banido ${userId} do grupo ${groupId}:`,
+								remErr
+							);
+						}
+
+						try {
+							const chat = await data.origin?.getChat?.();
+							if (chat?.linkedParentJid) {
+								await bot.removeFromCommunity(chat.linkedParentJid, [userId]).catch(() => {});
+							}
+						} catch (chatErr) {
+							// Ignora erro de comunidade
+						}
+
+						const idParaDesbanir = userPn || userLid || userId.split("@")[0];
+						const banNotice = `🚫 @${userPn || userLid || userId.split("@")[0]} está banido deste grupo e foi removido.\nPara desbanir: \`!g-desbanir ${idParaDesbanir}\``;
+						try {
+							await bot.sendMessage(groupId, banNotice, {
+								mentions: [userId]
+							});
+						} catch (sendErr) {
+							this.logger.error(
+								`[processGroupJoin] Erro ao enviar aviso de ban no grupo ${groupId}:`,
+								sendErr
+							);
+						}
+						return;
+					}
 				}
 			}
 		} catch (dbErr) {
-			this.logger.error(`[processGroupJoin] Erro ao verificar filtros do grupo ${groupId}:`, dbErr);
+			this.logger.error(
+				`[processGroupJoin] Erro ao verificar filtros/ban do grupo ${groupId}:`,
+				dbErr
+			);
 		}
 
 		if (!isBotJoining) {
-			// Se não for o bot sendo adicionado, coloca pessoa numa lista pra ignorar o join e evitar spam no grupo
-			//if(this.recentlyJoined.includes(data.user.id)) return;
-			this.recentlyJoined.push(data.user.id);
-
-			const fixedGroups = [
-				process.env.GRUPO_INTERACAO,
-				process.env.GRUPO_PESCA,
-				process.env.GRUPO_DOWNLOADS
-			].filter(Boolean);
-
-			if (data.user && data.user.id && fixedGroups.includes(groupId)) {
-				const userId = data.user.id;
-				const userPhone = userId.split("@")[0];
-				if (userPhone.startsWith("63") || userPhone.startsWith("62")) {
+			const group =
+				this.groups[groupId] || (await this.database?.getGroup(groupId).catch(() => null));
+			if (data.user && this.isSpamMonitoredGroup(groupId, group)) {
+				const isSpammer = await this.isSpammerUser(bot, data.user, groupId, null, group);
+				if (isSpammer) {
+					const userId = data.user.id;
+					const userPhone =
+						(await this.resolveSpammerPhone(bot, data.user)) ||
+						this.extractPhoneNumber(data.user) ||
+						this.extractPhoneNumber(userId);
+					const userLid = userId && userId.endsWith("@lid") ? userId : null;
 					this.logger.warn(
-						`[processGroupJoin] Spammer detectado via join event: ${userId} no grupo ${groupId}`
+						`[processGroupJoin] Spammer detectado via join event: ${userId} (telefone: ${userPhone || "não identificado"}) no grupo monitorado ${groupId}. Removendo imediatamente sem enviar boas-vindas.`
 					);
-					this.activeSpammers.add(userId);
-					this.activeSpammers.add(userPhone);
-					this.spammerActiveWindowUntil = Date.now() + 5 * 60 * 1000; // Ativa janela de monitoramento por 5 minutos
-					setTimeout(
-						() => {
-							this.activeSpammers.delete(userId);
-							this.activeSpammers.delete(userPhone);
-						},
-						5 * 60 * 1000
-					);
+					this.registerSpammer(userId, userPhone, userLid);
+
+					try {
+						await bot.removeFromGroup(groupId, [userId]);
+					} catch (remErr) {
+						this.logger.error(
+							`[processGroupJoin] Erro ao remover spammer ${userId} do grupo ${groupId}:`,
+							remErr
+						);
+					}
+
+					try {
+						const chat = await data.origin?.getChat?.();
+						if (chat?.linkedParentJid) {
+							await bot.removeFromCommunity(chat.linkedParentJid, [userId]).catch(() => {});
+						}
+						if (chat) {
+							await this.checkAutoBanSpammers(bot, chat);
+						}
+					} catch (chatErr) {
+						// Ignora erro
+					}
+
+					return;
 				}
 			}
 		}
-
-		setTimeout(
-			(rtlyL, id) => {
-				rtlyL = rtlyL.filter((rt) => rt !== id);
-			},
-			60000,
-			this.recentlyJoined,
-			data.user.id
-		);
 
 		//this.logger.info(`Usuário ${data.user.name} (${data.user.id}) entrou no grupo ${data.group.name} (${data.group.id}). Quem adicionou: ${data.responsavel.name}/${data.responsavel.id}`);
 
 		try {
 			// Obtém os dados completos do chat
-			const chat = await data.origin.getChat();
+			const chat = await data.origin?.getChat?.().catch(() => null);
 
 			//this.logger.info(`[processGroupJoin] Chat `, { chat });
 
-			// Verifica se há spammers para banir (63/62) nos grupos fixos
-			await this.checkAutoBanSpammers(bot, chat);
+			// Carrega o grupo para validações posteriores
+			let group =
+				this.groups[groupId] || (await this.database?.getGroup(groupId).catch(() => null));
 
-			if (chat.isCommunity) {
+			// Verifica se há spammers para banir (62/63/380 ou padrão MI###) nos grupos monitorados
+			if (chat) {
+				await this.checkAutoBanSpammers(bot, chat);
+			}
+
+			if (!isBotJoining && (await this.isSpammerUser(bot, data.user, groupId, chat, group))) {
+				const userId = data.user?.id;
+				const userPhone =
+					(await this.resolveSpammerPhone(bot, data.user, chat)) ||
+					this.extractPhoneNumber(data.user) ||
+					this.extractPhoneNumber(userId);
+				const userLid = userId && userId.endsWith("@lid") ? userId : null;
+				this.logger.warn(
+					`[processGroupJoin] Spammer detectado após verificação do chat no grupo monitorado ${groupId}: ${data.user?.id} (telefone: ${userPhone || "não identificado"}). Removendo e interrompendo boas-vindas.`
+				);
+				this.registerSpammer(userId, userPhone, userLid);
+				if (userId) {
+					await bot.removeFromGroup(groupId, [userId]).catch(() => {});
+				}
+				return;
+			}
+
+			if (chat?.isCommunity) {
 				this.logger.debug(
-					`[processGroupJoin][viaChat] Ignorando evento de join em comunidade '${chat.name}'`,
+					`[processGroupJoin][viaChat] IGNORANDO evento de join em comunidade '${chat.name}' (${data.group?.id || chat.id})`,
 					{ chat }
 				);
 				return;
 			}
-
-			if (chat.isAnnounce) {
-				this.logger.debug(
-					`[processGroupJoin][viaChat] Ignorando evento de join em Announce Channel '${chat.name}'`,
-					{ chat }
-				);
-				return;
-			}
-
-			// Verifica se o próprio bot é quem está entrando
-			this.logger.debug(
-				`[processGroupJoin] isBotJoining (${data.isBotJoining} / ${isBotJoining}}) = data.user.id (${data.user.id}) -startsWith- bot.phoneNumber ${bot.phoneNumber}`
-			);
 
 			// Obtém ou cria grupo
 			const nomeGrupo = data.group?.name?.replace(/[^a-zA-Z0-9_\-.]/g, "").substring(0, 30) ?? null;
@@ -1060,11 +1656,30 @@ class EventHandler extends EventEmitter {
 				data.responsavel?.id || (typeof data.responsavel === "string" ? data.responsavel : null),
 				bot
 			);
-			const group = groupData.group;
+			group = groupData.group;
+
+			// Motivo da alteração: Não ignorar mais o evento de join em grupos em modo Announce (apenas admins enviam mensagens)
+			// caso o grupo possua mensagem de boas-vindas ou despedida configurada.
+			const hasGreetings =
+				group?.greetings && Object.keys(group.greetings).some((k) => group.greetings[k]);
+			const hasFarewells =
+				group?.farewells && Object.keys(group.farewells).some((k) => group.farewells[k]);
+			if (chat?.isAnnounce && !hasGreetings && !hasFarewells) {
+				this.logger.debug(
+					`[processGroupJoin][viaChat] IGNORANDO evento de join em Announce Channel '${chat.name}' (${data.group?.id || chat.id}) sem boas-vindas/despedida configuradas`,
+					{ chat }
+				);
+				return;
+			}
+
+			// Verifica se o próprio bot é quem está entrando
+			this.logger.debug(
+				`[processGroupJoin] isBotJoining (${data.isBotJoining} / ${isBotJoining}}) = data.user.id (${data.user.id}) -startsWith- bot.phoneNumber ${bot.phoneNumber}`
+			);
 
 			// Popula titulo e descricao
-			group.titulo = chat.name || null;
-			group.descricao = chat.groupMetadata?.desc || null;
+			group.titulo = chat?.name || null;
+			group.descricao = chat?.groupMetadata?.desc || null;
 
 			//this.logger.debug(`Informações do grupo: ${JSON.stringify(group)}`);
 
@@ -1130,7 +1745,13 @@ class EventHandler extends EventEmitter {
 					`Bot entrou no grupo ${data.group.name} (${nomeGrupo}/${data.group.id}, ${groupData.newGroup ? "novo" : "antigo"})`
 				);
 				group.paused = false; // Sempre que o bot entra no grupo, tira o pause (para grupos em que saiu/foi removido)
-				await this.database.recordGroupJoin(group.id, group.name, Date.now(), data.responsavel);
+				await this.database.recordGroupJoin(
+					group.id,
+					group.name,
+					Date.now(),
+					data.responsavel,
+					bot?.id || null
+				);
 				await this.database.saveGroup(group);
 
 				// Busca pendingJoins para ver se esse grupo corresponde a um convite pendente
@@ -1138,14 +1759,15 @@ class EventHandler extends EventEmitter {
 				let foundInviter = null;
 
 				// Obtém todos os membros do grupo para verificação
-				const members = (chat.participants || [])
+				const members = (chat?.participants || [])
 					.filter((p) => p && p.id)
 					.map((p) => p.id._serialized);
 				const stringifiedData = JSON.stringify(data);
 
 				for (const pendingJoin of pendingJoins) {
-					// Verifica se o autor do convite está no grupo (duas abordagens)
+					// Verifica se corresponde ao grupo (groupJid) ou se o autor está no grupo
 					if (
+						(pendingJoin.groupJid && pendingJoin.groupJid === group.id) ||
 						members.includes(pendingJoin.authorId) ||
 						stringifiedData.includes(pendingJoin.authorId)
 					) {
@@ -1154,14 +1776,36 @@ class EventHandler extends EventEmitter {
 					}
 				}
 
+				if (foundInviter) {
+					group.inviteCode = foundInviter.code;
+					group.addedBy = foundInviter.authorId;
+					await this.database.updateInviteHistoryGroupJid(foundInviter.code, group.id);
+					await this.database.removePendingJoin(foundInviter.code);
+				} else if (!group.inviteCode) {
+					try {
+						const history = await this.database.getInviteHistoryByGroup(group.id);
+						if (history && history.length > 0 && history[0].invite_code) {
+							group.inviteCode = history[0].invite_code;
+							if (!group.addedBy && history[0].author_id) {
+								group.addedBy = history[0].author_id;
+							}
+						}
+					} catch (e) {}
+				}
+				await this.database.saveGroup(group);
+
 				// Envia uma mensagem de boas-vindas padrão sobre o bot
 				let botInfoMessage = "";
 
 				// Se é grupo novo, a mensagem de boas vindas é enviada
 
 				if (groupData.newGroup) {
-					this.logger.debug(`[groupJoin] Novo grupo, enviando toda mensagem de boas vindas`);
-					if (!joinSilencioso) {
+					if (joinSilencioso) {
+						this.logger.info(
+							`[groupJoin] 🔇 Join silencioso - Novo grupo (${group.name} / ${groupId}), boas-vindas suprimidas.`
+						);
+					} else {
+						this.logger.debug(`[groupJoin] Novo grupo, enviando toda mensagem de boas vindas`);
 						const botDisplayName = bot.nomeExibir || "ravenabot";
 						botInfoMessage = `🦇 Olá, grupo! Eu sou a *${botDisplayName}*, um bot de WhatsApp. Use "${group.prefix}cmd" para ver os comandos disponíveis.`;
 						try {
@@ -1204,7 +1848,6 @@ Para fazer a configuração do grupo sem poluir aqui, envie \`!g-painel\`, ou me
 
 						// Se encontramos o autor do convite, adiciona-o como admin adicional
 						if (foundInviter) {
-							group.addedBy = foundInviter.authorId;
 							// Inicializa additionalAdmins se não existir
 							if (!group.additionalAdmins) {
 								group.additionalAdmins = [];
@@ -1215,9 +1858,6 @@ Para fazer a configuração do grupo sem poluir aqui, envie \`!g-painel\`, ou me
 								group.additionalAdmins.push(foundInviter.authorId);
 								await this.database.saveGroup(group);
 							}
-
-							// Remove o join pendente
-							await this.database.removePendingJoin(foundInviter.code);
 						}
 
 						if (bot.comunitario) {
@@ -1233,9 +1873,9 @@ Para fazer a configuração do grupo sem poluir aqui, envie \`!g-painel\`, ou me
 						try {
 							// Extrai informações do grupo para o LLM
 							const groupInfo = {
-								name: chat.name,
-								description: chat.groupMetadata?.desc ?? "",
-								memberCount: chat.participants?.length ?? 0
+								name: chat?.name ?? data.group?.name ?? "",
+								description: chat?.groupMetadata?.desc ?? "",
+								memberCount: chat?.participants?.length ?? 0
 							};
 
 							const groupWelcomeSchema = {
@@ -1289,12 +1929,17 @@ Retorne um JSON com dois campos:
 										);
 										// Fallback: usa resposta crua como mensagem de boas-vindas
 										if (bot.sendJoinInfo !== false) {
-											bot.sendMessage(group.id, llmResponse, { delay: 5000 }).catch((error) => {
-												this.logger.error(
-													"Erro ao enviar mensagem de boas-vindas do grupo:",
-													error
-												);
-											});
+											bot
+												.sendMessage(group.id, llmResponse, {
+													delay: 5000,
+													maxChars: 3000
+												})
+												.catch((error) => {
+													this.logger.error(
+														"Erro ao enviar mensagem de boas-vindas do grupo:",
+														error
+													);
+												});
 										}
 										return;
 									}
@@ -1304,14 +1949,34 @@ Retorne um JSON com dois campos:
 									// Envia a mensagem de boas-vindas gerada
 									if (welcomeMessage && bot.sendJoinInfo !== false) {
 										this.logger.debug(`[groupJoin] LLM Welcome: ${welcomeMessage}`);
-										bot.sendMessage(group.id, welcomeMessage, { delay: 5000 }).catch((error) => {
-											this.logger.error("Erro ao enviar mensagem de boas-vindas do grupo:", error);
-										});
+										bot
+											.sendMessage(group.id, welcomeMessage, {
+												delay: 5000,
+												maxChars: 3000
+											})
+											.catch((error) => {
+												this.logger.error(
+													"Erro ao enviar mensagem de boas-vindas do grupo:",
+													error
+												);
+											});
 									}
 
 									// Salva personalidade no grupo se for válida
 									if (botPersonality && botPersonality.trim().length > 0) {
-										group.customAIPrompt = botPersonality.trim().slice(0, 1500);
+										let personality = botPersonality.trim().slice(0, 1500);
+										if (
+											typeof personality.isWellFormed === "function" &&
+											!personality.isWellFormed()
+										) {
+											personality = personality
+												.replace(
+													/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/gu,
+													""
+												)
+												.toWellFormed();
+										}
+										group.customAIPrompt = personality;
 										await this.database.saveGroup(group);
 										this.logger.info(
 											`[groupJoin] Personalidade definida para '${group.name}': ${group.customAIPrompt}`
@@ -1383,82 +2048,94 @@ Para fazer a configuração do grupo sem poluir aqui, envie \`!g-painel\`, ou me
 							botInfoMessage = `🦇 Olá, grupo! Eu sou a *${botDisplayName}*. Já estive aqui neste grupo antes, mas se tiverem dúvidas, é só mandar um *!cmd*\n\nFique por dentro das novidades:\n- https://ravena.moothz.win`;
 						}
 					}
+				}
 
-					this.logger.debug(`[groupJoin] botInfoMessage: ${botInfoMessage}`);
+				this.logger.debug(`[groupJoin] botInfoMessage: ${botInfoMessage}`);
 
-					let targetId = group.id;
-					// Se for Discord, tenta encontrar um canal adequado se o ID do grupo (Guild ID) não for um canal válido
-					if (bot.useDiscord && data.origin) {
+				let targetId = group.id;
+				// Se for Discord, tenta encontrar um canal adequado se o ID do grupo (Guild ID) não for um canal válido
+				if (bot.useDiscord && data.origin) {
+					try {
+						// Append discord.txt if it exists
 						try {
-							// Append discord.txt if it exists
-							try {
-								const discordTxtPath = path.join(
-									this.database.databasePath,
-									"textos",
-									"discord.txt"
-								);
-								const discordTxtContent = await fs.readFile(discordTxtPath, "utf8");
-								if (discordTxtContent && discordTxtContent.trim() !== "") {
-									botInfoMessage += `\n\n${discordTxtContent.trim()}`;
-								}
-							} catch (e) {
-								// Ignora se arquivo não existir
-							}
-
-							const guild = await bot.discordClient.guilds.fetch(data.group.id);
-							const systemChannel = guild.systemChannelId;
-							if (systemChannel) {
-								targetId = systemChannel;
-							} else {
-								// Busca o primeiro canal de texto onde o bot pode falar
-								const channels = await guild.channels.fetch();
-								const firstChannel = channels.find(
-									(c) =>
-										c.isTextBased() &&
-										c
-											.permissionsFor(bot.discordClient.user)
-											.has(PermissionsBitField.Flags.SendMessages)
-								);
-								if (firstChannel) targetId = firstChannel.id;
+							const discordTxtPath = path.join(this.database.databasePath, "textos", "discord.txt");
+							const discordTxtContent = await fs.readFile(discordTxtPath, "utf8");
+							if (discordTxtContent && discordTxtContent.trim() !== "") {
+								botInfoMessage += `\n\n${discordTxtContent.trim()}`;
 							}
 						} catch (e) {
-							this.logger.error("Erro ao definir canal de boas-vindas no Discord:", e);
+							// Ignora se arquivo não existir
 						}
-					}
 
-					if (!joinSilencioso && botInfoMessage && bot.sendJoinInfo !== false) {
-						bot.sendMessage(targetId, botInfoMessage).catch((error) => {
-							this.logger.error("Erro ao enviar mensagem de boas-vindas do grupo:", error);
-						});
-					} else if (joinSilencioso || bot.sendJoinInfo === false) {
-						this.logger.info(
-							`[groupJoin] 🔇 Join silencioso ou sendJoinInfo desativado - mensagem de boas-vindas suprimida para ${groupId} (${group.name})`
-						);
+						const guild = await bot.discordClient.guilds.fetch(data.group.id);
+						const systemChannel = guild.systemChannelId;
+						if (systemChannel) {
+							targetId = systemChannel;
+						} else {
+							// Busca o primeiro canal de texto onde o bot pode falar
+							const channels = await guild.channels.fetch();
+							const firstChannel = channels.find(
+								(c) =>
+									c.isTextBased() &&
+									c
+										.permissionsFor(bot.discordClient.user)
+										.has(PermissionsBitField.Flags.SendMessages)
+							);
+							if (firstChannel) targetId = firstChannel.id;
+						}
+					} catch (e) {
+						this.logger.error("Erro ao definir canal de boas-vindas no Discord:", e);
 					}
+				}
+
+				if (!joinSilencioso && botInfoMessage && bot.sendJoinInfo !== false) {
+					bot.sendMessage(targetId, botInfoMessage).catch((error) => {
+						this.logger.error("Erro ao enviar mensagem de boas-vindas do grupo:", error);
+					});
+				} else if (joinSilencioso || bot.sendJoinInfo === false) {
+					this.logger.info(
+						`[groupJoin] 🔇 Join silencioso ou sendJoinInfo desativado - mensagem de boas-vindas suprimida para ${groupId} (${group.name})`
+					);
 				}
 			} else {
 				// Caso 2: Outra pessoa entrou no grupo
+				if (await this.isSpammerUser(bot, data.user, groupId, chat, group)) {
+					this.logger.info(
+						`[processGroupJoin] Usuário ${data.user?.id} é spammer no grupo ${groupId}. Boas-vindas suprimidas.`
+					);
+					return;
+				}
+
 				// Gera e envia mensagem de boas-vindas para o novo membro
 				// this.logger.debug(`[groupJoin] Outra pessoa entrou, greetings?`, {
 				// 	greetings: group.greetings
 				// });
 				if (group.greetings) {
-					this.generateGreetingMessage(bot, group, data.user, chat)
-						.then((welcomes) => {
-							if (welcomes && Array.isArray(welcomes)) {
-								for (const welcome of welcomes) {
-									const options = welcome.options ?? {};
-									if (welcome.mentions) options.mentions = welcome.mentions;
+					try {
+						const greetingUsers = await this.getAccumulatedGreetingUsers(
+							bot,
+							group,
+							"welcome",
+							data.user,
+							chat
+						);
+						if (!greetingUsers) return;
+						const welcomes = await this.generateGreetingMessage(bot, group, greetingUsers, chat);
+						if (welcomes && Array.isArray(welcomes)) {
+							for (const welcome of welcomes) {
+								const options = welcome.options ?? {};
+								if (welcome.mentions) options.mentions = welcome.mentions;
 
-									bot.sendMessage(group.id, welcome.message, options).catch((error) => {
-										this.logger.error("Erro ao enviar mensagem de boas-vindas:", error);
-									});
+								try {
+									await bot.sendMessage(group.id, welcome.message, options);
+								} catch (error) {
+									this.logger.error("Erro ao enviar mensagem de boas-vindas:", error);
 								}
 							}
-						})
-						.catch((error) => {
-							this.logger.error("Erro ao gerar mensagem de saudação:", error);
-						});
+						}
+					} catch (error) {
+						this.logger.error("Erro ao gerar mensagem de saudação:", error);
+					}
 				}
 			}
 		} catch (error) {
@@ -1474,17 +2151,6 @@ Para fazer a configuração do grupo sem poluir aqui, envie \`!g-painel\`, ou me
 	async processGroupLeave(bot, data) {
 		//this.logger.info(`[processGroupLeave] `, { data });
 
-		//if(this.recentlyLeft.includes(data.user.id)) return;
-		this.recentlyLeft.push(data.user.id);
-		setTimeout(
-			(rtlyL, id) => {
-				rtlyL = rtlyL.filter((rt) => rt !== id);
-			},
-			60000,
-			this.recentlyLeft,
-			data.user.id
-		);
-
 		this.logger.info(
 			`Usuário ${JSON.stringify(data.user.name)} (${data.user.id}) saiu do grupo ${data.group.name} (${data.group.id}). Quem removeu: ${data.responsavel.name}/${data.responsavel.id}`,
 			{ quemRemoveu: data.responsavel.name }
@@ -1492,37 +2158,155 @@ Para fazer a configuração do grupo sem poluir aqui, envie \`!g-painel\`, ou me
 
 		try {
 			// Obtém grupo
-			const group = this.groups[data.group.id];
+			const group =
+				this.groups[data.group.id] ||
+				(await this.database?.getGroup(data.group.id).catch(() => null));
 
 			// Por enquanto, a única maneira é pegar a info do grupo pra descobrir o LID do bot nele
 			const chatInfo = await bot.getChatDetails(data.group.id);
 
 			// 1° passo: descobrir o lid do bot nesse grupo (identificado via Whatsgo)
-			const botNumber = bot.getLidFromPn(bot.phoneNumber, chatInfo);
+			const botNumber =
+				bot.getLidFromPn && chatInfo
+					? bot.getLidFromPn(bot.phoneNumber, chatInfo)
+					: bot.phoneNumber?.replace(/\D/g, "");
 
 			// notInGroup é solução nova que coloquei da Go, quando falha ao retornar info do grupo pois o bot não participa
-			const isBotLeaving = data.group.notInGroup || data?.user?.id?.startsWith(botNumber);
+			const cleanBotPn = bot.phoneNumber ? bot.phoneNumber.replace(/\D/g, "") : null;
+			const isBotLeaving =
+				data.isBotLeaving ||
+				data.group?.notInGroup ||
+				chatInfo?.notInGroup ||
+				(botNumber && data?.user?.id?.startsWith(botNumber)) ||
+				(cleanBotPn && data?.user?.id?.startsWith(cleanBotPn));
 
-			//this.logger.debug(`[processGroupLeave] isBotLeaving (${isBotLeaving}}) = data.user.id (${data.user.id}) -startsWith- bot.phoneNumber ${botNumber} | not in group? ${data.group.notInGroup}`, { data, chatInfo });
+			//this.logger.debug(`[processGroupLeave] isBotLeaving (${isBotLeaving}}) = data.user.id (${data.user.id}) -startsWith- bot.phoneNumber ${botNumber} | not in group? ${data.group?.notInGroup}`, { data, chatInfo });
 
 			// Envia notificação para o grupo de logs
 			if (bot.grupoLogs) {
 				try {
 					if (isBotLeaving) {
 						const groupId = data.group.id;
+						const dbGroup = await this.database?.getGroup(groupId).catch(() => null);
 						const groupData = await this.getOrCreateGroup(groupId, null, bot.prefix, null, bot);
-						const group = groupData.group;
+						const group = dbGroup || groupData.group;
+						this.groups[groupId] = group;
 
-						if (bot.addSkipGroup) {
+						if (bot.markNotInGroup) {
+							await bot.markNotInGroup(groupId);
+						} else if (bot.addSkipGroup) {
 							await bot.addSkipGroup(groupId);
 						}
 
-						await this.database.recordGroupLeave(groupId, Date.now(), data.responsavel);
+						await this.database.recordGroupLeave(
+							groupId,
+							Date.now(),
+							data.responsavel,
+							bot?.id || null
+						);
+
+						// Limpeza das configurações de monitoramento de streams do grupo (Twitch, Kick, YouTube)
+						let streamsRemovedText = "";
+						const oldTwitch = Array.isArray(group.twitch) ? [...group.twitch] : [];
+						const oldKick = Array.isArray(group.kick) ? [...group.kick] : [];
+						const oldYoutube = Array.isArray(group.youtube) ? [...group.youtube] : [];
+						const totalStreams = oldTwitch.length + oldKick.length + oldYoutube.length;
+
+						if (totalStreams > 0) {
+							group.twitch = [];
+							group.kick = [];
+							group.youtube = [];
+
+							const parts = [];
+							if (oldTwitch.length > 0) {
+								parts.push(
+									`${oldTwitch.length} Twitch (${oldTwitch.map((c) => c.channel).join(", ")})`
+								);
+							}
+							if (oldKick.length > 0) {
+								parts.push(`${oldKick.length} Kick (${oldKick.map((c) => c.channel).join(", ")})`);
+							}
+							if (oldYoutube.length > 0) {
+								parts.push(
+									`${oldYoutube.length} YouTube (${oldYoutube.map((c) => c.channel).join(", ")})`
+								);
+							}
+							streamsRemovedText = `\n📺 *Streams Removidas (${totalStreams}):* ${parts.join(" | ")}`;
+
+							this.logger.info(
+								`[processGroupLeave] Bot '${bot.id}' saiu do grupo '${group.name}' (${groupId}). Removidas configurações de streams: ${parts.join(" | ")}`
+							);
+
+							// Desinscreve canais do StreamMonitor caso não sejam usados por nenhum outro grupo
+							try {
+								const StreamSystem = require("./StreamSystem");
+								const streamSystem = StreamSystem.getInstance();
+								const streamMonitor = bot.streamMonitor || streamSystem?.streamMonitor;
+
+								if (streamMonitor) {
+									const allGroups = await this.database.getGroups();
+									for (const ch of oldTwitch) {
+										const chName = ch.channel;
+										const stillUsed = allGroups.some(
+											(g) =>
+												g.id !== groupId &&
+												Array.isArray(g.twitch) &&
+												g.twitch.some((c) => c.channel?.toLowerCase() === chName?.toLowerCase())
+										);
+										if (!stillUsed) {
+											streamMonitor.unsubscribe(chName, "twitch");
+											this.logger.debug(
+												`[processGroupLeave] Desinscrito canal Twitch sem grupos restantes: ${chName}`
+											);
+										}
+									}
+
+									for (const ch of oldKick) {
+										const chName = ch.channel;
+										const stillUsed = allGroups.some(
+											(g) =>
+												g.id !== groupId &&
+												Array.isArray(g.kick) &&
+												g.kick.some((c) => c.channel?.toLowerCase() === chName?.toLowerCase())
+										);
+										if (!stillUsed) {
+											streamMonitor.unsubscribe(chName, "kick");
+											this.logger.debug(
+												`[processGroupLeave] Desinscrito canal Kick sem grupos restantes: ${chName}`
+											);
+										}
+									}
+
+									for (const ch of oldYoutube) {
+										const chName = ch.channel;
+										const stillUsed = allGroups.some(
+											(g) =>
+												g.id !== groupId &&
+												Array.isArray(g.youtube) &&
+												g.youtube.some((c) => c.channel?.toLowerCase() === chName?.toLowerCase())
+										);
+										if (!stillUsed) {
+											streamMonitor.unsubscribe(chName, "youtube");
+											this.logger.debug(
+												`[processGroupLeave] Desinscrito canal YouTube sem grupos restantes: ${chName}`
+											);
+										}
+									}
+								}
+							} catch (streamErr) {
+								this.logger.error(
+									`[processGroupLeave] Erro ao desinscrever canais de streams do grupo ${groupId}:`,
+									streamErr
+								);
+							}
+						}
+
 						await this.database.saveGroup(group);
 
 						let membershipHistoryText = "";
+						let periods = [];
 						try {
-							const periods = await this.database.getGroupMembershipPeriods(groupId);
+							periods = await this.database.getGroupMembershipPeriods(groupId);
 							if (periods && periods.length > 0) {
 								membershipHistoryText = `\n🚪 *Histórico de Estadia no Grupo:*\n`;
 								periods.forEach((p, idx) => {
@@ -1550,7 +2334,8 @@ Para fazer a configuração do grupo sem poluir aqui, envie \`!g-painel\`, ou me
 										durationText = " (tempo desconhecido)";
 									}
 
-									membershipHistoryText += `${idx + 1}. 🟢 ${joinDate} até 🔴 ${leaveDate}${durationText}\n`;
+									const botTag = p.bot_id ? ` [🤖 ${p.bot_id}]` : "";
+									membershipHistoryText += `${idx + 1}.${botTag} 🟢 ${joinDate} até 🔴 ${leaveDate}${durationText}\n`;
 								});
 							}
 						} catch (historyErr) {
@@ -1560,13 +2345,150 @@ Para fazer a configuração do grupo sem poluir aqui, envie \`!g-painel\`, ou me
 							);
 						}
 
+						// Auto-bloqueio se removido em menos de 7 dias e quem removeu não é doador
+						// Aplica-se apenas às ravenas normais (não processar para vip, comunitárias e privadas)
+						let blockLogsText = "";
+						const isNormalBot = !bot.vip && !bot.comunitario && !bot.privado;
+
+						if (isNormalBot) {
+							const currentPeriod =
+								periods && periods.length > 0 ? periods[periods.length - 1] : null;
+							const durationMs =
+								currentPeriod?.duration ??
+								(currentPeriod?.join_timestamp ? Date.now() - currentPeriod.join_timestamp : null);
+							const isLessThan7Days =
+								durationMs !== null
+									? durationMs < 7 * 24 * 60 * 60 * 1000
+									: group.date
+										? Date.now() - group.date < 7 * 24 * 60 * 60 * 1000
+										: false;
+
+							const removerId = data.responsavel?.id || null;
+							const cleanRemoverPhone = removerId
+								? removerId.replace(/\D/g, "").split("@")[0]
+								: null;
+							const botCleanPhone = bot.phoneNumber ? bot.phoneNumber.replace(/\D/g, "") : null;
+							const isRemovedBySelf =
+								cleanRemoverPhone && botCleanPhone && cleanRemoverPhone === botCleanPhone;
+							const isRemoverSuperAdmin = removerId
+								? this.adminUtils.isSuperAdmin(removerId)
+								: false;
+
+							if (
+								isLessThan7Days &&
+								cleanRemoverPhone &&
+								!isRemovedBySelf &&
+								!isRemoverSuperAdmin
+							) {
+								let isRemoverDonator = false;
+								try {
+									const donations = await this.database.getDonations();
+									if (donations && donations.length > 0) {
+										isRemoverDonator = donations.some((donation) => {
+											if (donation.numero) {
+												const cleanDonorNumber = donation.numero.replace(/[^0-9]/g, "");
+												if (cleanDonorNumber.length > 10) {
+													return (
+														cleanDonorNumber.includes(cleanRemoverPhone) ||
+														cleanRemoverPhone.includes(cleanDonorNumber)
+													);
+												}
+											}
+											return false;
+										});
+									}
+								} catch (donErr) {
+									this.logger.error("Erro ao verificar doador para quem removeu o bot:", donErr);
+								}
+
+								if (!isRemoverDonator) {
+									this.logger.info(
+										`[processGroupLeave] Bot normal '${bot.id}' removido em <7d (${durationMs}ms) por não-doador (${cleanRemoverPhone}) do grupo ${groupId}. Executando bloqueios...`
+									);
+
+									// 1. Busca código de convite e autor do convite
+									let inviteCode = group.inviteCode || null;
+									let inviterId = group.addedBy || null;
+
+									try {
+										const inviteHistory = await this.database.getInviteHistoryByGroup(groupId);
+										if (inviteHistory && inviteHistory.length > 0) {
+											const latestInvite =
+												inviteHistory.find((r) => r.invite_code) || inviteHistory[0];
+											if (latestInvite) {
+												if (!inviteCode && latestInvite.invite_code) {
+													inviteCode = latestInvite.invite_code;
+												}
+												if (!inviterId && latestInvite.author_id) {
+													inviterId = latestInvite.author_id;
+												}
+											}
+										}
+									} catch (invErr) {
+										this.logger.error(
+											"Erro ao buscar histórico de convites para auto-block:",
+											invErr
+										);
+									}
+
+									const cleanInviterPhone = inviterId
+										? inviterId.replace(/\D/g, "").split("@")[0]
+										: null;
+
+									const blockLogParts = [];
+
+									// 2. Executa block no convite
+									if (cleanInviterPhone || inviteCode) {
+										const inviteArgs = [];
+										if (cleanInviterPhone) inviteArgs.push(cleanInviterPhone);
+										if (inviteCode) inviteArgs.push(inviteCode);
+
+										const inviteCmd = `!sa-blockInvites ${inviteArgs.join(" ")}`.trim();
+										try {
+											const inviteBlockRes = await this.commandHandler.superAdmin.blockInvites(
+												bot,
+												{ group: groupId, author: cleanInviterPhone, isSystem: true },
+												inviteArgs
+											);
+											if (inviteBlockRes && inviteBlockRes.content) {
+												blockLogParts.push(`> *${inviteCmd}*\n${inviteBlockRes.content}`);
+											}
+										} catch (cmdErr) {
+											this.logger.error("Erro ao rodar blockInvites no convite:", cmdErr);
+										}
+									}
+
+									// 3. Executa block em quem removeu
+									if (cleanRemoverPhone && cleanRemoverPhone !== cleanInviterPhone) {
+										const removerCmd = `!sa-blockInvites ${cleanRemoverPhone}`;
+										try {
+											const removerBlockRes = await this.commandHandler.superAdmin.blockInvites(
+												bot,
+												{ group: groupId, author: cleanRemoverPhone, isSystem: true },
+												[cleanRemoverPhone]
+											);
+											if (removerBlockRes && removerBlockRes.content) {
+												blockLogParts.push(`> *${removerCmd}*\n${removerBlockRes.content}`);
+											}
+										} catch (cmdErr) {
+											this.logger.error("Erro ao rodar blockInvites em quem removeu:", cmdErr);
+										}
+									}
+
+									if (blockLogParts.length > 0) {
+										blockLogsText = `\n\n🛡️ *Bloqueio de convites (< 7 dias & não doador):*\n${blockLogParts.join("\n\n")}`;
+									}
+								}
+							}
+						}
+
 						const msgLeave = `🚪🔴 *${bot.id}* saiu do grupo:
 - 🆔 *ID:* \`${group.id}\`
 - 📃 *Nome:* \`${group.name}\`
 - 👷‍♂️ *Responsável:*
 \`\`\`${JSON.stringify(data.responsavel, null, "\t")}\`\`\`
 - 👨‍💻 *Raw Data*:
-\`\`\`${JSON.stringify(data.group)}\`\`\`${membershipHistoryText}`;
+\`\`\`${JSON.stringify(data.group)}\`\`\`${membershipHistoryText}${streamsRemovedText}${blockLogsText}`;
 
 						// Remove o responsável do bot comunitário dos admins adicionais
 						/* por enquanto desabilitado
@@ -1590,7 +2512,7 @@ Para fazer a configuração do grupo sem poluir aqui, envie \`!g-painel\`, ou me
 
 						bot.sendMessage(bot.grupoLogs, msgLeave).catch((error) => {
 							this.logger.error(
-								"Erro ao enviar notificação de entrada no grupo para o grupo de logs:",
+								"Erro ao enviar notificação de saída do grupo para o grupo de logs:",
 								error
 							);
 						});
@@ -1603,26 +2525,382 @@ Para fazer a configuração do grupo sem poluir aqui, envie \`!g-painel\`, ou me
 				}
 			}
 
+			if (!isBotLeaving) {
+				const isSpammer = await this.isSpammerUser(bot, data.user, data.group.id, null, group);
+				if (isSpammer) {
+					// 1. Tenta resolver o telefone real do spammer (inclusive se data.user for LID)
+					let cleanPhone = await this.resolveSpammerPhone(bot, data.user);
+					if (!cleanPhone && data.origin?.getChat) {
+						try {
+							const chat = await data.origin.getChat();
+							cleanPhone = await this.resolveSpammerPhone(bot, data.user, chat);
+						} catch (chatErr) {
+							// Ignora erro ao buscar chat
+						}
+					}
+					if (!cleanPhone) {
+						cleanPhone =
+							this.extractPhoneNumber(data.user) || this.extractPhoneNumber(data.user?.id) || "";
+					}
+
+					this.logger.info(
+						`[processGroupLeave] Usuário ${data.user?.id} identificado como spammer no grupo monitorado ${data.group.id} (telefone: ${cleanPhone || "não identificado"}). Enviando aviso de spammer e suprimindo despedida padrão.`
+					);
+
+					const noticeKey = `${data.group.id}:${cleanPhone || data.user?.id}`;
+					const now = Date.now();
+					const lastSent = this.recentSpammerLeaveNotices.get(noticeKey) || 0;
+
+					if (now - lastSent >= 30000) {
+						this.recentSpammerLeaveNotices.set(noticeKey, now);
+						if (this.recentSpammerLeaveNotices.size > 200) {
+							for (const [k, ts] of this.recentSpammerLeaveNotices.entries()) {
+								if (now - ts > 60000) this.recentSpammerLeaveNotices.delete(k);
+							}
+						}
+
+						const prefix = group?.prefix || bot.prefix || "!";
+						const displayTarget =
+							cleanPhone ||
+							(data.user?.name && !data.user.name.includes("@") ? data.user.name : "") ||
+							(data.user?.id ? data.user.id.split("@")[0] : "");
+						const cmdArg = cleanPhone || (data.user?.id ? data.user.id.split("@")[0] : "");
+
+						const mentionJid = cleanPhone
+							? `${cleanPhone}@s.whatsapp.net`
+							: data.user?.id && data.user.id.includes("@")
+								? data.user.id
+								: `${displayTarget}@s.whatsapp.net`;
+
+						const mentions = [mentionJid];
+						if (data.user?.id && data.user.id.includes("@") && data.user.id !== mentionJid) {
+							mentions.push(data.user.id);
+						}
+
+						const spammerMsg = `🚫 Spammer @${displayTarget} detectado removido do grupo.\n> Se deseja permitir que este numero entre no grupo, envie ${prefix}g-permitirSpammer ${cmdArg}`;
+
+						await bot
+							.sendMessage(data.group.id, spammerMsg, {
+								mentions
+							})
+							.catch((err) => {
+								this.logger.error(
+									"Erro ao enviar mensagem de despedida personalizada de spammer:",
+									err
+								);
+							});
+					}
+
+					return;
+				}
+			}
+
 			// this.logger.debug(`[groupLeave] Outra pessoa saiu, farewell? `, {
 			// 	farewells: group?.farewells
 			// });
 			if (group && group.farewells && !isBotLeaving) {
-				const farewells = await this.processFarewellMessage(group, data.user, bot);
-				if (farewells && Array.isArray(farewells)) {
-					for (const farewell of farewells) {
-						const options = farewell.options ?? {};
-						if (farewell.mentions) options.mentions = farewell.mentions;
+				try {
+					const farewellUsers = await this.getAccumulatedGreetingUsers(
+						bot,
+						group,
+						"farewell",
+						data.user
+					);
+					if (!farewellUsers) return;
+					const farewells = await this.processFarewellMessage(group, farewellUsers, bot);
+					if (farewells && Array.isArray(farewells)) {
+						for (const farewell of farewells) {
+							const options = farewell.options ?? {};
+							if (farewell.mentions) options.mentions = farewell.mentions;
 
-						bot.sendMessage(data.group.id, farewell.message, options).catch((error) => {
-							this.logger.error("Erro ao enviar mensagem de despedida:", error);
-						});
+							try {
+								await bot.sendMessage(data.group.id, farewell.message, options);
+							} catch (error) {
+								this.logger.error("Erro ao enviar mensagem de despedida:", error);
+							}
+						}
 					}
+				} catch (error) {
+					this.logger.error("Erro ao gerar mensagem de despedida:", error);
 				}
 			}
 		} catch (error) {
 			this.logger.error("Erro ao processar saída do grupo:", error);
 		}
 	}
+	/**
+	 * Localiza a melhor instância de bot conectada para envio em um grupo.
+	 * @param {string} groupId - ID do grupo
+	 * @param {string|null} preferredBotId - ID preferencial do bot
+	 * @returns {WhatsAppBot|null}
+	 */
+	getBotForGroup(groupId, preferredBotId = null) {
+		const allBots = Database.getInstance().botInstances || [];
+		if (preferredBotId) {
+			const b = allBots.find(
+				(item) => (item.id === preferredBotId || item.name === preferredBotId) && item.isConnected
+			);
+			if (b) return b;
+		}
+		const isWhatsApp = groupId && groupId.includes("@g.us");
+		if (isWhatsApp) {
+			return (
+				allBots.find((b) => !b.useTelegram && !b.useDiscord && b.isConnected) ||
+				allBots.find((b) => b.isConnected) ||
+				null
+			);
+		}
+		return allBots.find((b) => b.isConnected) || null;
+	}
+
+	/**
+	 * Acumula entradas/saídas e agenda envio em lote, ou retorna usuário imediatamente se desativado.
+	 * Suporta assinaturas:
+	 *   (bot, group, type, user, chatData)
+	 *   (group, type, user)
+	 * Retorna array de usuários se o envio deve acontecer de imediato (quando accumulation está desligado).
+	 * Retorna null se foi acumulado na fila para envio posterior via timer.
+	 */
+	async getAccumulatedGreetingUsers(
+		botOrGroup,
+		groupOrType,
+		typeOrUser,
+		userOrChat = null,
+		chatData = null
+	) {
+		let bot = null;
+		let group = null;
+		let type = null;
+		let user = null;
+		let chat = null;
+
+		if (botOrGroup && typeof botOrGroup.id === "string" && typeof groupOrType === "string") {
+			group = botOrGroup;
+			type = groupOrType;
+			user = typeOrUser;
+		} else {
+			bot = botOrGroup;
+			group = groupOrType;
+			type = typeOrUser;
+			user = userOrChat;
+			chat = chatData;
+		}
+
+		const config = group?.greetingAccumulation;
+		if (!config?.enabled) return [user];
+
+		const now = Date.now();
+		const intervalMinutes = Math.max(1, Number(config.intervalMinutes) || 30);
+		const intervalMs = intervalMinutes * 60 * 1000;
+		const state = group.greetingAccumulationState ?? {};
+		const queue = Array.isArray(state[type]) ? state[type] : [];
+		const userId = user?.id;
+
+		if (userId && !queue.some((queuedUser) => queuedUser.id === userId)) {
+			queue.push(user);
+		}
+
+		state[type] = queue;
+
+		const timerKey = `${group.id}_${type}`;
+		this.greetingTimers = this.greetingTimers || new Map();
+
+		let scheduledFor = Number(state[`${type}ScheduledFor`] || 0);
+		const hasActiveTimer = this.greetingTimers.has(timerKey);
+
+		if (!hasActiveTimer || !scheduledFor || scheduledFor <= now) {
+			scheduledFor = now + intervalMs;
+			state[`${type}ScheduledFor`] = scheduledFor;
+			state[`${type}BotId`] = bot?.id || null;
+
+			if (this.greetingTimers.has(timerKey)) {
+				clearTimeout(this.greetingTimers.get(timerKey));
+			}
+
+			const timer = setTimeout(async () => {
+				try {
+					await this.flushAccumulatedGreetings(bot, group.id, type, chat);
+				} catch (err) {
+					this.logger.error(
+						`[greetingAccumulation] Erro no timeout de ${type} em ${group.id}:`,
+						err
+					);
+				}
+			}, intervalMs);
+
+			this.greetingTimers.set(timerKey, timer);
+		}
+
+		group.greetingAccumulationState = state;
+		await this.database.saveGroup(group);
+
+		this.logger.info(
+			`[greetingAccumulation] Usuário ${userId} enfileirado para ${type} no grupo ${group.id} (${group.name || "sem nome"}). Total na fila: ${queue.length}. Disparo previsto para: ${new Date(scheduledFor).toLocaleTimeString()}`
+		);
+
+		return null;
+	}
+
+	/**
+	 * Descarrega e envia as saudações acumuladas para um grupo e tipo (welcome/farewell).
+	 * @param {WhatsAppBot|null} bot - Instância do bot
+	 * @param {string} groupId - ID do grupo
+	 * @param {"welcome"|"farewell"} type - Tipo de saudação
+	 * @param {Object|null} chatData - Dados do chat
+	 */
+	async flushAccumulatedGreetings(bot, groupId, type, chatData = null) {
+		const timerKey = `${groupId}_${type}`;
+		if (this.greetingTimers?.has(timerKey)) {
+			clearTimeout(this.greetingTimers.get(timerKey));
+			this.greetingTimers.delete(timerKey);
+		}
+
+		const group = await this.database.getGroup(groupId);
+		if (!group) return;
+
+		const state = group.greetingAccumulationState ?? {};
+		const queue = Array.isArray(state[type]) ? state[type] : [];
+
+		state[type] = [];
+		state[`${type}ScheduledFor`] = null;
+		state[`${type}LastSentAt`] = Date.now();
+		group.greetingAccumulationState = state;
+		await this.database.saveGroup(group);
+
+		if (queue.length === 0) return;
+
+		// Localiza bot apropriado se não fornecido ou desconectado
+		let botToUse = bot;
+		if (!botToUse || !botToUse.isConnected) {
+			botToUse = this.getBotForGroup(groupId, state[`${type}BotId`]);
+		}
+
+		if (!botToUse) {
+			this.logger.warn(
+				`[greetingAccumulation] Nenhum bot conectado encontrado para enviar ${type} acumulado no grupo ${groupId}.`
+			);
+			return;
+		}
+
+		this.logger.info(
+			`[greetingAccumulation] Enviando ${type} acumulado para ${queue.length} membro(s) no grupo ${groupId} (${group.name || "sem nome"}).`
+		);
+
+		if (type === "welcome" && group.greetings) {
+			try {
+				const welcomes = await this.generateGreetingMessage(botToUse, group, queue, chatData);
+				if (welcomes && Array.isArray(welcomes)) {
+					for (const welcome of welcomes) {
+						const options = welcome.options ?? {};
+						if (welcome.mentions) options.mentions = welcome.mentions;
+						await botToUse.sendMessage(groupId, welcome.message, options);
+					}
+				}
+			} catch (err) {
+				this.logger.error(
+					`[greetingAccumulation] Erro ao enviar boas-vindas acumuladas em ${groupId}:`,
+					err
+				);
+			}
+		} else if (type === "farewell" && group.farewells) {
+			try {
+				const farewells = await this.processFarewellMessage(group, queue, botToUse);
+				if (farewells && Array.isArray(farewells)) {
+					for (const farewell of farewells) {
+						const options = farewell.options ?? {};
+						if (farewell.mentions) options.mentions = farewell.mentions;
+						await botToUse.sendMessage(groupId, farewell.message, options);
+					}
+				}
+			} catch (err) {
+				this.logger.error(
+					`[greetingAccumulation] Erro ao enviar despedida acumulada em ${groupId}:`,
+					err
+				);
+			}
+		}
+	}
+
+	/**
+	 * Restaura e agenda timers pendentes de acúmulo de saudações após reinicialização.
+	 * @param {WhatsAppBot|null} bot - Instância do bot
+	 */
+	async initGreetingAccumulationTimers(bot = null) {
+		try {
+			this.greetingTimers = this.greetingTimers || new Map();
+			const groups = await this.database.getGroups();
+			if (!groups || !Array.isArray(groups)) return;
+
+			const now = Date.now();
+			for (const group of groups) {
+				if (!group.greetingAccumulation?.enabled) continue;
+				const state = group.greetingAccumulationState;
+				if (!state) continue;
+
+				for (const type of ["welcome", "farewell"]) {
+					const queue = Array.isArray(state[type]) ? state[type] : [];
+					if (queue.length === 0) continue;
+
+					const timerKey = `${group.id}_${type}`;
+					if (this.greetingTimers.has(timerKey)) continue;
+
+					const scheduledFor = Number(state[`${type}ScheduledFor`] || 0);
+					const remainingMs = scheduledFor - now;
+
+					if (remainingMs <= 0) {
+						this.logger.info(
+							`[greetingAccumulation] Intervalo expirado em offline para ${type} no grupo ${group.id}. Agendando flush.`
+						);
+						setTimeout(() => {
+							this.flushAccumulatedGreetings(bot, group.id, type).catch((err) =>
+								this.logger.error(
+									`[initGreetingAccumulationTimers] Erro ao descarregar ${type}:`,
+									err
+								)
+							);
+						}, 3000);
+					} else {
+						this.logger.info(
+							`[greetingAccumulation] Restaurando timer de ${type} para grupo ${group.id} com restante de ${Math.round(remainingMs / 1000)}s.`
+						);
+						const timer = setTimeout(() => {
+							this.flushAccumulatedGreetings(bot, group.id, type).catch((err) =>
+								this.logger.error(
+									`[initGreetingAccumulationTimers] Erro ao descarregar ${type}:`,
+									err
+								)
+							);
+						}, remainingMs);
+						this.greetingTimers.set(timerKey, timer);
+					}
+				}
+			}
+		} catch (err) {
+			this.logger.error("Erro ao inicializar timers de acúmulo de saudações:", err);
+		}
+	}
+
+	/**
+	 * Manipula alteração na configuração de acúmulo de saudações (chamado por comando ou painel).
+	 * @param {Group|Object} group - Dados do grupo
+	 */
+	handleGreetingAccumulationConfigChange(group) {
+		if (!group?.id) return;
+		this.greetingTimers = this.greetingTimers || new Map();
+		if (!group.greetingAccumulation?.enabled) {
+			for (const type of ["welcome", "farewell"]) {
+				const timerKey = `${group.id}_${type}`;
+				if (this.greetingTimers.has(timerKey)) {
+					clearTimeout(this.greetingTimers.get(timerKey));
+					this.greetingTimers.delete(timerKey);
+				}
+			}
+		}
+		if (this.groups[group.id]) {
+			this.groups[group.id].greetingAccumulation = group.greetingAccumulation;
+		}
+	}
+
 	/**
 	 * Gera mensagem de saudação para novos membros do grupo
 	 * @param {WhatsAppBot} bot - Instância do bot
@@ -1646,19 +2924,25 @@ Para fazer a configuração do grupo sem poluir aqui, envie \`!g-painel\`, ou me
 			}
 
 			// Se houver múltiplos usuários, prepara os nomes
-			const nomesPessoas = "";
 			let numeroPessoas = "";
+			let pessoasEnter = "";
+			let pessoasVirgula = "";
 			let quantidadePessoas = 1;
 			let isPlural = false;
 			let baseMentions = [];
 
 			if (Array.isArray(user)) {
-				numeroPessoas = user.map((u) => `@${u.id.split("@")[0]}` ?? "@123456780").join(", ");
+				const names = user.map((u) => `@${u.id.split("@")[0]}`);
+				numeroPessoas = names.join(" ");
+				pessoasEnter = names.map((name) => `- ${name}`).join("\n");
+				pessoasVirgula = names.join(", ");
 				quantidadePessoas = user.length;
 				isPlural = quantidadePessoas > 1;
 				baseMentions = user.map((u) => u.id);
 			} else {
 				numeroPessoas = `@${user.id.split("@")[0]}` ?? "@123456780";
+				pessoasEnter = `- ${numeroPessoas}`;
+				pessoasVirgula = numeroPessoas;
 				baseMentions = [user.id];
 			}
 
@@ -1666,6 +2950,14 @@ Para fazer a configuração do grupo sem poluir aqui, envie \`!g-painel\`, ou me
 			const availableTypes = Object.keys(group.greetings).filter((type) => group.greetings[type]);
 
 			if (availableTypes.length === 0) return [];
+
+			// Garante que o texto seja processado primeiro, seguido das mídias
+			const typePriority = ["text", "image", "video", "gif", "sticker", "audio"];
+			availableTypes.sort((a, b) => {
+				const ia = typePriority.indexOf(a);
+				const ib = typePriority.indexOf(b);
+				return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
+			});
 
 			const messagesToSend = [];
 
@@ -1684,6 +2976,8 @@ Para fazer a configuração do grupo sem poluir aqui, envie \`!g-painel\`, ou me
 
 				// Variáveis básicas
 				message = message.replace(/{pessoa}/g, numeroPessoas);
+				message = message.replace(/{pessoaEnter}/g, pessoasEnter);
+				message = message.replace(/{pessoasVirgula}/g, pessoasVirgula);
 
 				// Variáveis de grupo
 				message = message.replace(/{tituloGrupo}/g, chatData?.name ?? "Grupo");
@@ -1724,7 +3018,13 @@ Para fazer a configuração do grupo sem poluir aqui, envie \`!g-painel\`, ou me
 
 				// Se saudação de texto
 				if (type === "text") {
+					if (typeof greetingData === "string" && !greetingData.trim()) {
+						continue;
+					}
 					const processed = await processText(greetingData, baseMentions); // greetingData is the string itself for text type
+					if (!processed.text || !processed.text.trim()) {
+						continue;
+					}
 					currentMentions = [...new Set([...currentMentions, ...processed.mentions])];
 
 					messagesToSend.push({
@@ -1753,7 +3053,9 @@ Para fazer a configuração do grupo sem poluir aqui, envie \`!g-painel\`, ou me
 						// Processa caption se houver (audio e sticker ignoram caption no envio, mas a gente processa igual)
 						let caption = "";
 						if (type !== "audio" && type !== "sticker") {
-							const processedCaption = await processText(greetingData.caption, baseMentions);
+							const rawCaption =
+								typeof greetingData.caption === "string" ? greetingData.caption : "";
+							const processedCaption = await processText(rawCaption, baseMentions);
 							caption = processedCaption.text;
 							currentMentions = [...new Set([...currentMentions, ...processedCaption.mentions])];
 						}
@@ -1766,15 +3068,15 @@ Para fazer a configuração do grupo sem poluir aqui, envie \`!g-painel\`, ou me
 								mentions: currentMentions,
 								sendAudioAsVoice: type === "audio",
 								sendMediaAsSticker: type === "sticker",
-								sendVideoAsGif: type === "gif"
+								sendVideoAsGif:
+									type === "gif" ||
+									mimeType === "image/gif" ||
+									Boolean(greetingData.file && greetingData.file.toLowerCase().endsWith(".gif"))
 							},
 							mentions: currentMentions
 						});
 					} catch (err) {
 						this.logger.error(`Erro ao carregar mídia de greeting (${mediaPath}):`, err);
-						// Fallback para texto se falhar ao carregar mídia e houver texto configurado (mas não duplicar se o loop já cobrir 'text')
-						// Como o loop passa por todos os types, se 'text' estiver configurado, ele será processado separadamente.
-						// Então aqui apenas logamos o erro.
 					}
 				}
 			}
@@ -1809,8 +3111,21 @@ Para fazer a configuração do grupo sem poluir aqui, envie \`!g-painel\`, ou me
 			const availableTypes = Object.keys(group.farewells).filter((type) => group.farewells[type]);
 			if (availableTypes.length === 0) return [];
 
+			// Garante que o texto seja processado primeiro, seguido das mídias
+			const typePriority = ["text", "image", "video", "gif", "sticker", "audio"];
+			availableTypes.sort((a, b) => {
+				const ia = typePriority.indexOf(a);
+				const ib = typePriority.indexOf(b);
+				return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
+			});
+
 			const messagesToSend = [];
-			const baseMentions = [user.id];
+			const users = Array.isArray(user) ? user : [user];
+			const names = users.map((currentUser) => `@${currentUser.id.split("@")[0]}`);
+			const pessoa = names.join(" ");
+			const pessoaEnter = names.map((name) => `- ${name}`).join("\n");
+			const pessoasVirgula = names.join(", ");
+			const baseMentions = users.map((currentUser) => currentUser.id);
 
 			const processText = async (text, mentionsList) => {
 				if (!text) return { text: "", mentions: [] };
@@ -1821,7 +3136,9 @@ Para fazer a configuração do grupo sem poluir aqui, envie \`!g-painel\`, ou me
 					if (typeof message !== "string") message = "";
 				}
 
-				message = message.replace(/{pessoa}/g, `@${user.id.split("@")[0]}`);
+				message = message.replace(/{pessoa}/g, pessoa);
+				message = message.replace(/{pessoaEnter}/g, pessoaEnter);
+				message = message.replace(/{pessoasVirgula}/g, pessoasVirgula);
 				message = message.replace(/{tituloGrupo}/g, chatData?.name ?? "Grupo");
 
 				// Processa variáveis
@@ -1868,7 +3185,9 @@ Para fazer a configuração do grupo sem poluir aqui, envie \`!g-painel\`, ou me
 
 						let caption = "";
 						if (type !== "audio" && type !== "sticker") {
-							const processedCaption = await processText(farewellData.caption, baseMentions);
+							const rawCaption =
+								typeof farewellData.caption === "string" ? farewellData.caption : "";
+							const processedCaption = await processText(rawCaption, baseMentions);
 							caption = processedCaption.text;
 							currentMentions = [...new Set([...currentMentions, ...processedCaption.mentions])];
 						}
@@ -1880,7 +3199,10 @@ Para fazer a configuração do grupo sem poluir aqui, envie \`!g-painel\`, ou me
 								mentions: currentMentions,
 								sendAudioAsVoice: type === "audio",
 								sendMediaAsSticker: type === "sticker",
-								sendVideoAsGif: type === "gif"
+								sendVideoAsGif:
+									type === "gif" ||
+									mimeType === "image/gif" ||
+									Boolean(farewellData.file && farewellData.file.toLowerCase().endsWith(".gif"))
 							},
 							mentions: currentMentions
 						});
@@ -1943,24 +3265,503 @@ Para fazer a configuração do grupo sem poluir aqui, envie \`!g-painel\`, ou me
 			return false;
 		}
 	}
-	async checkAutoBanSpammers(bot, chat) {
-		const fixedGroups = [
+	/**
+	 * Retorna a lista de grupos fixos monitorados contra spammers
+	 * @returns {string[]}
+	 */
+	getFixedSpamGroups() {
+		return [
 			process.env.GRUPO_INTERACAO,
 			process.env.GRUPO_PESCA,
-			process.env.GRUPO_DOWNLOADS
+			process.env.GRUPO_DOWNLOADS,
+			process.env.GRUPO_STICKERS
 		].filter(Boolean);
+	}
 
-		const chatId = chat.id._serialized || chat.id;
+	/**
+	 * Verifica se o grupo é um dos grupos fixos protegidos contra spammers
+	 * @param {string} groupId - ID do grupo
+	 * @returns {boolean}
+	 */
+	isFixedSpamGroup(groupId) {
+		if (!groupId) return false;
+		const fixedGroups = this.getFixedSpamGroups();
+		return fixedGroups.includes(groupId);
+	}
+
+	/**
+	 * Verifica se o grupo é monitorado contra spammers (grupos fixos ou com banirSpammers ativado)
+	 * @param {string} groupId - ID do grupo
+	 * @param {Group} [group] - Objeto do grupo (opcional)
+	 * @returns {boolean}
+	 */
+	isSpamMonitoredGroup(groupId, group = null) {
+		if (!groupId) return false;
+		if (this.isFixedSpamGroup(groupId)) return true;
+		const grp = group || this.groups[groupId];
+		return !!grp?.banirSpammers;
+	}
+
+	/**
+	 * Verifica se o usuário está na whitelist de spammers permitidos do grupo
+	 * @param {Group} group - Objeto do grupo
+	 * @param {string} userId - ID ou JID do usuário
+	 * @param {string} [phone] - Telefone do usuário
+	 * @returns {boolean}
+	 */
+	isSpammerWhitelisted(group, userId, phone = "") {
+		if (!group || !Array.isArray(group.spammerWhitelist) || group.spammerWhitelist.length === 0) {
+			return false;
+		}
+		const cleanPhone = phone ? String(phone).replace(/\D/g, "") : "";
+		const cleanUserId = userId ? String(userId).split("@")[0].replace(/\D/g, "") : "";
+
+		return group.spammerWhitelist.some((allowed) => {
+			const cleanAllowed = String(allowed).replace(/\D/g, "");
+			if (!cleanAllowed) return false;
+			return cleanAllowed === cleanPhone || cleanAllowed === cleanUserId;
+		});
+	}
+
+	/**
+	 * Extrai o número de telefone celular real de um usuário, participante ou JID.
+	 * Retorna null se for um LID (@lid) ou se o número real não puder ser determinado.
+	 * O banimento por DDI NUNCA deve ocorrer usando um LID.
+	 * @param {Object|string} userOrJid
+	 * @returns {string|null}
+	 */
+	extractPhoneNumber(userOrJid) {
+		if (!userOrJid) return null;
+
+		if (typeof userOrJid === "string") {
+			const str = userOrJid.trim();
+			if (str.endsWith("@lid") || str.includes("@lid") || str.endsWith("@g.us")) {
+				return null;
+			}
+			if (str.endsWith("@s.whatsapp.net") || str.endsWith("@c.us")) {
+				const num = str.split("@")[0].replace(/\D/g, "");
+				return num || null;
+			}
+			// Se for apenas dígitos ou formato internacional (+55...) sem @lid
+			const num = str.replace(/\D/g, "");
+			return num || null;
+		}
+
+		if (typeof userOrJid === "object") {
+			// Prioriza phoneNumber explícito se não for LID
+			if (userOrJid.phoneNumber && typeof userOrJid.phoneNumber === "string") {
+				const pn = userOrJid.phoneNumber.trim();
+				if (!pn.includes("@lid")) {
+					const clean = pn.split("@")[0].replace(/\D/g, "");
+					if (clean) return clean;
+				}
+			}
+
+			// Verifica se o ID principal é de telefone (@s.whatsapp.net ou @c.us)
+			const idStr = userOrJid.id?._serialized || userOrJid.id || "";
+			if (typeof idStr === "string" && !idStr.includes("@lid") && !idStr.includes("@g.us")) {
+				if (idStr.endsWith("@s.whatsapp.net") || idStr.endsWith("@c.us")) {
+					const clean = idStr.split("@")[0].replace(/\D/g, "");
+					if (clean) return clean;
+				}
+			}
+
+			// Se tiver campo .number, só confia se idStr NÃO for @lid
+			if (userOrJid.number && typeof userOrJid.number === "string") {
+				const numStr = userOrJid.number.trim();
+				if (!numStr.includes("@lid") && (!idStr || !idStr.includes("@lid"))) {
+					const clean = numStr.split("@")[0].replace(/\D/g, "");
+					if (clean) return clean;
+				}
+			}
+		}
+
+		return null;
+	}
+
+	/**
+	 * Extrai o nome de exibição / pushname de um usuário ou participante
+	 * @param {Object|string} userOrParticipant
+	 * @returns {string}
+	 */
+	extractUserName(userOrParticipant) {
+		if (!userOrParticipant || typeof userOrParticipant === "string") return "";
+		return (
+			userOrParticipant.name ||
+			userOrParticipant.pushname ||
+			userOrParticipant.pushName ||
+			userOrParticipant.displayName ||
+			userOrParticipant.verifiedName ||
+			userOrParticipant.authorName ||
+			""
+		);
+	}
+
+	/**
+	 * Verifica se o nome do usuário segue o padrão de spammer: MI seguido de 3 a 8 dígitos
+	 * Exemplos: MI523508, MI123456
+	 * @param {string} name
+	 * @returns {boolean}
+	 */
+	isSpammerName(name) {
+		if (!name || typeof name !== "string") return false;
+		const clean = name.trim();
+		return /^MI\s*\d{3,8}$/i.test(clean);
+	}
+
+	/**
+	 * Verifica se o telefone possui prefixo de spammer (62, 63 ou 380).
+	 * NUNCA deve retornar true para LIDs (@lid) ou IDs que não sejam números de celular.
+	 * @param {string} phone
+	 * @returns {boolean}
+	 */
+	isSpammerPrefix(phone) {
+		if (!phone) return false;
+		const str = String(phone).trim();
+		if (str.endsWith("@lid") || str.includes("@lid") || str.endsWith("@g.us")) {
+			return false;
+		}
+		const clean = str.split("@")[0].replace(/\D/g, "");
+		if (!clean) return false;
+		return clean.startsWith("63") || clean.startsWith("62") || clean.startsWith("380");
+	}
+
+	/**
+	 * Tenta resolver o número de telefone real de um usuário/spammer,
+	 * consultando sucessivamente:
+	 * 1. extractPhoneNumber (caso já seja telefone ou objeto com telefone real)
+	 * 2. Propriedade phoneNumber / phone / number no objeto user
+	 * 3. Mapa interno de spammers conhecidos (spammerPhoneMap)
+	 * 4. bot.getPnFromLid (inclusive cache de LID <-> PN do bot)
+	 * 5. chat.participants (se o objeto chat for fornecido)
+	 * 6. bot.getContactDetails / getContactById (se disponível)
+	 *
+	 * @param {Object} bot - Instância do bot
+	 * @param {Object|string} user - Objeto de usuário ou JID/LID
+	 * @param {Object} [chat] - Dados do chat/grupo
+	 * @returns {Promise<string|null>} - Número de telefone limpo (apenas dígitos) ou null
+	 */
+	async resolveSpammerPhone(bot, user, chat = null) {
+		if (!user) return null;
+
+		// 1. Telefone direto (se não for LID)
+		const directPhone = this.extractPhoneNumber(user);
+		if (directPhone) return directPhone;
+
+		// 2. Propriedades explícitas no objeto user
+		if (typeof user === "object") {
+			const cand = user.phoneNumber || user.phone || user.number;
+			if (cand) {
+				const candPhone = this.extractPhoneNumber(cand);
+				if (candPhone) return candPhone;
+			}
+		}
+
+		const userId = typeof user === "string" ? user : user.id?._serialized || user.id || "";
+		if (!userId) return null;
+
+		const strId = String(userId).trim();
+		const pure = strId.split(/[@:]/)[0].replace(/\D/g, "");
+
+		// 3. Consulta mapa interno de spammers registrados
+		if (this.spammerPhoneMap.has(strId)) return this.spammerPhoneMap.get(strId);
+		if (pure && this.spammerPhoneMap.has(pure)) return this.spammerPhoneMap.get(pure);
+		if (pure && this.spammerPhoneMap.has(`${pure}@lid`))
+			return this.spammerPhoneMap.get(`${pure}@lid`);
+
+		// 4. Tenta obter pelo bot.getPnFromLid
+		if (bot && typeof bot.getPnFromLid === "function") {
+			try {
+				const resPn = bot.getPnFromLid(strId, chat);
+				if (resPn && typeof resPn === "string" && !resPn.includes("@lid")) {
+					const clean = resPn.split("@")[0].replace(/\D/g, "");
+					if (clean) {
+						this.spammerPhoneMap.set(strId, clean);
+						if (pure) this.spammerPhoneMap.set(pure, clean);
+						return clean;
+					}
+				}
+			} catch (e) {
+				// Ignora erro
+			}
+		}
+
+		// 5. Procura no chat.participants se fornecido
+		if (chat) {
+			const participants = chat.Participants || chat.participants || [];
+			const p = participants.find(
+				(part) =>
+					part.lid === strId ||
+					part.id?._serialized === strId ||
+					part.id === strId ||
+					part.LID === strId ||
+					(pure &&
+						((part.lid && String(part.lid).startsWith(pure)) ||
+							(part.LID && String(part.LID).startsWith(pure)) ||
+							(part.id?._serialized && String(part.id._serialized).startsWith(pure))))
+			);
+			if (p) {
+				const pPhone =
+					this.extractPhoneNumber(p) ||
+					this.extractPhoneNumber(p.phoneNumber) ||
+					this.extractPhoneNumber(p.PhoneNumber);
+				if (pPhone) {
+					this.spammerPhoneMap.set(strId, pPhone);
+					if (pure) this.spammerPhoneMap.set(pure, pPhone);
+					return pPhone;
+				}
+			}
+		}
+
+		// 6. Consulta bot.getContactDetails / getContactById
+		if (bot && (bot.getContactDetails || bot.client?.getContactById)) {
+			try {
+				const contact = bot.getContactDetails
+					? await bot.getContactDetails(strId)
+					: await bot.client.getContactById(strId);
+				if (contact) {
+					const cPhone =
+						this.extractPhoneNumber(contact) ||
+						this.extractPhoneNumber(contact.phoneNumber) ||
+						this.extractPhoneNumber(contact.number);
+					if (cPhone) {
+						this.spammerPhoneMap.set(strId, cPhone);
+						if (pure) this.spammerPhoneMap.set(pure, cPhone);
+						return cPhone;
+					}
+				}
+			} catch (e) {
+				// Ignora erro
+			}
+		}
+
+		return null;
+	}
+
+	/**
+	 * Registra um spammer no Set de spammers ativos e estende a janela de monitoramento
+	 * @param {string} userId - ID ou JID do spammer
+	 * @param {string} [phone] - Telefone do spammer
+	 * @param {string} [lid] - LID do spammer
+	 */
+	registerSpammer(userId, phone, lid) {
+		const items = [userId, phone, lid].filter(Boolean);
+		for (const item of items) {
+			const str = String(item);
+			this.activeSpammers.add(str);
+			// Não adiciona os dígitos puros de um LID para não colidir com números de celular
+			if (!str.endsWith("@lid") && !str.includes("@lid")) {
+				const clean = str.split("@")[0].replace(/\D/g, "");
+				if (clean) this.activeSpammers.add(clean);
+			}
+		}
+
+		// Mapeia identificadores (inclusive LID) para o telefone celular real
+		const cleanPhone =
+			(phone && this.extractPhoneNumber(phone)) ||
+			(userId && !String(userId).includes("@lid") && this.extractPhoneNumber(userId)) ||
+			null;
+
+		if (cleanPhone) {
+			for (const item of items) {
+				const str = String(item);
+				this.spammerPhoneMap.set(str, cleanPhone);
+				const pure = str.split("@")[0].replace(/\D/g, "");
+				if (pure) {
+					this.spammerPhoneMap.set(pure, cleanPhone);
+					if (str.endsWith("@lid") || str.includes("@lid")) {
+						this.spammerPhoneMap.set(`${pure}@lid`, cleanPhone);
+					}
+				}
+			}
+		}
+
+		this.spammerActiveWindowUntil = Date.now() + 5 * 60 * 1000;
+
+		setTimeout(
+			() => {
+				for (const item of items) {
+					const str = String(item);
+					this.activeSpammers.delete(str);
+					if (!str.endsWith("@lid") && !str.includes("@lid")) {
+						const clean = str.split("@")[0].replace(/\D/g, "");
+						if (clean) this.activeSpammers.delete(clean);
+					}
+					this.spammerPhoneMap.delete(str);
+					const pure = str.split("@")[0].replace(/\D/g, "");
+					if (pure) {
+						this.spammerPhoneMap.delete(pure);
+						this.spammerPhoneMap.delete(`${pure}@lid`);
+					}
+				}
+			},
+			5 * 60 * 1000
+		);
+	}
+
+	/**
+	 * Verifica se o usuário (ou algum na lista) é considerado spammer
+	 * @param {WhatsAppBot} bot - Instância do bot
+	 * @param {Object|Array|string} user - Usuário ou lista de usuários
+	 * @param {string} groupId - ID do grupo
+	 * @param {Object} [chat] - Dados do chat (opcional)
+	 * @param {Group} [group] - Objeto do grupo (opcional)
+	 * @returns {Promise<boolean>}
+	 */
+	async isSpammerUser(bot, user, groupId, chat = null, group = null) {
+		if (!user) return false;
+		const grp =
+			group || this.groups[groupId] || (await this.database?.getGroup(groupId).catch(() => null));
+		const isMonitored = this.isSpamMonitoredGroup(groupId, grp);
+		if (!isMonitored) return false;
+
+		const users = Array.isArray(user) ? user : [user];
+
+		for (const u of users) {
+			const userId = u?.id?._serialized || u?.id || (typeof u === "string" ? u : "");
+			const isLid = Boolean(userId && (userId.endsWith("@lid") || userId.includes("@lid")));
+
+			// Extrai telefone real com segurança (retorna null se for LID)
+			const cleanPhone =
+				this.extractPhoneNumber(u) || (isLid ? null : this.extractPhoneNumber(userId));
+
+			// Extrai nome do usuário
+			const userName = this.extractUserName(u);
+
+			// Se estiver na whitelist do grupo, ignora
+			if (this.isSpammerWhitelisted(grp, userId, cleanPhone)) {
+				continue;
+			}
+
+			// 1. Está no Set de spammers ativos?
+			if (
+				(userId && this.activeSpammers.has(userId)) ||
+				(cleanPhone && this.activeSpammers.has(cleanPhone))
+			) {
+				return true;
+			}
+
+			// 2. Checa se o nome do usuário segue o padrão MI### (3 a 8 números)
+			if (this.isSpammerName(userName)) {
+				return true;
+			}
+
+			// 3. Checa prefixo de spammer no telefone celular real (62, 63, 380)
+			// JAMAIS testa se cleanPhone for nulo ou proveniente de LID
+			if (cleanPhone && this.isSpammerPrefix(cleanPhone)) {
+				return true;
+			}
+
+			// 4. Se for LID ou o telefone/nome não tiver sido obtido, tenta buscar via chat.participants ou bot
+			if (isLid || !cleanPhone || !userName) {
+				let participantPhone = null;
+				let participantName = null;
+
+				if (chat) {
+					const participants = chat.Participants || chat.participants || [];
+					const p = participants.find(
+						(part) =>
+							part.lid === userId ||
+							part.id?._serialized === userId ||
+							part.id === userId ||
+							(cleanPhone &&
+								(part.phoneNumber === cleanPhone ||
+									(part.id?._serialized || part.id || "").startsWith(cleanPhone)))
+					);
+					if (p) {
+						participantPhone = this.extractPhoneNumber(p);
+						participantName = this.extractUserName(p);
+					}
+				}
+
+				if (participantName && this.isSpammerName(participantName)) {
+					this.registerSpammer(userId, participantPhone, isLid ? userId : null);
+					return true;
+				}
+
+				if (participantPhone) {
+					if (this.isSpammerWhitelisted(grp, userId, participantPhone)) {
+						continue;
+					}
+					if (this.isSpammerPrefix(participantPhone)) {
+						this.registerSpammer(userId, participantPhone, isLid ? userId : null);
+						return true;
+					}
+				}
+
+				// Se ainda não achou nem nome nem telefone do LID, tenta contato via bot
+				if (
+					(!participantPhone || !participantName) &&
+					(bot?.getContactDetails || bot?.client?.getContactById)
+				) {
+					try {
+						const contact = bot.getContactDetails
+							? await bot.getContactDetails(userId)
+							: await bot.client.getContactById(userId);
+
+						if (contact) {
+							const cName = this.extractUserName(contact);
+							const cPhone = this.extractPhoneNumber(contact);
+							if (this.isSpammerName(cName)) {
+								this.registerSpammer(userId, cPhone || participantPhone, isLid ? userId : null);
+								return true;
+							}
+							if (cPhone) {
+								if (this.isSpammerWhitelisted(grp, userId, cPhone)) {
+									continue;
+								}
+								if (this.isSpammerPrefix(cPhone)) {
+									this.registerSpammer(userId, cPhone, isLid ? userId : null);
+									return true;
+								}
+							}
+						}
+					} catch (e) {
+						// Ignora erro
+					}
+				}
+			}
+		}
+
+		return false;
+	}
+
+	async checkAutoBanSpammers(bot, chat) {
+		if (!chat || !chat.id) return [];
+		const chatId = chat.id?._serialized || chat.id;
+		if (!chatId) return [];
 		//this.logger.debug(`[checkAutoBanSpammers][${chatId}]`, { fixedGroups });
-		if (fixedGroups.length === 0) return;
-
-		if (!fixedGroups.includes(chatId)) return;
+		const group = this.groups[chatId] || (await this.database?.getGroup(chatId).catch(() => null));
+		if (!this.isSpamMonitoredGroup(chatId, group)) return [];
 
 		const participants = chat.Participants || chat.participants || [];
 
 		const spammers = participants.filter((p) => {
-			const phone = p.phoneNumber || "";
-			return phone.startsWith("63") || phone.startsWith("62");
+			const pId = p.id?._serialized || p.id || "";
+			const phone = this.extractPhoneNumber(p);
+			const name = this.extractUserName(p);
+
+			if (this.isSpammerWhitelisted(group, pId, phone)) {
+				return false;
+			}
+
+			// 1. Está no Set de spammers ativos?
+			if ((pId && this.activeSpammers.has(pId)) || (phone && this.activeSpammers.has(phone))) {
+				return true;
+			}
+
+			// 2. Nome de spammer MI### (3 a 8 dígitos)
+			if (this.isSpammerName(name)) {
+				return true;
+			}
+
+			// 3. Prefixo de spammer (62, 63, 380) no telefone celular REAL
+			// NUNCA valida se for LID ou se phone for nulo
+			if (phone && this.isSpammerPrefix(phone)) {
+				return true;
+			}
+
+			return false;
 		});
 
 		//this.logger.debug(`[checkAutoBanSpammers][${chatId}]`, { participants, spammers });
@@ -1968,11 +3769,13 @@ Para fazer a configuração do grupo sem poluir aqui, envie \`!g-painel\`, ou me
 		if (spammers.length > 0) {
 			const spammersJids = spammers.map((s) => {
 				// Prioritize the phone number JID (@s.whatsapp.net) over LID
-				if (s.phoneNumber) {
-					const cleanPhone = s.phoneNumber.split("@")[0];
+				const cleanPhone = this.extractPhoneNumber(s);
+				if (cleanPhone) {
 					return `${cleanPhone}@s.whatsapp.net`;
 				}
-				return s.id._serialized || s.id;
+				const sId = s.id?._serialized || s.id || "";
+				if (sId.includes("@")) return sId;
+				return `${sId}@s.whatsapp.net`;
 			});
 			this.logger.info(
 				`[checkAutoBanSpammers] Detectados ${spammers.length} spammers no grupo ${chatId}`,
@@ -1981,23 +3784,15 @@ Para fazer a configuração do grupo sem poluir aqui, envie \`!g-painel\`, ou me
 				}
 			);
 
-			// Ativa a janela de monitoramento intenso por 5 minutos
-			this.spammerActiveWindowUntil = Date.now() + 5 * 60 * 1000;
-
-			// Adiciona à lista de spammers ativos para deletar mensagens
-			for (const spammer of spammersJids) {
-				this.activeSpammers.add(spammer);
-				const cleanPhone = spammer.split("@")[0];
-				this.activeSpammers.add(cleanPhone);
-
-				// Remove do set após 5 minutos
-				setTimeout(
-					() => {
-						this.activeSpammers.delete(spammer);
-						this.activeSpammers.delete(cleanPhone);
-					},
-					5 * 60 * 1000
-				);
+			// Ativa a janela de monitoramento intenso por 5 minutos e registra no Set
+			for (const spammer of spammers) {
+				const sId = spammer.id?._serialized || spammer.id || "";
+				const sPhone =
+					this.extractPhoneNumber(spammer) ||
+					this.extractPhoneNumber(spammer.phoneNumber) ||
+					this.extractPhoneNumber(spammer.PhoneNumber);
+				const sLid = spammer.lid || spammer.LID || (sId.endsWith("@lid") ? sId : null);
+				this.registerSpammer(sId, sPhone, sLid);
 			}
 
 			// Remove do grupo
@@ -2009,7 +3804,11 @@ Para fazer a configuração do grupo sem poluir aqui, envie \`!g-painel\`, ou me
 				this.logger.info(`[checkAutoBanSpammers] Removendo spammers da comunidade ${communityJid}`);
 				await bot.removeFromCommunity(communityJid, spammersJids);
 			}
+
+			return spammersJids;
 		}
+
+		return [];
 	}
 
 	/**
@@ -2019,13 +3818,21 @@ Para fazer a configuração do grupo sem poluir aqui, envie \`!g-painel\`, ou me
 	 * @returns {Promise<boolean>} - True se a mensagem for de spammer e foi apagada
 	 */
 	async checkSpammerMessage(bot, message) {
-		const fixedGroups = [
-			process.env.GRUPO_INTERACAO,
-			process.env.GRUPO_PESCA,
-			process.env.GRUPO_DOWNLOADS
-		].filter(Boolean);
+		if (!message.group) {
+			return false;
+		}
 
-		if (!message.group || !fixedGroups.includes(message.group)) {
+		const group =
+			this.groups[message.group] ||
+			(await this.database?.getGroup(message.group).catch(() => null));
+		if (!this.isSpamMonitoredGroup(message.group, group)) {
+			return false;
+		}
+
+		if (
+			this.isSpammerWhitelisted(group, message.author) ||
+			(message.authorAlt && this.isSpammerWhitelisted(group, message.authorAlt))
+		) {
 			return false;
 		}
 
@@ -2037,15 +3844,20 @@ Para fazer a configuração do grupo sem poluir aqui, envie \`!g-painel\`, ou me
 			return false;
 		}
 
+		const authorPhone = this.extractPhoneNumber(message.author);
+		const authorAltPhone = this.extractPhoneNumber(message.authorAlt);
+		const authorName = this.extractUserName(message);
+
 		// Verifica se o autor ou authorAlt é spammer
 		const isSpammer =
 			this.activeSpammers.has(message.author) ||
 			(message.authorAlt && this.activeSpammers.has(message.authorAlt)) ||
+			(authorPhone && this.activeSpammers.has(authorPhone)) ||
+			(authorAltPhone && this.activeSpammers.has(authorAltPhone)) ||
+			this.isSpammerName(authorName) ||
 			(isWindowActive &&
-				(message.author?.startsWith("63") ||
-					message.author?.startsWith("62") ||
-					(message.authorAlt &&
-						(message.authorAlt.startsWith("63") || message.authorAlt.startsWith("62")))));
+				((authorPhone && this.isSpammerPrefix(authorPhone)) ||
+					(authorAltPhone && this.isSpammerPrefix(authorAltPhone))));
 
 		if (isSpammer) {
 			this.logger.warn(

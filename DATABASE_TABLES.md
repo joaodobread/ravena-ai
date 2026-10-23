@@ -100,6 +100,8 @@ Configuração completa de cada grupo onde o bot está presente.
 | `muted_commands` | TEXT (JSON) | Comandos silenciados |
 | `webhooks` | TEXT (JSON) | Webhooks configurados |
 | `twitch` / `youtube` / `kick` | TEXT (JSON) | Canais monitorados |
+| `bot_not_in_group` | TEXT (JSON) | Lista de bot_ids que não participam deste grupo |
+| `minecraft_server` | TEXT (JSON) | Servidor de Minecraft do grupo `{host, port}` (`!configurar-servidor` / `!servidor`) |
 | `json_data` | TEXT | **Legado** — mantido como fallback (Fase 4 remove) |
 
 ### `donations`
@@ -352,7 +354,16 @@ Participantes inscritos em sorteios ativos.
 ## 📣 Social & Conteúdo
 
 ### `msgranking.db → ranking`
-Contador de mensagens por usuário/grupo para ranking de atividade.
+Contador de mensagens e timestamp de última atividade por usuário/grupo para ranking de faladores e atividade (`!faladores`, `!faladores-atividade`).
+
+| Coluna | Tipo | Descrição |
+|---|---|---|
+| `chat_id` | TEXT PK | JID do grupo ou chat |
+| `user_id` | TEXT PK | JID / número do usuário |
+| `user_name` | TEXT | Nome / pushName do usuário |
+| `message_count` | INTEGER | Quantidade de mensagens enviadas |
+| `reaction_count` | INTEGER | Quantidade de reações enviadas |
+| `last_message_at` | INTEGER | Timestamp (ms) da última mensagem ou reação |
 
 ### `summaries.db → group_summaries`
 Resumos gerados por IA das conversas dos grupos.
@@ -384,21 +395,63 @@ Interações cômicas automáticas do bot.
 | `cmd_usage.db` | `cmd_usage_log` | Log de uso de comandos (analytics) |
 | `cooldowns.db` | `cooldowns` | Rate limiting de comandos por usuário/grupo |
 | `copa_seguir.db` | `copa_seguindo` | Chats que seguem times da Copa 2026 para notificações em tempo real |
-| `llm_stats.db` | `usage_stats` | Tokens consumidos por modelo de IA |
-| `media_stats.db` | `comfy_stats`, `speech_transcription_stats` | Uso de geração de imagem e transcrição |
+| `llm_stats.db` | `usage_stats` | Tokens consumidos por modelo de IA (com identificador de `api_user`) |
+| `media_stats.db` | `comfy_stats`, `speech_transcription_stats`, `speech_generation_stats` | Uso de geração de imagem, transcrição e síntese de voz (com `api_user`) |
+| `bonsai_stats.db` | `bonsai_stats` | Uso de geração de imagem Bonsai SDXL (com `api_user`) |
 | `files.db` | `managed_files` | Arquivos gerenciados pelo FileManager |
 | `lists.db` | `user_lists` | Listas criadas por usuários nos grupos |
 | `lembretes.db` | `lembretes` | Lembretes agendados por usuário |
 | `greeted_users.db` | `greeted_users` | Controle de saudação (evita repetição) |
-| `skip_groups.db` | `skip_groups` | Grupos excluídos de operações em lote |
+| `skip_groups.db` | `skipped_groups` | Grupos ignorados onde o bot não participa ou excluídos de envios |
 | `web_management.db` | `sessions`, `users` | Autenticação do painel web |
 | `anon_msgs.db` | `anonymous_messages` | Histórico de mensagens anônimas |
 | `correios.db` | `tracked_packages` | Rastreamento de encomendas Correios |
+| `afk.db` | `afk_sessions` | Histórico e gerenciamento de status AFK (Away From Keyboard) por grupo |
 | `food_tracker.db` | `food_logs` | Registro alimentar por usuário |
+
+### `afk.db`
+Banco de dados para o módulo de status AFK nos grupos.
+
+#### `afk_sessions`
+Armazena histórico de entradas e saídas de status AFK por membro e grupo.
+
+| Coluna | Tipo | Descrição |
+|---|---|---|
+| `id` | INTEGER PK | Auto-incremento |
+| `group_id` | TEXT | JID do grupo (ex: `120363...@g.us`) |
+| `user_id` | TEXT | JID do celular do usuário (ex: `5511999999999@s.whatsapp.net`) |
+| `user_lid` | TEXT | LID do usuário (ex: `123456789@lid`), se disponível |
+| `user_name` | TEXT | Nome / pushname do usuário no grupo |
+| `reason` | TEXT | Motivo informado ao entrar em AFK (opcional) |
+| `entered_at` | INTEGER | Timestamp de entrada em AFK (ms) |
+| `exited_at` | INTEGER | Timestamp de saída do AFK (ms, NULL se ativo) |
+| `is_active` | INTEGER | Estado da sessão AFK (1=ativo, 0=encerrado) |
 | `horoscopo.db` | `horoscopo_cache` | Cache de previsões astrológicas |
 | `placas.db` | `placas_cache` | Cache de consultas de placas veiculares |
 | `raffle_cache.db` | `raffle_cache` | Cache de informações e andamento de rifas/ações |
 | `relacionamentos.db` | `relacionamentos` | Histórico e estatísticas de relacionamentos (namoros, casamentos, divórcios, traições e coisas) nos grupos |
+| `grupo_agendamentos.db` | `grupo_agendamentos` | Agendamentos recorrentes e únicos de fechar/abrir grupos automaticamente |
+
+### `grupo_agendamentos.db`
+Banco de dados para agendamentos de abertura e fechamento automático de grupos do WhatsApp.
+
+#### `grupo_agendamentos`
+Armazena horários programados únicos e semanais por grupo.
+
+| Coluna | Tipo | Descrição |
+|---|---|---|
+| `id` | TEXT PK | Identificador curto por grupo ('A', 'B', ...) |
+| `group_id` | TEXT PK | JID do grupo (ex: `120363...@g.us`) |
+| `bot_id` | TEXT | ID da instância do bot responsável |
+| `tipo` | TEXT | Ação a executar: 'fechar' ou 'abrir' |
+| `hora` | INTEGER | Hora programada no fuso de Brasília (0-23) |
+| `minuto` | INTEGER | Minuto programado no fuso de Brasília (0-59) |
+| `dia_semana` | INTEGER | Dia da semana (0=domingo a 6=sábado, NULL para único) |
+| `timestamp_unico` | INTEGER | Timestamp epoch ms para execução única (NULL para semanal) |
+| `frase` | TEXT | Frase personalizada opcional enviada ao abrir/fechar |
+| `ativo` | INTEGER | Estado do agendamento (1=ativo, 0=inativo/executado) |
+| `criado_em` | INTEGER | Timestamp de criação |
+| `executado_em` | INTEGER | Timestamp da última ou única execução |
 
 ### `relacionamentos.db`
 Banco de dados para o módulo de relacionamentos nos grupos do WhatsApp.
@@ -418,3 +471,15 @@ Armazena propostas e relacionamentos ativos ou terminados entre os participantes
 | `terminado_em` | INTEGER | Timestamp de término (separação) |
 | `coisas_count` | INTEGER | Contador de quantas vezes o casal coisou |
 | `traicoes_count` | INTEGER | Contador de quantas vezes o autor traiu o cônjuge / parceiros |
+
+### `skip_groups.db`
+Banco de dados para controle de grupos ignorados ou dos quais o bot não participa.
+
+#### `skipped_groups`
+Armazena a relação de bots e grupos que devem ser ignorados em envios de mensagens e buscas de detalhes/contato.
+
+| Coluna | Tipo | Descrição |
+|---|---|---|
+| `bot_id` | TEXT PK | Identificador da instância do bot (ex: 'rav-enculinha') |
+| `group_id` | TEXT PK | JID do grupo ignorado/sem participação (ex: `120363...@g.us`) |
+

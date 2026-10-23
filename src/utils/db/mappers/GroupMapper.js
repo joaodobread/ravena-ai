@@ -33,6 +33,7 @@ const GroupMapper = {
 			name: row.name,
 			titulo: row.titulo ?? null,
 			descricao: row.descricao ?? null,
+			regras: row.regras ?? null,
 			addedBy: row.added_by ?? null,
 			removedBy: row.removed_by ?? false,
 			prefix: row.prefix ?? "!",
@@ -40,12 +41,21 @@ const GroupMapper = {
 			inviteCode: row.invite_code ?? null,
 			paused: !!row.paused,
 			additionalAdmins: parse(row.additional_admins, []),
-			filters: parse(row.filters, { nsfw: false, links: false, words: [], people: [] }),
+			filters: parse(row.filters, {
+				nsfw: false,
+				links: false,
+				words: [],
+				regexes: [],
+				people: [],
+				allowAdmins: false,
+				allowedLinks: []
+			}),
 			twitch: parse(row.twitch, []),
 			kick: parse(row.kick, []),
 			youtube: parse(row.youtube, []),
 			botNotInGroup: parse(row.bot_not_in_group, []),
 			webhooks: parse(row.webhooks, []),
+			minecraftServer: parse(row.minecraft_server, null),
 			greetings: parse(row.greetings, {}),
 			farewells: parse(row.farewells, {}),
 			interact: (() => {
@@ -70,9 +80,25 @@ const GroupMapper = {
 			mutedCategories: parse(row.muted_categories, []),
 			nicks: parse(row.nicks, []),
 			warnings: parse(row.warnings, []),
-			customAIPrompt: parse(row.custom_ai_prompt, []),
+			customAIPrompt: (() => {
+				const val = parse(row.custom_ai_prompt, []);
+				if (typeof val === "string") {
+					if (typeof val.isWellFormed === "function" && val.isWellFormed()) {
+						return val;
+					}
+					const cleaned = val.replace(
+						/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/gu,
+						""
+					);
+					return typeof cleaned.toWellFormed === "function" ? cleaned.toWellFormed() : cleaned;
+				}
+				return val;
+			})(),
 			notificaGrupoFechado: !!row.notifica_grupo_fechado,
 			notificaGrupoAberto: !!row.notifica_grupo_aberto,
+			banirSpammers: !!row.banir_spammers,
+			spammerWhitelist: parse(row.spammer_whitelist, []),
+			bannedUsers: parse(row.banned_users, parse(row.json_data, {}).bannedUsers || []),
 			createdAt: row.created_at ?? Date.now(),
 			updatedAt: row.updated_at ?? Date.now()
 		};
@@ -100,6 +126,7 @@ const GroupMapper = {
 			titulo: obj.titulo !== undefined && obj.titulo !== null ? asString(obj.titulo) : null,
 			descricao:
 				obj.descricao !== undefined && obj.descricao !== null ? asString(obj.descricao) : null,
+			regras: obj.regras !== undefined && obj.regras !== null ? asString(obj.regras) : null,
 			added_by: obj.addedBy !== undefined && obj.addedBy !== null ? asString(obj.addedBy) : null,
 			removed_by: obj.removedBy && obj.removedBy !== false ? asString(obj.removedBy) : null,
 			prefix: obj.prefix ?? "!",
@@ -114,6 +141,7 @@ const GroupMapper = {
 			youtube: s(obj.youtube),
 			bot_not_in_group: s(obj.botNotInGroup),
 			webhooks: s(obj.webhooks),
+			minecraft_server: s(obj.minecraftServer),
 			greetings: s(obj.greetings),
 			farewells: s(obj.farewells),
 			interact: s(obj.interact),
@@ -126,9 +154,26 @@ const GroupMapper = {
 			muted_categories: s(obj.mutedCategories),
 			nicks: s(obj.nicks),
 			warnings: s(obj.warnings),
-			custom_ai_prompt: s(obj.customAIPrompt),
+			custom_ai_prompt: (() => {
+				if (typeof obj.customAIPrompt === "string") {
+					let val = obj.customAIPrompt;
+					if (typeof val.isWellFormed === "function" && !val.isWellFormed()) {
+						val = val
+							.replace(
+								/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/gu,
+								""
+							)
+							.toWellFormed();
+					}
+					return s(val);
+				}
+				return s(obj.customAIPrompt);
+			})(),
 			notifica_grupo_fechado: obj.notificaGrupoFechado ? 1 : 0,
 			notifica_grupo_aberto: obj.notificaGrupoAberto ? 1 : 0,
+			banir_spammers: obj.banirSpammers ? 1 : 0,
+			spammer_whitelist: s(obj.spammerWhitelist || obj.allowedSpammers || []),
+			banned_users: s(obj.bannedUsers || []),
 			created_at: obj.createdAt ?? Date.now(),
 			updated_at: Date.now()
 		};

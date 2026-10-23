@@ -27,6 +27,7 @@ const unlinkAsync = promisify(fs.unlink);
 class WhatsAppBotTelegram {
 	constructor(options) {
 		this.id = options.id;
+		this.enabled = options.enabled !== undefined ? Boolean(options.enabled) : true;
 		this.telegramBotName = options.telegramBotName || "ravenabot";
 		this.eventHandler = options.eventHandler;
 		this.prefix = options.prefix || process.env.DEFAULT_PREFIX || "/";
@@ -45,6 +46,10 @@ class WhatsAppBotTelegram {
 		this.updateStatus = options.updateStatus ?? true;
 		this.aiPersonality = options.aiPersonality ?? "";
 		this.grupoLogs = parseInt(options.grupoLogs || process.env.TELEGRAM_GRUPO_LOGS);
+		this.dossieGroups =
+			options.dossieGroups ??
+			this.grupoLogs ??
+			(process.env.TELEGRAM_GRUPO_DOSSIES ? parseInt(process.env.TELEGRAM_GRUPO_DOSSIES) : null);
 		this.grupoAvisos = parseInt(options.grupoAvisos || process.env.TELEGRAM_GRUPO_AVISOS);
 		this.notificarDonate = options.notificarDonate;
 		this.webhookHost = options.webhookHost; // ex: ravena.moothz.win
@@ -66,6 +71,7 @@ class WhatsAppBotTelegram {
 		this.whatsgoApiKey = options.whatsgoApiKey;
 		this.goInstanceName = options.goInstanceName;
 		this.privado = options.privado ?? false;
+		this.extras = options.extras || {};
 		this.managementUser = options.managementUser ?? "admin";
 		this.managementPW = options.managementPW ?? "batata123";
 		this.redisURL = options.redisURL;
@@ -618,6 +624,69 @@ class WhatsAppBotTelegram {
 		return userId; // Fallback to ID
 	}
 
+	/**
+	 * Limita o conteúdo de texto para evitar mensagens gigantescas ou loops de repetição.
+	 * Respeita o limite máximo de caracteres (padrão 15000), de linhas (padrão 200) e repetições consecutivas (máx 15).
+	 *
+	 * @param {string} text - Texto a ser validado e possivelmente truncado.
+	 * @param {number} [maxChars=15000] - Limite máximo de caracteres.
+	 * @param {number} [maxLines=200] - Limite máximo de linhas.
+	 * @param {number} [maxCharRepeats=15] - Limite máximo de repetições consecutivas do mesmo caractere.
+	 * @returns {string} - Texto original ou truncado com indicador.
+	 */
+	truncateText(text, maxChars = 15000, maxLines = 200, maxCharRepeats = 15) {
+		if (typeof text !== "string" || !text) {
+			return text;
+		}
+
+		let result = text;
+		let modified = false;
+
+		// Limita repetições consecutivas do mesmo caractere para no máximo 15 (ex: "KKK...KKK" -> 15 K's)
+		if (maxCharRepeats > 0) {
+			const repeatRegex =
+				maxCharRepeats === 15 ? /(.)\1{15,}/gu : new RegExp(`(.)\\1{${maxCharRepeats},}`, "gu");
+			if (repeatRegex.test(result)) {
+				result = result.replace(repeatRegex, (match, char) => char.repeat(maxCharRepeats));
+				modified = true;
+			}
+		}
+
+		const lines = result.split(/\r?\n/);
+		const exceedsLines = maxLines > 0 && lines.length > maxLines;
+		const exceedsChars = maxChars > 0 && result.length > maxChars;
+
+		if (exceedsLines || exceedsChars) {
+			modified = true;
+			const suffix = "\n... [truncado]";
+
+			if (exceedsLines) {
+				const targetLines = Math.max(1, maxLines - 1);
+				result = lines.slice(0, targetLines).join("\n") + suffix;
+			}
+
+			if (maxChars > 0 && result.length > maxChars) {
+				const targetChars = Math.max(0, maxChars - suffix.length);
+				let sliced = result.slice(0, targetChars);
+				if (typeof sliced.isWellFormed === "function" && !sliced.isWellFormed()) {
+					sliced = sliced.replace(
+						/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/gu,
+						""
+					);
+				}
+				result = sliced + suffix;
+			}
+		}
+
+		if (modified) {
+			this.logger.warn(
+				`[${this.id}] Mensagem de texto ajustada por filtros de tamanho/repetição (${maxChars} chars / ${maxLines} linhas / máx ${maxCharRepeats} repetições).`
+			);
+		}
+
+		return typeof result.toWellFormed === "function" ? result.toWellFormed() : result;
+	}
+
 	async sendMessage(chatId, content, options = {}) {
 		const ignored = chatId?.toString().includes?.("@") ?? false;
 
@@ -657,14 +726,20 @@ class WhatsAppBotTelegram {
 				);
 			}
 
+			const maxChars = options.maxChars !== undefined ? options.maxChars : 15000;
+			const maxLines = options.maxLines !== undefined ? options.maxLines : 200;
+			const maxCharRepeats = options.maxCharRepeats !== undefined ? options.maxCharRepeats : 15;
+
 			// Format Content (Text)
 			if (typeof content === "string") {
 				content = this._formatMessage(content, mentionMap);
+				content = this.truncateText(content, maxChars, maxLines, maxCharRepeats);
 			}
 
 			// Format Caption (Media)
 			if (options.caption) {
 				options.caption = this._formatMessage(options.caption, mentionMap);
+				options.caption = this.truncateText(options.caption, maxChars, maxLines, maxCharRepeats);
 			}
 
 			let response;
@@ -926,6 +1001,20 @@ class WhatsAppBotTelegram {
 		}
 	}
 
+	async setGroupName(groupId, title) {
+		if (!groupId || !title) return false;
+		try {
+			return await this.apiClient.setChatTitle(groupId, title);
+		} catch (err) {
+			this.logger.error(`[setGroupName] Erro ao alterar título de ${groupId}:`, err);
+			throw err;
+		}
+	}
+
+	async setGroupSubject(groupId, title) {
+		return await this.setGroupName(groupId, title);
+	}
+
 	async getChatDetails(chatId) {
 		try {
 			if (chatId.includes("@")) {
@@ -991,6 +1080,66 @@ class WhatsAppBotTelegram {
 		if (this.skipGroupInfo.length < initialLength) {
 			await SkipGroups.getInstance().removeSkippedGroup(this.id, groupId);
 			this.logger.info(`[SkipGroups] Removed ${groupId} from skip list.`);
+		}
+	}
+
+	isParticipating(groupId) {
+		if (!groupId) return false;
+		if (this.skipGroupInfo && this.skipGroupInfo.includes(groupId)) {
+			return false;
+		}
+		return true;
+	}
+
+	isInGroup(groupId) {
+		return this.isParticipating(groupId);
+	}
+
+	async markNotInGroup(groupId) {
+		if (!groupId) return;
+		await this.addSkipGroup(groupId);
+		try {
+			if (this.eventHandler?.groups?.[groupId]) {
+				const grp = this.eventHandler.groups[groupId];
+				if (!grp.botNotInGroup) grp.botNotInGroup = [];
+				if (!grp.botNotInGroup.includes(this.id)) {
+					grp.botNotInGroup.push(this.id);
+				}
+			}
+			if (this.database?.getGroup && this.database?.saveGroup) {
+				const group = await this.database.getGroup(groupId);
+				if (group) {
+					if (!group.botNotInGroup) group.botNotInGroup = [];
+					if (!group.botNotInGroup.includes(this.id)) {
+						group.botNotInGroup.push(this.id);
+						await this.database.saveGroup(group);
+					}
+				}
+			}
+		} catch (error) {
+			this.logger.error(`[TelegramBot] Erro ao marcar botNotInGroup:`, error);
+		}
+	}
+
+	async markInGroup(groupId) {
+		if (!groupId) return;
+		await this.removeSkipGroup(groupId);
+		try {
+			if (this.eventHandler?.groups?.[groupId]) {
+				const grp = this.eventHandler.groups[groupId];
+				if (grp.botNotInGroup && grp.botNotInGroup.includes(this.id)) {
+					grp.botNotInGroup = grp.botNotInGroup.filter((b) => b !== this.id);
+				}
+			}
+			if (this.database?.getGroup && this.database?.saveGroup) {
+				const group = await this.database.getGroup(groupId);
+				if (group && group.botNotInGroup && group.botNotInGroup.includes(this.id)) {
+					group.botNotInGroup = group.botNotInGroup.filter((b) => b !== this.id);
+					await this.database.saveGroup(group);
+				}
+			}
+		} catch (error) {
+			this.logger.error(`[TelegramBot] Erro ao remover botNotInGroup:`, error);
 		}
 	}
 
@@ -1090,6 +1239,24 @@ class WhatsAppBotTelegram {
 		};
 	}
 
+	async createMediaFromBase64(base64Data, mimetype, filename) {
+		const extension = mime.extension(mimetype) ?? "bin";
+		return {
+			mimetype,
+			data: base64Data,
+			filename: filename ?? `file.${extension}`,
+			source: "base64",
+			isMessageMedia: true,
+			size: Buffer.byteLength(base64Data, "base64")
+		};
+	}
+
+	notInWhitelist(author) {
+		const cleanAuthor = String(author || "").replace(/\D/g, "");
+		const list = this.whitelist || this.whitelistPV || [];
+		return !list.includes(cleanAuthor);
+	}
+
 	// As funções abaixo são stubs e não têm efeito no bot do Telegram.
 	logout() {
 		this.logger.warn("logout() is not applicable for Telegram Bot");
@@ -1148,6 +1315,25 @@ class WhatsAppBotTelegram {
 	}
 	getPnFromLid(lid, chat) {
 		return lid;
+	}
+
+	/**
+	 * Verifica se um chat/grupo é o grupo de dossiês do bot
+	 * @param {string|number} groupId - ID do chat a verificar
+	 * @returns {boolean}
+	 */
+	isDossieGroup(groupId) {
+		if (!this.dossieGroups || !groupId) return false;
+		const clean = (id) => String(id).split("@")[0].trim();
+		const targetClean = clean(groupId);
+		const groups = Array.isArray(this.dossieGroups)
+			? this.dossieGroups
+			: typeof this.dossieGroups === "string" && this.dossieGroups.includes(",")
+				? this.dossieGroups.split(",").map((g) => g.trim())
+				: [this.dossieGroups];
+		return groups.some(
+			(g) => clean(g) === targetClean || String(g).trim() === String(groupId).trim()
+		);
 	}
 
 	async destroy() {

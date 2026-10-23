@@ -1,5 +1,6 @@
 const fs = require("fs").promises;
 const path = require("path");
+const axios = require("axios");
 const Logger = require("../utils/Logger");
 const Database = require("../utils/Database");
 const AdminUtils = require("../utils/AdminUtils");
@@ -8,6 +9,8 @@ const ReturnMessage = require("../models/ReturnMessage");
 const Command = require("../models/Command");
 const WebManagement = require("../utils/WebManagement");
 const StreamSystem = require("../StreamSystem");
+const GrupoAgendamentos = require("./modules/GrupoAgendamentos");
+const { validateRegexFilter } = require("../utils/RegexFilterValidator");
 
 class Management {
 	constructor() {
@@ -46,6 +49,10 @@ class Management {
 			setDespedida: {
 				method: "setFarewellMessage",
 				description: "Mensagem quando alguém sai do grupo"
+			},
+			acumularSaudacoes: {
+				method: "toggleGreetingAccumulation",
+				description: "Ativa/desativa o acúmulo de boas-vindas e despedidas por intervalo"
 			},
 			delDespedida: {
 				method: "deleteFarewellMessage",
@@ -137,9 +144,27 @@ class Management {
 				method: "filterWord",
 				description: "Detecta e Apaga mensagens com a palavra/frase especificada"
 			},
+			"filtro-regex": {
+				method: "filterRegex",
+				description:
+					"Detecta e Apaga mensagens que correspondam à expressão regular (regex) especificada"
+			},
 			"filtro-links": {
 				method: "filterLinks",
 				description: "Detecta e Apaga mensagens com links"
+			},
+			"filtro-permitirAdm": {
+				method: "filterAllowAdmins",
+				description: "Habilita/desabilita a filtragem de mensagens de administradores do grupo"
+			},
+			"filtro-permitirLink": {
+				method: "filterAllowLink",
+				description: "Adiciona/remove ou lista domínios e padrões de links permitidos no grupo"
+			},
+			"filtro-linksConfiaveis": {
+				method: "filterTrustedLinks",
+				description:
+					"Adiciona ou remove os principais sites confiáveis da lista de links permitidos"
 			},
 			"filtro-pessoa": {
 				method: "filterPerson",
@@ -147,7 +172,7 @@ class Management {
 			},
 			"filtro-nsfw": {
 				method: "filterNSFW",
-				description: "Detecta e Apaga mensagens NSFW"
+				description: "Ativa/desativa ou define a intensidade (0-100) do filtro NSFW"
 			},
 			// 'apelido': {
 			//   method: 'setUserNickname',
@@ -193,23 +218,82 @@ class Management {
 				method: "setInteractionProportion",
 				description: "Define a proporção entre comandos e IA para interações automáticas"
 			},
+			pin: {
+				method: "pinMessage",
+				description: "Fixa a mensagem marcada (em resposta)"
+			},
+			promover: {
+				method: "promoteMembers",
+				description: "Transforma membros mencionados em administradores do grupo (máx 10)"
+			},
+			rebaixar: {
+				method: "demoteMembers",
+				description: "Remove privilégios de administrador dos membros mencionados (máx 10)"
+			},
+			banir: {
+				method: "banGroupMembers",
+				description:
+					"Remove pessoas mencionadas do grupo e comunidade, impedindo reentrada (máx 5)",
+				hidden: true
+			},
 			ban: {
-				method: "banUser",
-				description: "Remove membros mencionados do grupo",
+				method: "banGroupMembers",
+				description: "Alias de banir",
 				hidden: true
 			},
 			block: {
-				method: "blockGroupUser",
-				description: "Remove membros mencionados do grupo e impede reentrada",
+				method: "banGroupMembers",
+				description: "Alias de banir",
+				hidden: true
+			},
+			bloquear: {
+				method: "banGroupMembers",
+				description: "Alias de banir",
+				hidden: true
+			},
+			desbanir: {
+				method: "unbanGroupMembers",
+				description: "Remove o ban da pessoa, permitindo que entre no grupo novamente",
+				hidden: true
+			},
+			desblock: {
+				method: "unbanGroupMembers",
+				description: "Alias de desbanir",
+				hidden: true
+			},
+			unban: {
+				method: "unbanGroupMembers",
+				description: "Alias de desbanir",
+				hidden: true
+			},
+			unblock: {
+				method: "unbanGroupMembers",
+				description: "Alias de desbanir",
 				hidden: true
 			},
 			fechar: {
 				method: "closeGroup",
-				description: "Fecha o grupo (apenas admins enviam msgs)"
+				description: "Fecha o grupo (apenas admins enviam msgs) ou agenda horário"
+			},
+			"fechar-lista": {
+				method: "listGroupSchedulesClose",
+				description: "Lista horários agendados para fechar o grupo"
+			},
+			"fechar-del": {
+				method: "deleteGroupScheduleClose",
+				description: "Remove um agendamento de fechamento do grupo"
 			},
 			abrir: {
 				method: "openGroup",
-				description: "Abre o grupo (todos podem envar msgs)"
+				description: "Abre o grupo (todos podem enviar msgs) ou agenda horário"
+			},
+			"abrir-lista": {
+				method: "listGroupSchedulesOpen",
+				description: "Lista horários agendados para abrir o grupo"
+			},
+			"abrir-del": {
+				method: "deleteGroupScheduleOpen",
+				description: "Remove um agendamento de abertura do grupo"
 			},
 			"notificar-grupoFechado": {
 				method: "toggleNotificaGrupoFechado",
@@ -218,6 +302,21 @@ class Management {
 			"notificar-grupoAberto": {
 				method: "toggleNotificaGrupoAberto",
 				description: "Ativa/desativa a notificação quando o grupo é aberto"
+			},
+			banirSpammers: {
+				method: "toggleBanirSpammers",
+				description:
+					"Ativa/desativa o monitoramento e banimento de spammers (DDI 62/63/380 ou padrão MI###) neste grupo"
+			},
+			permitirSpammer: {
+				method: "togglePermitirSpammer",
+				description: "Adiciona/remove número da lista de spammers permitidos no grupo",
+				hidden: true
+			},
+			permitirSpamer: {
+				method: "togglePermitirSpammer",
+				description: "Adiciona/remove número da lista de spammers permitidos no grupo",
+				hidden: true
 			},
 			setPersonalidade: {
 				method: "setPersonalidadeIA",
@@ -234,6 +333,10 @@ class Management {
 			"twitch-mudarTitulo": {
 				method: "toggleTwitchTitleChange",
 				description: "Ativa/desativa mudança de título do grupo para eventos da Twitch"
+			},
+			"twitch-mudarFoto": {
+				method: "toggleTwitchPhotoChange",
+				description: "Ativa/desativa mudança de foto do grupo para eventos da Twitch"
 			},
 			"twitch-titulo": {
 				method: "setTwitchTitle",
@@ -263,6 +366,11 @@ class Management {
 				method: "toggleTwitchMentions",
 				description: "Ativa/desativa menção a todos os membros nas notificações de canal da Twitch"
 			},
+			"twitch-encaminharCanal": {
+				method: "setTwitchForwardChannel",
+				description:
+					"Ativa/desativa encaminhamento de notificações da Twitch para canal do WhatsApp"
+			},
 			"kick-canal": {
 				method: "toggleKickChannel",
 				description: "Adiciona/remove canal do Kick para monitoramento"
@@ -270,6 +378,10 @@ class Management {
 			"kick-mudarTitulo": {
 				method: "toggleKickTitleChange",
 				description: "Ativa/desativa mudança de título do grupo para eventos do Kick"
+			},
+			"kick-mudarFoto": {
+				method: "toggleKickPhotoChange",
+				description: "Ativa/desativa mudança de foto do grupo para eventos do Kick"
 			},
 			"kick-titulo": {
 				method: "setKickTitle",
@@ -299,6 +411,10 @@ class Management {
 				method: "toggleKickMentions",
 				description: "Ativa/desativa menção a todos os membros nas notificações de canal do Kick"
 			},
+			"kick-encaminharCanal": {
+				method: "setKickForwardChannel",
+				description: "Ativa/desativa encaminhamento de notificações do Kick para canal do WhatsApp"
+			},
 			"youtube-canal": {
 				method: "toggleYoutubeChannel",
 				description: "Adiciona/remove canal do YouTube para monitoramento"
@@ -306,6 +422,10 @@ class Management {
 			"youtube-mudarTitulo": {
 				method: "toggleYoutubeTitleChange",
 				description: "Ativa/desativa mudança de título do grupo para eventos do YouTube"
+			},
+			"youtube-mudarFoto": {
+				method: "toggleYoutubePhotoChange",
+				description: "Ativa/desativa mudança de foto do grupo para eventos do YouTube"
 			},
 			"youtube-titulo": {
 				method: "setYoutubeTitle",
@@ -334,6 +454,11 @@ class Management {
 			"youtube-marcar": {
 				method: "toggleYoutubeMentions",
 				description: "Ativa/desativa menção a todos os membros nas notificações de canal do YouTube"
+			},
+			"youtube-encaminharCanal": {
+				method: "setYoutubeForwardChannel",
+				description:
+					"Ativa/desativa encaminhamento de notificações do YouTube para canal do WhatsApp"
 			},
 			variaveis: {
 				method: "listVariables",
@@ -374,6 +499,10 @@ class Management {
 			copiarCmds: {
 				method: "copyCommands",
 				description: "Copia os comandos do grupoOrigem pro grupoDestino"
+			},
+			regras: {
+				method: "handleGroupRules",
+				description: "Define, exibe ou remove as regras do grupo"
 			}
 		};
 
@@ -388,7 +517,12 @@ class Management {
 	 * @returns {Object} - Objeto com comandos e descrições
 	 */
 	getCommandMethod(command) {
-		return this.commandMap[command]?.method;
+		if (!command) return undefined;
+		if (this.commandMap[command]) return this.commandMap[command].method;
+		const lower = command.toLowerCase();
+		if (this.commandMap[lower]) return this.commandMap[lower].method;
+		const match = Object.entries(this.commandMap).find(([k]) => k.toLowerCase() === lower);
+		return match ? match[1].method : undefined;
 	}
 
 	/**
@@ -518,7 +652,7 @@ class Management {
 
 		const grupoExistente = await this.database.getGroupByName(newName);
 
-		if (grupoExistente) {
+		if (grupoExistente && grupoExistente.id !== group.id) {
 			this.logger.info(
 				`[setGroupName] ${message.author} tentou renomear grupo '${group.name}' para '${newName}', mas já existe um!`,
 				[group, grupoExistente]
@@ -1320,8 +1454,33 @@ class Management {
 
 		// Se tiver mensagem citada
 		if (quotedMsg) {
-			const type = "text";
-			const content = quotedMsg.caption ?? quotedMsg.content ?? quotedMsg.body ?? "";
+			const prefixo = group.prefix ?? "!";
+			const comandoCompleto = `${prefixo}g-setBoasvindas`;
+			let commandText = "";
+			if (message.origin && message.origin.body) {
+				const bodyStr = message.origin.body;
+				const idx = bodyStr.toLowerCase().indexOf("g-setboasvindas");
+				if (idx !== -1) {
+					commandText = bodyStr.substring(idx + "g-setboasvindas".length).trim();
+				}
+			}
+
+			let content = commandText;
+			if (!content) {
+				if (typeof quotedMsg.caption === "string" && quotedMsg.caption.trim()) {
+					content = quotedMsg.caption.trim();
+				} else if (typeof quotedMsg.body === "string" && quotedMsg.body.trim()) {
+					content = quotedMsg.body.trim();
+				} else if (typeof quotedMsg.content === "string" && quotedMsg.content.trim()) {
+					content = quotedMsg.content.trim();
+				} else if (
+					quotedMsg._data &&
+					typeof quotedMsg._data.body === "string" &&
+					quotedMsg._data.body.trim()
+				) {
+					content = quotedMsg._data.body.trim();
+				}
+			}
 
 			if (quotedMsg.hasMedia) {
 				try {
@@ -1333,6 +1492,16 @@ class Management {
 					}
 					if (quotedMsg.type.toLowerCase() == "voice") {
 						mediaType = "audio";
+					}
+
+					const isGif =
+						quotedMsg.content?._mediaDetails?.gifPlayback === true ||
+						quotedMsg._mediaDetails?.gifPlayback === true ||
+						quotedMsg.isGif === true ||
+						media.mimetype === "image/gif";
+
+					if (isGif) {
+						mediaType = "gif";
 					}
 
 					// Gera nome de arquivo com extensão apropriada
@@ -1355,7 +1524,7 @@ class Management {
 					// Define o objeto de mídia
 					group.greetings[mediaType] = {
 						file: fileName,
-						caption: content // legenda original
+						caption: content // legenda original ou texto enviado no comando
 					};
 
 					// Se a legenda tiver texto, atualiza também o texto principal?
@@ -1500,7 +1669,16 @@ class Management {
 
 		// Se tiver mensagem citada
 		if (quotedMsg) {
-			const content = quotedMsg.caption ?? quotedMsg.content ?? quotedMsg.body ?? "";
+			let content = "";
+			if (typeof quotedMsg.caption === "string") {
+				content = quotedMsg.caption;
+			} else if (typeof quotedMsg.body === "string") {
+				content = quotedMsg.body;
+			} else if (typeof quotedMsg.content === "string") {
+				content = quotedMsg.content;
+			} else if (quotedMsg._data && typeof quotedMsg._data.body === "string") {
+				content = quotedMsg._data.body;
+			}
 
 			if (quotedMsg.hasMedia) {
 				try {
@@ -1512,6 +1690,16 @@ class Management {
 					}
 					if (quotedMsg.type.toLowerCase() == "voice") {
 						mediaType = "audio";
+					}
+
+					const isGif =
+						quotedMsg.content?._mediaDetails?.gifPlayback === true ||
+						quotedMsg._mediaDetails?.gifPlayback === true ||
+						quotedMsg.isGif === true ||
+						media.mimetype === "image/gif";
+
+					if (isGif) {
+						mediaType = "gif";
 					}
 
 					// Gera nome de arquivo com extensão apropriada
@@ -1602,6 +1790,67 @@ class Management {
 	 * @param {Object} group - Dados do grupo
 	 * @returns {Promise<ReturnMessage>} Mensagem de retorno
 	 */
+	/**
+	 * Alterna o acúmulo de saudações e define o intervalo em minutos.
+	 */
+	async toggleGreetingAccumulation(bot, message, args, group) {
+		if (!group) {
+			return new ReturnMessage({
+				chatId: message.author,
+				content: "Este comando só pode ser usado em grupos."
+			});
+		}
+
+		if (!group.greetingAccumulation) {
+			group.greetingAccumulation = {
+				enabled: false,
+				intervalMinutes: 30
+			};
+		}
+
+		let targetEnabled = !group.greetingAccumulation.enabled;
+		let targetMinutes = group.greetingAccumulation.intervalMinutes || 30;
+
+		if (args && args.length > 0) {
+			const argStr = args.join(" ").toLowerCase();
+			const hasEnable = /\b(on|ativar|liga|ligar|true|habilitar|sim)\b/i.test(argStr);
+			const hasDisable = /\b(off|desativar|desliga|desligar|false|desabilitar|nao|não)\b/i.test(
+				argStr
+			);
+			const numMatch = argStr.match(/\b\d+\b/);
+
+			if (numMatch) {
+				const parsed = Number.parseInt(numMatch[0], 10);
+				if (parsed > 0) targetMinutes = parsed;
+			}
+
+			if (hasEnable) {
+				targetEnabled = true;
+			} else if (hasDisable) {
+				targetEnabled = false;
+			} else if (numMatch && !hasEnable && !hasDisable) {
+				targetEnabled = true;
+			}
+		}
+
+		group.greetingAccumulation = {
+			enabled: targetEnabled,
+			intervalMinutes: targetMinutes
+		};
+
+		await this.database.saveGroup(group);
+
+		const EventHandler = require("../EventHandler");
+		if (EventHandler.instance) {
+			EventHandler.instance.handleGreetingAccumulationConfigChange(group);
+		}
+
+		return new ReturnMessage({
+			chatId: group.id,
+			content: `Acúmulo de saudações ${group.greetingAccumulation.enabled ? "*ativado*" : "*desativado*"} (intervalo: ${targetMinutes} minuto(s)).`
+		});
+	}
+
 	async deleteFarewellMessage(bot, message, args, group) {
 		if (!group) {
 			return new ReturnMessage({
@@ -1671,9 +1920,13 @@ class Management {
 
   *Comandos de Filtro:*
   *!g-filtro-palavra* <palavra> - Adiciona/remove palavra do filtro
+  *!g-filtro-regex* <expressão> - Adiciona/remove regex do filtro
   *!g-filtro-links* - Ativa/desativa filtro de links
+  *!g-filtro-permitirLink* <dominio> - Adiciona/remove ou lista domínios e padrões de links permitidos
+  *!g-filtro-linksConfiaveis* - Adiciona ou remove principais sites confiáveis dos links permitidos
+  *!g-filtro-permitirAdm* - Ativa/desativa isenção de filtros para administradores
   *!g-filtro-pessoa* @MarcarPessoa - Adiciona/remove número do filtro
-  *!g-filtro-nsfw* - Ativa/desativa filtro de conteúdo NSFW
+  *!g-filtro-nsfw* [0-100] - Ativa/desativa ou ajusta a intensidade do filtro NSFW
 
   *Variáveis em mensagens:*
   {pessoa} - Nome da pessoa que entrou/saiu do grupo
@@ -1721,6 +1974,11 @@ class Management {
 				group.filters && group.filters.words && group.filters.words.length > 0
 					? group.filters.words.join(", ")
 					: "Nenhuma palavra filtrada";
+
+			const regexFilters =
+				group.filters && group.filters.regexes && group.filters.regexes.length > 0
+					? group.filters.regexes.map((r) => `\`${r}\``).join(", ")
+					: "Nenhum regex filtrado";
 
 			const linkFiltering = group.filters && group.filters.links ? "Sim" : "Não";
 
@@ -1831,9 +2089,21 @@ class Management {
 
 			infoMessage += `*Filtros:*\n`;
 			infoMessage += `- *Palavras:* ${wordFilters}\n`;
+			infoMessage += `- *Regexes:* ${regexFilters}\n`;
 			infoMessage += `- *Links:* ${linkFiltering}\n`;
+			infoMessage += `- *Permitir Admins:* ${group.filters?.allowAdmins ? "Sim" : "Não"}\n`;
+			if (group.filters?.allowedLinks && group.filters.allowedLinks.length > 0) {
+				infoMessage += `- *Links Permitidos:* ${group.filters.allowedLinks.join(", ")}\n`;
+			}
 			infoMessage += `- *Pessoas:* ${personFilters}\n`;
 			infoMessage += `- *NSFW:* ${nsfwFiltering}\n`;
+			infoMessage += `- *Banir Spammers:* ${group.banirSpammers ? "Sim" : "Não"}\n`;
+			if (group.spammerWhitelist && group.spammerWhitelist.length > 0) {
+				infoMessage += `- *Spammers Permitidos:* ${group.spammerWhitelist.join(", ")}\n`;
+			}
+			if (group.bannedUsers && group.bannedUsers.length > 0) {
+				infoMessage += `- *Banidos:* ${group.bannedUsers.length}\n`;
+			}
 
 			// Buscar Dossiês
 			let dossierInfo = "";
@@ -1856,7 +2126,8 @@ class Management {
 					const avgScore = (totalScore / dossiers.length).toFixed(1);
 
 					dossierInfo += `\n*📋 Dossiê do Grupo:*\n`;
-					dossierInfo += `- *Último:* [${latest.type}] ${latest.summary}\n`;
+					const underageTag = latest.is_underage ? " 👶 [Menores]" : "";
+					dossierInfo += `- *Último:* [${latest.type}] ${latest.summary}${underageTag}\n`;
 					dossierInfo += `- *Nota Média:* ${avgScore}/10 (baseado em ${dossiers.length} análises)\n`;
 				}
 			} catch (e) {
@@ -1922,13 +2193,18 @@ class Management {
 					infoMessage += `  • Marcar Todos: ${channel.mentionAllMembers ? "Sim" : "Não"}\n`;
 					infoMessage += `  • Usar Thumbnail: ${channel.useThumbnail ? "Sim" : "Não"}\n`;
 					infoMessage += `  • Usar IA: ${channel.useAI ? "Sim" : "Não"}\n`;
+					infoMessage += `  • Mudar foto do grupo: ${channel.changePhotoOnEvent ? "Sim" : "Não"}\n`;
 
 					if (channel.groupPhotoOnline) {
 						infoMessage += `  • Foto de grupo Online: Configurada\n`;
+					} else if (channel.changePhotoOnEvent) {
+						infoMessage += `  • Foto de grupo Online: Thumbnail da live\n`;
 					}
 
 					if (channel.groupPhotoOffline) {
 						infoMessage += `  • Foto de grupo Offline: Configurada\n`;
+					} else if (channel.changePhotoOnEvent) {
+						infoMessage += `  • Foto de grupo Offline: Restaurar foto anterior\n`;
 					}
 
 					infoMessage += "\n";
@@ -1966,13 +2242,18 @@ class Management {
 					}
 
 					infoMessage += `  • Usar IA: ${channel.useAI ? "Sim" : "Não"}\n`;
+					infoMessage += `  • Mudar foto do grupo: ${channel.changePhotoOnEvent ? "Sim" : "Não"}\n`;
 
 					if (channel.groupPhotoOnline) {
 						infoMessage += `  • Foto de grupo Online: Configurada\n`;
+					} else if (channel.changePhotoOnEvent) {
+						infoMessage += `  • Foto de grupo Online: Thumbnail da live\n`;
 					}
 
 					if (channel.groupPhotoOffline) {
 						infoMessage += `  • Foto de grupo Offline: Configurada\n`;
+					} else if (channel.changePhotoOnEvent) {
+						infoMessage += `  • Foto de grupo Offline: Restaurar foto anterior\n`;
 					}
 
 					infoMessage += "\n";
@@ -2003,9 +2284,18 @@ class Management {
 					}
 
 					infoMessage += `  • Usar IA: ${channel.useAI ? "Sim" : "Não"}\n`;
+					infoMessage += `  • Mudar foto do grupo: ${channel.changePhotoOnEvent ? "Sim" : "Não"}\n`;
 
 					if (channel.groupPhotoOnline) {
-						infoMessage += `  • Foto de grupo Novo Vídeo: Configurada\n`;
+						infoMessage += `  • Foto de grupo Online: Configurada\n`;
+					} else if (channel.changePhotoOnEvent) {
+						infoMessage += `  • Foto de grupo Online: Thumbnail da live\n`;
+					}
+
+					if (channel.groupPhotoOffline) {
+						infoMessage += `  • Foto de grupo Offline: Configurada\n`;
+					} else if (channel.changePhotoOnEvent) {
+						infoMessage += `  • Foto de grupo Offline: Restaurar foto anterior\n`;
 					}
 
 					infoMessage += "\n";
@@ -2198,6 +2488,98 @@ class Management {
 	}
 
 	/**
+	 * Adiciona ou remove uma expressão regular (regex) do filtro
+	 * @param {WhatsAppBot} bot - Instância do bot
+	 * @param {Object} message - Dados da mensagem
+	 * @param {Array} args - Argumentos do comando
+	 * @param {Object} group - Dados do grupo
+	 * @returns {Promise<ReturnMessage>} Mensagem de retorno
+	 */
+	async filterRegex(bot, message, args, group) {
+		if (!group) {
+			return new ReturnMessage({
+				chatId: message.group,
+				content: "❌ Este comando só pode ser usado em grupos."
+			});
+		}
+
+		// Verifica se o bot é admin para filtros efetivos
+		const isAdmin = await this.isBotAdmin(bot, group);
+		if (!isAdmin) {
+			await bot.sendMessage(
+				group.id,
+				"⚠️ Atenção: O bot não é administrador do grupo. Ele não poderá apagar mensagens filtradas. Para usar filtros efetivamente, adicione o bot como administrador."
+			);
+		}
+
+		// Inicializa filtros se não existirem
+		if (!group.filters) {
+			group.filters = {};
+		}
+
+		if (!group.filters.regexes || !Array.isArray(group.filters.regexes)) {
+			group.filters.regexes = [];
+		}
+
+		if (args.length === 0) {
+			// Mostra lista de regexes filtrados atualmente
+			const regexFilters =
+				group.filters.regexes.length > 0
+					? group.filters.regexes.map((r) => `• \`${r}\``).join("\n")
+					: "Nenhum regex filtrado";
+
+			return new ReturnMessage({
+				chatId: group.id,
+				content: `*Expressões regulares (regex) filtradas atualmente:*\n${regexFilters}\n\nPara adicionar ou remover um regex do filtro, use: !g-filtro-regex <expressão regular>\nExemplo: \`!g-filtro-regex \\b(palavra1|palavra2)\\b\` ou \`!g-filtro-regex /padrão/i\``
+			});
+		}
+
+		const pattern = args.join(" ").trim();
+
+		// Verifica se o regex já está no filtro (para remoção)
+		const index = group.filters.regexes.findIndex((r) => r === pattern);
+
+		if (index !== -1) {
+			// Remove o regex
+			group.filters.regexes.splice(index, 1);
+			await this.database.saveGroup(group);
+
+			const regexFilters =
+				group.filters.regexes.length > 0
+					? group.filters.regexes.map((r) => `• \`${r}\``).join("\n")
+					: "Nenhum regex filtrado";
+
+			return new ReturnMessage({
+				chatId: group.id,
+				content: `✅ Regex removido do filtro: \`${pattern}\`\n\n*Regex filtrados atualmente:*\n${regexFilters}`
+			});
+		} else {
+			// Valida o regex antes de adicionar
+			const validation = validateRegexFilter(pattern);
+			if (!validation.valid) {
+				return new ReturnMessage({
+					chatId: group.id,
+					content: `⚠️ Não foi possível adicionar o regex:\n${validation.error}`
+				});
+			}
+
+			// Adiciona o regex
+			group.filters.regexes.push(pattern);
+			await this.database.saveGroup(group);
+
+			const regexFilters =
+				group.filters.regexes.length > 0
+					? group.filters.regexes.map((r) => `• \`${r}\``).join("\n")
+					: "Nenhum regex filtrado";
+
+			return new ReturnMessage({
+				chatId: group.id,
+				content: `✅ Regex adicionado ao filtro: \`${pattern}\`\n\n*Regex filtrados atualmente:*\n${regexFilters}`
+			});
+		}
+	}
+
+	/**
 	 * Ativa ou desativa filtro de links
 	 * @param {WhatsAppBot} bot - Instância do bot
 	 * @param {Object} message - Dados da mensagem
@@ -2232,10 +2614,23 @@ class Management {
 		await this.database.saveGroup(group);
 
 		if (group.filters.links) {
+			let content =
+				"✅ *Filtro de links ativado!* Mensagens contendo links serão apagadas automaticamente.\n\n";
+			content += "💡 *Deseja personalizar quais links são permitidos?*\n";
+			content +=
+				"• *!g-filtro-permitirLink <dominio>* - Permite domínios específicos (ex: `!g-filtro-permitirLink *youtube*` ou `terra.com.br`)\n";
+			content +=
+				"• *!g-filtro-linksConfiaveis* - Libera sites confiáveis (YouTube, Google, OLX, Mercado Livre, Facebook, Instagram)\n";
+			content +=
+				"• *!g-filtro-permitirAdm* - Permite que administradores enviem links livremente sem serem filtrados";
+
+			if (group.filters.allowedLinks && group.filters.allowedLinks.length > 0) {
+				content += `\n\n📌 *Links permitidos atualmente (${group.filters.allowedLinks.length}):*\n${group.filters.allowedLinks.join(", ")}`;
+			}
+
 			return new ReturnMessage({
 				chatId: group.id,
-				content:
-					"✅ Filtro de links ativado. Mensagens contendo links serão apagadas automaticamente."
+				content
 			});
 		} else {
 			return new ReturnMessage({
@@ -2243,6 +2638,337 @@ class Management {
 				content: "❌ Filtro de links desativado. Mensagens contendo links não serão mais filtradas."
 			});
 		}
+	}
+
+	/**
+	 * Habilita ou desabilita a filtragem de mensagens enviadas por administradores do grupo
+	 * @param {WhatsAppBot} bot - Instância do bot
+	 * @param {Object} message - Dados da mensagem
+	 * @param {Array} args - Argumentos do comando
+	 * @param {Object} group - Dados do grupo
+	 * @returns {Promise<ReturnMessage>} Mensagem de retorno
+	 */
+	async filterAllowAdmins(bot, message, args, group) {
+		if (!group) {
+			return new ReturnMessage({
+				chatId: message.author,
+				content: "Este comando só pode ser usado em grupos."
+			});
+		}
+
+		const isAdmin = await this.isBotAdmin(bot, group);
+		if (!isAdmin) {
+			await bot.sendMessage(
+				group.id,
+				"⚠️ Atenção: O bot não é administrador do grupo. Ele não poderá apagar mensagens filtradas. Para usar filtros efetivamente, adicione o bot como administrador."
+			);
+		}
+
+		if (!group.filters) {
+			group.filters = {};
+		}
+
+		group.filters.allowAdmins = !group.filters.allowAdmins;
+		await this.database.saveGroup(group);
+
+		if (group.filters.allowAdmins) {
+			return new ReturnMessage({
+				chatId: group.id,
+				content:
+					"✅ *Isenção para administradores ativada!*\n\nMensagens enviadas por administradores do grupo ou admins adicionais *não serão mais apagadas* por filtros (palavras, links, pessoas ou NSFW)."
+			});
+		} else {
+			return new ReturnMessage({
+				chatId: group.id,
+				content:
+					"❌ *Isenção para administradores desativada!*\n\nMensagens de todos os membros, inclusive administradores, serão filtradas normalmente."
+			});
+		}
+	}
+
+	/**
+	 * Normaliza de forma inteligente um domínio ou padrão para links permitidos
+	 * @param {string} input - Domínio, URL ou wildcard
+	 * @returns {{ pattern: string, extractedFromUrl: boolean }}
+	 */
+	_normalizeLinkPattern(input) {
+		if (!input) return { pattern: "", extractedFromUrl: false };
+		let raw = input.trim();
+
+		// Se contém wildcard '*', mantém o padrão
+		if (raw.includes("*")) {
+			return { pattern: raw.toLowerCase(), extractedFromUrl: false };
+		}
+
+		const extractedFromUrl = false;
+		if (/^(https?:\/\/|www\.)/i.test(raw)) {
+			try {
+				const formatted = /^[a-zA-Z][a-zA-Z\d+\-.]*:\/\//.test(raw) ? raw : `http://${raw}`;
+				const parsed = new URL(formatted);
+				let host = parsed.hostname.toLowerCase();
+				if (host.startsWith("www.")) {
+					host = host.substring(4);
+				}
+				return { pattern: host, extractedFromUrl: true };
+			} catch {
+				// Fallback
+			}
+		}
+
+		// Remove protocolo se houver
+		raw = raw.replace(/^https?:\/\//i, "");
+		// Remove query string e hash
+		raw = raw.split(/[?#]/)[0];
+		if (raw.toLowerCase().startsWith("www.")) {
+			raw = raw.substring(4);
+		}
+		raw = raw.replace(/\/+$/, "");
+
+		return { pattern: raw.toLowerCase(), extractedFromUrl };
+	}
+
+	/**
+	 * Permite ao usuário adicionar, remover ou listar domínios/padrões permitidos no filtro de links
+	 * @param {WhatsAppBot} bot - Instância do bot
+	 * @param {Object} message - Dados da mensagem
+	 * @param {Array} args - Argumentos do comando
+	 * @param {Object} group - Dados do grupo
+	 * @returns {Promise<ReturnMessage>} Mensagem de retorno
+	 */
+	async filterAllowLink(bot, message, args, group) {
+		if (!group) {
+			return new ReturnMessage({
+				chatId: message.author,
+				content: "Este comando só pode ser usado em grupos."
+			});
+		}
+
+		const isAdmin = await this.isBotAdmin(bot, group);
+		if (!isAdmin) {
+			await bot.sendMessage(
+				group.id,
+				"⚠️ Atenção: O bot não é administrador do grupo. Ele não poderá apagar mensagens filtradas. Para usar filtros efetivamente, adicione o bot como administrador."
+			);
+		}
+
+		if (!group.filters) {
+			group.filters = {};
+		}
+		if (!Array.isArray(group.filters.allowedLinks)) {
+			group.filters.allowedLinks = [];
+		}
+
+		// Se usado sem argumentos: exibe a lista atual e ajuda
+		if (args.length === 0) {
+			const linksList =
+				group.filters.allowedLinks.length > 0
+					? group.filters.allowedLinks.map((l) => `• ${l}`).join("\n")
+					: "_Nenhum link ou domínio permitido cadastrado_";
+
+			let helpContent = `🔗 *Links e Domínios Permitidos Atualmente:*\n${linksList}\n\n`;
+			helpContent += `*Como usar este comando:*\n`;
+			helpContent += `• *!g-filtro-permitirLink <dominio>* - Adiciona ou remove um domínio (Ex: \`!g-filtro-permitirLink terra.com.br\`)\n`;
+			helpContent += `• *!g-filtro-permitirLink *palavra** - Suporta wildcard (Ex: \`!g-filtro-permitirLink *youtube*\` ou \`*.google.com\`)\n`;
+			helpContent += `• *!g-filtro-linksConfiaveis* - Adiciona os principais sites confiáveis automaticamente\n`;
+			helpContent += `• *!g-filtro-permitirLink limpar* - Remove todos os links permitidos da lista`;
+
+			if (!group.filters.links) {
+				helpContent += `\n\n💡 *Aviso:* O filtro de links está desativado no momento. Use *!g-filtro-links* para ativá-lo.`;
+			}
+
+			return new ReturnMessage({
+				chatId: group.id,
+				content: helpContent
+			});
+		}
+
+		const actionOrDomain = args.join(" ").trim();
+
+		// Ação limpar / reset
+		if (actionOrDomain.toLowerCase() === "limpar" || actionOrDomain.toLowerCase() === "reset") {
+			group.filters.allowedLinks = [];
+			await this.database.saveGroup(group);
+
+			return new ReturnMessage({
+				chatId: group.id,
+				content:
+					"🗑️ *Lista de links permitidos limpa com sucesso!*\n\nAgora todas as mensagens com links serão bloqueadas se o filtro de links estiver ativo."
+			});
+		}
+
+		const { pattern, extractedFromUrl } = this._normalizeLinkPattern(actionOrDomain);
+
+		if (!pattern) {
+			return new ReturnMessage({
+				chatId: group.id,
+				content:
+					"⚠️ Domínio ou padrão inválido. Exemplo de uso: *!g-filtro-permitirLink terra.com.br*"
+			});
+		}
+
+		const existingIndex = group.filters.allowedLinks.findIndex(
+			(l) => l.toLowerCase() === pattern.toLowerCase()
+		);
+
+		let retornoMsg = "";
+		if (existingIndex !== -1) {
+			// Remove
+			group.filters.allowedLinks.splice(existingIndex, 1);
+			await this.database.saveGroup(group);
+			retornoMsg = `➖ *Domínio/padrão removido dos permitidos:* \`${pattern}\``;
+		} else {
+			// Adiciona
+			group.filters.allowedLinks.push(pattern);
+			await this.database.saveGroup(group);
+			retornoMsg = `➕ *Domínio/padrão adicionado aos permitidos:* \`${pattern}\``;
+			if (extractedFromUrl) {
+				retornoMsg += ` _(extraído automaticamente da URL informada)_`;
+			}
+		}
+
+		const updatedList =
+			group.filters.allowedLinks.length > 0
+				? group.filters.allowedLinks.join(", ")
+				: "_Nenhum link permitido no momento_";
+
+		retornoMsg += `\n\n📌 *Links permitidos atualmente (${group.filters.allowedLinks.length}):*\n${updatedList}`;
+
+		if (!group.filters.links) {
+			retornoMsg += `\n\n💡 *Dica:* O filtro de links está desligado. Ative-o com *!g-filtro-links* para começar a filtrar.`;
+		}
+
+		return new ReturnMessage({
+			chatId: group.id,
+			content: retornoMsg
+		});
+	}
+
+	/**
+	 * Adiciona ou remove os principais sites confiáveis à lista de links permitidos
+	 * @param {WhatsAppBot} bot - Instância do bot
+	 * @param {Object} message - Dados da mensagem
+	 * @param {Array} args - Argumentos do comando
+	 * @param {Object} group - Dados do grupo
+	 * @returns {Promise<ReturnMessage>} Mensagem de retorno
+	 */
+	async filterTrustedLinks(bot, message, args, group) {
+		if (!group) {
+			return new ReturnMessage({
+				chatId: message.author,
+				content: "Este comando só pode ser usado em grupos."
+			});
+		}
+
+		const isAdmin = await this.isBotAdmin(bot, group);
+		if (!isAdmin) {
+			await bot.sendMessage(
+				group.id,
+				"⚠️ Atenção: O bot não é administrador do grupo. Ele não poderá apagar mensagens filtradas. Para usar filtros efetivamente, adicione o bot como administrador."
+			);
+		}
+
+		if (!group.filters) {
+			group.filters = {};
+		}
+		if (!Array.isArray(group.filters.allowedLinks)) {
+			group.filters.allowedLinks = [];
+		}
+
+		const TRUSTED_DOMAINS = [
+			"youtube.com",
+			"youtu.be",
+			"google.com",
+			"google.com.br",
+			"goo.gl",
+			"olx.com.br",
+			"mercadolivre.com.br",
+			"mercadolivre.com",
+			"mercadopago.com.br",
+			"mercadopago.com",
+			"facebook.com",
+			"fb.watch",
+			"fb.me",
+			"instagram.com",
+			"x.com",
+			"twitter.com",
+			"t.co",
+			"tiktok.com",
+			"vm.tiktok.com",
+			"amazon.com.br",
+			"amazon.com",
+			"amzn.to",
+			"shopee.com.br",
+			"shopee.com",
+			"pinterest.com",
+			"pin.it",
+			"reddit.com",
+			"redd.it",
+			"linkedin.com",
+			"lnkd.in",
+			"github.com",
+			"twitch.tv",
+			"spotify.com",
+			"spoti.fi"
+		];
+
+		const isRemove = args.length > 0 && args[0].toLowerCase() === "remover";
+
+		if (isRemove) {
+			const initialCount = group.filters.allowedLinks.length;
+			group.filters.allowedLinks = group.filters.allowedLinks.filter(
+				(link) => !TRUSTED_DOMAINS.includes(link.toLowerCase())
+			);
+			await this.database.saveGroup(group);
+
+			const removedCount = initialCount - group.filters.allowedLinks.length;
+			const updatedList =
+				group.filters.allowedLinks.length > 0
+					? group.filters.allowedLinks.join(", ")
+					: "_Nenhum link permitido no momento_";
+
+			return new ReturnMessage({
+				chatId: group.id,
+				content: `🗑️ *${removedCount} sites confiáveis foram removidos dos links permitidos.*\n\n📌 *Links permitidos atualmente (${group.filters.allowedLinks.length}):*\n${updatedList}`
+			});
+		}
+
+		// Adiciona os que ainda não estiverem na lista
+		const newlyAdded = [];
+		for (const domain of TRUSTED_DOMAINS) {
+			if (!group.filters.allowedLinks.some((l) => l.toLowerCase() === domain.toLowerCase())) {
+				group.filters.allowedLinks.push(domain);
+				newlyAdded.push(domain);
+			}
+		}
+
+		await this.database.saveGroup(group);
+
+		let retorno = "";
+		if (newlyAdded.length > 0) {
+			retorno += `✅ *Sites confiáveis adicionados aos links permitidos:*\n`;
+			retorno += `• YouTube (\`youtube.com\`, \`youtu.be\`)\n`;
+			retorno += `• Google (\`google.com\`, \`google.com.br\`, \`goo.gl\`)\n`;
+			retorno += `• Twitter / X (\`x.com\`, \`twitter.com\`, \`t.co\`)\n`;
+			retorno += `• Instagram (\`instagram.com\`) & Facebook (\`facebook.com\`, \`fb.watch\`)\n`;
+			retorno += `• TikTok (\`tiktok.com\`, \`vm.tiktok.com\`)\n`;
+			retorno += `• Mercado Livre / Pago (\`mercadolivre.com.br\`, \`mercadopago.com.br\`)\n`;
+			retorno += `• OLX (\`olx.com.br\`), Amazon (\`amazon.com.br\`), Shopee (\`shopee.com.br\`)\n`;
+			retorno += `• GitHub, Reddit, LinkedIn, Twitch, Spotify, Pinterest`;
+		} else {
+			retorno += `ℹ️ *Todos os sites confiáveis já estavam na lista de links permitidos!*`;
+		}
+
+		retorno += `\n\n📌 *Total de links permitidos:* ${group.filters.allowedLinks.length} domínios/padrões`;
+		retorno += `\n\n💡 Para remover os sites confiáveis da lista, use: *!g-filtro-linksConfiaveis remover*`;
+
+		if (!group.filters.links) {
+			retorno += `\n\n💡 *Aviso:* O filtro de links está desativado no momento. Use *!g-filtro-links* para ativá-lo.`;
+		}
+
+		return new ReturnMessage({
+			chatId: group.id,
+			content: retorno
+		});
 	}
 
 	/**
@@ -2324,7 +3050,7 @@ class Management {
 	}
 
 	/**
-	 * Ativa ou desativa filtro de conteúdo NSFW
+	 * Ativa/desativa ou define a intensidade (0-100) do filtro de conteúdo NSFW
 	 * @param {WhatsAppBot} bot - Instância do bot
 	 * @param {Object} message - Dados da mensagem
 	 * @param {Array} args - Argumentos do comando
@@ -2353,17 +3079,85 @@ class Management {
 			group.filters = {};
 		}
 
-		// Alterna estado do filtro
-		group.filters.nsfw = !group.filters.nsfw;
-		await this.database.saveGroup(group);
+		const defaultThreshold = parseFloat(process.env.NUDENET_THRESHOLD || "0.8");
+		const calcIntensityFromThreshold = (t) => {
+			const intensity = Math.round(((0.95 - t) / 0.75) * 100);
+			return Math.max(0, Math.min(100, intensity));
+		};
+		const calcThresholdFromIntensity = (intensity) => {
+			const clamped = Math.max(0, Math.min(100, intensity));
+			return parseFloat((0.95 - (clamped / 100) * 0.75).toFixed(4));
+		};
 
-		if (group.filters.nsfw) {
+		const defaultIntensity = calcIntensityFromThreshold(defaultThreshold);
+		const firstArg = args && args[0] ? String(args[0]).trim() : "";
+
+		// Se o argumento for para desativar explicitamente
+		if (firstArg.toLowerCase() === "off" || firstArg.toLowerCase() === "desativar") {
+			group.filters.nsfw = false;
+			await this.database.saveGroup(group);
 			return new ReturnMessage({
 				chatId: group.id,
 				content:
-					"✅ Filtro de conteúdo NSFW ativado. Imagens e vídeos detectados como conteúdo adulto serão automaticamente removidos."
+					"❌ Filtro de conteúdo NSFW desativado. Imagens e vídeos não serão filtrados para conteúdo adulto."
+			});
+		}
+
+		// Se foi fornecido um valor numérico de intensidade (0 a 100)
+		if (firstArg !== "") {
+			const num = parseFloat(firstArg);
+			if (isNaN(num) || num < 0 || num > 100) {
+				return new ReturnMessage({
+					chatId: group.id,
+					content:
+						"⚠️ Valor inválido! Por favor, informe um número de 0 a 100 para a intensidade de detecção (Ex: *!g-filtro-nsfw 30*)."
+				});
+			}
+
+			const intensity = Math.round(num);
+			const threshold = calcThresholdFromIntensity(intensity);
+
+			group.filters.nsfw = true;
+			group.filters.nsfwIntensity = intensity;
+			group.filters.nsfwThreshold = threshold;
+			await this.database.saveGroup(group);
+
+			return new ReturnMessage({
+				chatId: group.id,
+				content:
+					`Intensidade de detecção ${intensity}%\n` +
+					"> Se estiver apagando coisas que não são NSFW, diminua o valor. Se não estiver apagando NSFW o suficiente, aumente o valor"
+			});
+		}
+
+		// Sem argumentos: ativa/desativa alternadamente
+		group.filters.nsfw = !group.filters.nsfw;
+
+		if (group.filters.nsfw) {
+			if (
+				group.filters.nsfwThreshold === undefined ||
+				group.filters.nsfwThreshold === null ||
+				isNaN(group.filters.nsfwThreshold)
+			) {
+				group.filters.nsfwThreshold = defaultThreshold;
+				group.filters.nsfwIntensity = defaultIntensity;
+			}
+			await this.database.saveGroup(group);
+
+			const currentIntensity =
+				group.filters.nsfwIntensity !== undefined
+					? group.filters.nsfwIntensity
+					: calcIntensityFromThreshold(group.filters.nsfwThreshold);
+
+			return new ReturnMessage({
+				chatId: group.id,
+				content:
+					`✅ Filtro de conteúdo NSFW ativado.\n\n` +
+					`Intensidade de detecção ${currentIntensity}%\n` +
+					"> Se estiver apagando coisas que não são NSFW, diminua o valor. Se não estiver apagando NSFW o suficiente, aumente o valor"
 			});
 		} else {
+			await this.database.saveGroup(group);
 			return new ReturnMessage({
 				chatId: group.id,
 				content:
@@ -2396,7 +3190,13 @@ class Management {
 			// Zera mensagem
 			group.customAIPrompt = "";
 		} else {
-			group.customAIPrompt = args.join(" ").slice(0, 1500);
+			let newPrompt = args.join(" ").slice(0, 1500);
+			if (typeof newPrompt.isWellFormed === "function" && !newPrompt.isWellFormed()) {
+				newPrompt = newPrompt
+					.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/gu, "")
+					.toWellFormed();
+			}
+			group.customAIPrompt = newPrompt;
 		}
 
 		// Alterna estado do filtro
@@ -2722,6 +3522,106 @@ class Management {
 	}
 
 	/**
+	 * Alterna o monitoramento e banimento automático de spammers no grupo
+	 * @param {WhatsAppBot} bot - A instância do bot
+	 * @param {Object} message - A mensagem recebida
+	 * @param {Array} args - Argumentos do comando
+	 * @param {Group} group - O objeto do grupo
+	 * @returns {Promise<ReturnMessage>}
+	 */
+	async toggleBanirSpammers(bot, message, args, group) {
+		if (!group) {
+			return new ReturnMessage({
+				chatId: message.author,
+				content: "Este comando só pode ser usado em grupos."
+			});
+		}
+
+		group.banirSpammers = !group.banirSpammers;
+		await this.database.saveGroup(group);
+
+		const statusMsg = group.banirSpammers
+			? "🛡️ Monitoramento de *spammers* agora está *ativado* neste grupo.\nO bot removerá automaticamente números com DDI 62/63/380 ou padrão de nome MI### ao entrarem."
+			: "⚪ Monitoramento de *spammers* agora está *desativado* neste grupo.";
+
+		return new ReturnMessage({
+			chatId: group.id,
+			content: statusMsg
+		});
+	}
+
+	/**
+	 * Adiciona ou remove um número de telefone da lista de spammers permitidos do grupo
+	 * @param {WhatsAppBot} bot - A instância do bot
+	 * @param {Object} message - A mensagem recebida
+	 * @param {Array} args - Argumentos do comando
+	 * @param {Group} group - O objeto do grupo
+	 * @returns {Promise<ReturnMessage>}
+	 */
+	async togglePermitirSpammer(bot, message, args, group) {
+		if (!group) {
+			return new ReturnMessage({
+				chatId: message.author,
+				content: "Este comando só pode ser usado em grupos."
+			});
+		}
+
+		if (!Array.isArray(group.spammerWhitelist)) {
+			group.spammerWhitelist = [];
+		}
+
+		let targetPhone = "";
+		if (args && args.length > 0) {
+			targetPhone = args.join("").replace(/\D/g, "");
+		} else if (message.mentions && message.mentions.length > 0) {
+			targetPhone = message.mentions[0].split("@")[0].replace(/\D/g, "");
+		} else if (message.quotedMsg?.author) {
+			targetPhone = message.quotedMsg.author.split("@")[0].replace(/\D/g, "");
+		}
+
+		if (!targetPhone) {
+			const prefix = group.prefix || bot.prefix || "!";
+			return new ReturnMessage({
+				chatId: group.id,
+				content: `⚠️ Informe o número de telefone do spammer ou mencione o usuário.\n*Exemplo:* \`${prefix}g-permitirSpammer 62812345678\``
+			});
+		}
+
+		const mentionJid = `${targetPhone}@s.whatsapp.net`;
+		const index = group.spammerWhitelist.indexOf(targetPhone);
+
+		if (index !== -1) {
+			group.spammerWhitelist.splice(index, 1);
+			await this.database.saveGroup(group);
+
+			return new ReturnMessage({
+				chatId: group.id,
+				content: `🚫 Número @${targetPhone} *removido* da lista de spammers permitidos. O bot voltará a removê-lo caso entre no grupo.`,
+				options: {
+					mentions: [mentionJid]
+				}
+			});
+		} else {
+			group.spammerWhitelist.push(targetPhone);
+			await this.database.saveGroup(group);
+
+			// Remove do Set activeSpammers se estiver em memória
+			if (bot.eventHandler?.activeSpammers) {
+				bot.eventHandler.activeSpammers.delete(targetPhone);
+				bot.eventHandler.activeSpammers.delete(mentionJid);
+			}
+
+			return new ReturnMessage({
+				chatId: group.id,
+				content: `✅ Número @${targetPhone} *adicionado* à lista de spammers permitidos neste grupo. O bot não o removerá ao entrar.`,
+				options: {
+					mentions: [mentionJid]
+				}
+			});
+		}
+	}
+
+	/**
 	 * Gets the platform-specific channel configuration from the group
 	 * @param {Object} group - The group object
 	 * @param {string} platform - The platform ('twitch', 'kick', 'youtube')
@@ -2793,7 +3693,7 @@ class Management {
 	 * @param {string} channelName - The channel name
 	 * @returns {Object} - Default notification configuration
 	 */
-	createDefaultNotificationConfig(platform, channelName) {
+	createDefaultNotificationConfig(platform, channelName, eventType = "on") {
 		let defaultText = "";
 
 		if (platform === "twitch" || platform === "kick") {
@@ -2802,7 +3702,13 @@ class Management {
 				`⚠️ ATENÇÃO!⚠️\n\n🌟 *${channelName}* ✨ está *online* streamando *{jogo}*!\n_{titulo}_\n\n` +
 				`https://${platform}.${domain}/${channelName}`;
 		} else if (platform === "youtube") {
-			defaultText = `*⚠️ Vídeo novo! ⚠️*\n\n*{author}:* *{title}* \n{link}`;
+			if (eventType === "video") {
+				defaultText = `*⚠️ Vídeo novo! ⚠️*\n\n*{author}:* *{title}*\n{link}`;
+			} else if (eventType === "on") {
+				defaultText = `🔴 *{canal}* está AO VIVO no YouTube!\n\n*{titulo}*\nVenha assistir: {link}`;
+			} else {
+				defaultText = `⚫ A live de *{canal}* no YouTube foi finalizada.`;
+			}
 		}
 
 		return {
@@ -2853,6 +3759,29 @@ class Management {
 		// This sanitization step focuses on character validity.
 		// Length validation should be performed separately if needed.
 		// e.g., if (sanitized.length >= 4 && sanitized.length <= 25) { ... }
+
+		return sanitized ?? "";
+	}
+
+	/**
+	 * Processes a string to extract and sanitize a Kick channel name.
+	 *
+	 * @param {string} inputString - The raw input string, potentially a URL or just a name.
+	 * @returns {string} The sanitized Kick channel name, or an empty string if input is invalid.
+	 */
+	sanitizeKickChannelName(inputString) {
+		if (typeof inputString !== "string") {
+			return "";
+		}
+
+		// 1. Remove common Kick URL prefixes
+		const withoutUrl = inputString.replace(/^(https?:\/\/)?(www\.)?kick\.com\//i, "");
+
+		// 2. Convert to lowercase
+		const lowercased = withoutUrl.toLowerCase().trim();
+
+		// 3. Keep alphanumeric and underscores
+		const sanitized = lowercased.replace(/[^a-z0-9_]/g, "");
 
 		return sanitized ?? "";
 	}
@@ -2936,7 +3865,8 @@ class Management {
 						},
 						changeTitleOnEvent: true,
 						useThumbnail: true,
-						useAI: false
+						useAI: false,
+						mentionAllMembers: false
 					};
 
 					channels.push(newChannel);
@@ -3445,6 +4375,8 @@ class Management {
 			});
 		}
 
+		args = args.filter((a) => !["on", "off"].includes(a.toLowerCase()));
+
 		if (args.length === 0) {
 			return new ReturnMessage({
 				chatId: group.id,
@@ -3452,7 +4384,14 @@ class Management {
 			});
 		}
 
-		const channelName = args[0].toLowerCase();
+		const channelName = this.sanitizeKickChannelName(args[0] ?? "");
+
+		if (!channelName) {
+			return new ReturnMessage({
+				chatId: group.id,
+				content: "Nome de canal inválido para o Kick. Por favor, forneça um nome válido."
+			});
+		}
 
 		// Get current channels
 		const channels = this.getChannelConfig(group, "kick");
@@ -3461,7 +4400,6 @@ class Management {
 		const existingChannel = this.findChannelConfig(group, "kick", channelName);
 
 		if (existingChannel) {
-			// Remove channel
 			// Remove channel
 			const updatedChannels = channels.filter(
 				(c) => c.channel.toLowerCase() !== channelName.toLowerCase()
@@ -3480,6 +4418,17 @@ class Management {
 				content: `Canal do Kick removido: ${channelName}`
 			});
 		} else {
+			// Check if the channel exists on Kick before adding
+			if (bot.streamMonitor) {
+				const channelExists = await bot.streamMonitor.kickChannelExists(channelName);
+				if (!channelExists) {
+					return new ReturnMessage({
+						chatId: group.id,
+						content: `❌ Erro: O canal "${channelName}" não existe na Kick. Verifique se o nome ou link está correto.`
+					});
+				}
+			}
+
 			// Add channel with default configuration
 			const newChannel = {
 				channel: channelName,
@@ -3488,7 +4437,8 @@ class Management {
 					media: []
 				},
 				changeTitleOnEvent: true,
-				useAI: false
+				useAI: false,
+				mentionAllMembers: false
 			};
 
 			channels.push(newChannel);
@@ -3905,16 +4855,20 @@ class Management {
 				content: `Canal do YouTube removido: ${channelName}`
 			});
 		} else {
-			// Add channel with default configuration
+			// Add channel with default configuration (separando videoConfig e onConfig para lives)
 			const newChannel = {
 				channel: channelName,
-				onConfig: this.createDefaultNotificationConfig("youtube", channelName),
+				notifyVideos: true,
+				notifyLives: true,
+				videoConfig: this.createDefaultNotificationConfig("youtube", channelName, "video"),
+				onConfig: this.createDefaultNotificationConfig("youtube", channelName, "on"),
 				offConfig: {
 					media: []
 				},
-				changeTitleOnEvent: false,
+				changeTitleOnEvent: true,
 				useAI: false,
-				useThumbnail: true
+				useThumbnail: true,
+				mentionAllMembers: false
 			};
 
 			channels.push(newChannel);
@@ -3938,7 +4892,7 @@ class Management {
 					chatId: group.id,
 					content:
 						`Canal do YouTube adicionado: ${channelName}\n\n` +
-						`Configuração padrão de notificação de vídeo definida. Use !g-youtube-midia on ${channelName} para personalizar.`
+						`Configurações padrão definidas para Novos Vídeos e Lives. Use !g-youtube-midia [video|on|off] ${channelName} para personalizar.`
 				});
 			} else {
 				return new ReturnMessage({
@@ -4153,7 +5107,7 @@ class Management {
 				return new ReturnMessage({
 					chatId: group.id,
 					content:
-						"Não há categorias silenciadas neste grupo. Use !g-muteCategoria [categoria] para silenciar uma categoria inteira de comandos."
+						"Não há categorias silenciadas neste grupo. Use !g-muteCategoria [categoria] para silenciar uma categoria inteira de comandos (ex: canais, outros, jogos, downloaders, ia, midia, zoeira)."
 				});
 			}
 
@@ -4624,20 +5578,24 @@ class Management {
 		if (args.length === 0 || isNaN(parseInt(args[0]))) {
 			return new ReturnMessage({
 				chatId: group.id,
-				content: `🕐 Cooldown atual: ${group.interact.cooldown} minutos\n\nUse !g-interagir-cd [minutos] para alterar. Valores entre 5 minutos e 30 dias (43200 minutos).`
+				content: `🕐 Cooldown atual: ${group.interact.cooldown} minutos\n\nUse !g-interagir-cd [minutos] para alterar. Valores entre 1 minuto e 12 horas (720 minutos).`
 			});
 		}
 
 		// Analisa e valida o cooldown
 		let textoMinimo = "";
+		let textoMaximo = "";
 
 		let cooldown = parseInt(args[0]);
-		if (cooldown < 30) {
-			textoMinimo = " (mínimo possível)";
-			cooldown = 30; // Mínimo 30 minutos
+		if (cooldown < 1) {
+			textoMinimo = " (mínimo de 1 minuto)";
+			cooldown = 1; // Mínimo 1 minuto
 		}
 
-		if (cooldown > 43200) cooldown = 43200; // Máximo 30 dias
+		if (cooldown > 720) {
+			textoMaximo = " (máximo de 12 horas / 720 minutos)";
+			cooldown = 720; // Máximo 12 horas
+		}
 
 		// Atualiza cooldown
 		group.interact.cooldown = cooldown;
@@ -4647,7 +5605,7 @@ class Management {
 
 		return new ReturnMessage({
 			chatId: group.id,
-			content: `🕐 Cooldown de interações definido para ${cooldown} minutos${textoMinimo}.`
+			content: `🕐 Cooldown de interações definido para ${cooldown} minutos${textoMinimo}${textoMaximo}.`
 		});
 	}
 
@@ -4685,30 +5643,43 @@ class Management {
 
 		// Verifica se valor de chance foi fornecido
 		if (args.length === 0 || isNaN(parseInt(args[0]))) {
+			const chanceExibida =
+				group.interact.chance >= 100
+					? Math.round(group.interact.chance / 100)
+					: group.interact.chance;
 			return new ReturnMessage({
 				chatId: group.id,
-				content: `📊 Chance atual: ${group.interact.chance / 100}% (${group.interact.chance}/10000)\n\nUse !g-interagir-chance [1-1000] para alterar. Valores entre 0.01% e 10%.`
+				content: `📊 Chance atual: ${chanceExibida}%\n\nUse !g-interagir-chance [1-100] para alterar. Valores entre 1% e 100%.`
 			});
 		}
 
 		let textoMaximo = "";
+		let textoMinimo = "";
 		// Analisa e valida a chance
-		let chance = parseInt(args[0]);
-		if (chance < 1) chance = 1; // Mínimo 0.01%
-		if (chance >= 500) {
-			chance = 500; // Máximo 5%
-			textoMaximo = " (máximo possível)";
+		const rawChance = parseInt(args[0]);
+		let chancePercent = rawChance;
+		if (rawChance > 100) {
+			// Suporte ao formato antigo em basis points (ex: 500 para 5%)
+			chancePercent = Math.round(rawChance / 100);
+		}
+		if (chancePercent < 1) {
+			chancePercent = 1;
+			textoMinimo = " (mínimo de 1%)";
+		}
+		if (chancePercent > 100) {
+			chancePercent = 100;
+			textoMaximo = " (máximo de 100%)";
 		}
 
-		// Atualiza chance
-		group.interact.chance = chance;
+		// Atualiza chance em base 10000 (1% = 100, 100% = 10000)
+		group.interact.chance = chancePercent * 100;
 
 		// Salva mudanças
 		await this.database.saveGroup(group);
 
 		return new ReturnMessage({
 			chatId: group.id,
-			content: `📊 Chance de interações definida para ${chance / 100}%${textoMaximo}.`
+			content: `📊 Chance de interações definida para ${chancePercent}%${textoMinimo}${textoMaximo}.`
 		});
 	}
 
@@ -4838,7 +5809,7 @@ class Management {
 	 * @param {string} mode - The mode (on or off)
 	 * @returns {Promise<ReturnMessage>} Return message
 	 */
-	async setStreamMedia(bot, message, args, group, platform, mode = "on") {
+	async setStreamMedia(bot, message, args, group, platform, mode = null) {
 		if (!group) {
 			return new ReturnMessage({
 				chatId: message.author,
@@ -4848,16 +5819,23 @@ class Management {
 
 		this.logger.debug(`[setStreamMedia] Recebido pedido para: ${args.join("|")}, modo ${mode}`);
 
-		// Determina o modo (online/offline) a partir dos argumentos
+		// Determina o modo (vídeo, online ou offline) a partir dos argumentos
 		if (args.length > 0) {
 			const modeArg = args[0].toLowerCase();
 			if (modeArg === "on" || modeArg === "online") {
 				mode = "on";
-				args = args.slice(1); // Remove o primeiro argumento
+				args = args.slice(1);
 			} else if (modeArg === "off" || modeArg === "offline") {
 				mode = "off";
-				args = args.slice(1); // Remove o primeiro argumento
+				args = args.slice(1);
+			} else if (platform === "youtube" && (modeArg === "video" || modeArg === "videos")) {
+				mode = "video";
+				args = args.slice(1);
 			}
+		}
+
+		if (!mode) {
+			mode = platform === "youtube" ? "video" : "on";
 		}
 
 		// Validate and get channel name
@@ -4879,10 +5857,17 @@ class Management {
 		}
 
 		// Verify if this is a reply to a message
-
 		const quotedMsg = await message.origin.getQuotedMessage().catch(() => null);
 
-		const configKey = mode === "on" ? "onConfig" : "offConfig";
+		let configKey = "onConfig";
+		if (mode === "video") {
+			configKey = "videoConfig";
+		} else if (mode === "off") {
+			configKey = "offConfig";
+		}
+
+		const modeDesc =
+			mode === "video" ? "novo vídeo" : mode === "on" ? "live online" : "live offline";
 
 		if (!quotedMsg && args.length <= 1) {
 			this.logger.debug(`[stream media] no quoted`, { quotedMsg, message });
@@ -4894,16 +5879,26 @@ class Management {
 				});
 			} else {
 				// Reset to default if no quoted message and no additional args
-				if (mode === "on") {
-					channelConfig[configKey] = this.createDefaultNotificationConfig(platform, channelName);
+				if (mode === "video") {
+					channelConfig.videoConfig = this.createDefaultNotificationConfig(
+						platform,
+						channelName,
+						"video"
+					);
+				} else if (mode === "on") {
+					channelConfig.onConfig = this.createDefaultNotificationConfig(
+						platform,
+						channelName,
+						"on"
+					);
 				} else {
-					channelConfig[configKey] = { media: [] };
+					channelConfig.offConfig = { media: [] };
 				}
 				await this.database.saveGroup(group);
 
 				return new ReturnMessage({
 					chatId: group.id,
-					content: `Configuração de notificação "${mode === "on" ? "online" : "offline"}" para o canal ${channelName} redefinida para o padrão.`
+					content: `Configuração de notificação "${modeDesc}" para o canal ${channelName} redefinida para o padrão.`
 				});
 			}
 		}
@@ -5015,7 +6010,7 @@ class Management {
 
 			return new ReturnMessage({
 				chatId: group.id,
-				content: `Configuração de notificação "${mode === "on" ? "online" : "offline"}" para o canal ${channelName} atualizada com sucesso.\n\nAdicionado conteúdo do tipo: ${mediaTypeDesc[mediaType] || mediaType}\n\nPara remover este tipo de conteúdo, use:\n!g-${platform}-midia-del ${mode} ${mediaType} ${channelName}`
+				content: `Configuração de notificação "${modeDesc}" para o canal ${channelName} atualizada com sucesso.\n\nAdicionado conteúdo do tipo: ${mediaTypeDesc[mediaType] || mediaType}\n\nPara remover este tipo de conteúdo, use:\n!g-${platform}-midia-del ${mode} ${mediaType} ${channelName}`
 			});
 		} catch (error) {
 			this.logger.error(
@@ -5048,23 +6043,29 @@ class Management {
 
 		// Verifica se todos os argumentos necessários foram fornecidos
 		if (args.length < 2) {
+			const modesAllowed = platform === "youtube" ? "[video/on/off]" : "[on/off]";
 			return new ReturnMessage({
 				chatId: group.id,
-				content: `Argumentos insuficientes. Uso: !g-${platform}-midia-del [on/off] [tipo]
-        
-  Onde:
-  - [on/off]: Especifica se é para notificação online ou offline
-  - [tipo]: Tipo de mídia (text, image, audio, video, sticker)`
+				content: `Argumentos insuficientes. Uso: !g-${platform}-midia-del ${modesAllowed} [tipo] <canal>\n\nOnde:\n- ${modesAllowed}: Especifica o tipo de notificação\n- [tipo]: Tipo de mídia (text, image, audio, video, sticker)`
 			});
 		}
 
-		// Determina o modo (online/offline)
+		// Determina o modo
 		const mode = args[0].toLowerCase();
-		if (mode !== "on" && mode !== "off") {
-			return new ReturnMessage({
-				chatId: group.id,
-				content: `Modo inválido: ${mode}. Use "on" ou "off".`
-			});
+		if (platform === "youtube") {
+			if (!["video", "on", "off"].includes(mode)) {
+				return new ReturnMessage({
+					chatId: group.id,
+					content: `Modo inválido: ${mode}. Para YouTube, use "video", "on" ou "off".`
+				});
+			}
+		} else {
+			if (mode !== "on" && mode !== "off") {
+				return new ReturnMessage({
+					chatId: group.id,
+					content: `Modo inválido: ${mode}. Use "on" ou "off".`
+				});
+			}
 		}
 
 		// Determina o tipo de mídia
@@ -5101,7 +6102,7 @@ class Management {
 		}
 
 		// Seleciona a configuração correta com base no modo
-		const configKey = mode === "on" ? "onConfig" : "offConfig";
+		const configKey = mode === "video" ? "videoConfig" : mode === "on" ? "onConfig" : "offConfig";
 
 		// Verifica se a configuração e o array de mídia existem
 		if (!channelConfig[configKey] || !channelConfig[configKey].media) {
@@ -5161,17 +6162,25 @@ class Management {
 			});
 		}
 
-		// Determina o modo (online/offline) a partir dos argumentos
+		// Determina o modo (on/off) e se é comando de remoção
 		let mode = "on";
-		if (args.length > 0) {
-			const modeArg = args[0].toLowerCase();
-			if (modeArg === "on" || modeArg === "online") {
-				mode = "on";
-				args = args.slice(1); // Remove o primeiro argumento
-			} else if (modeArg === "off" || modeArg === "offline") {
-				mode = "off";
-				args = args.slice(1); // Remove o primeiro argumento
-			}
+		let isDelete = false;
+
+		const delIdx = args.findIndex((a) =>
+			["del", "delete", "remover", "remove", "limpar"].includes(a.toLowerCase())
+		);
+		if (delIdx !== -1) {
+			isDelete = true;
+			args.splice(delIdx, 1);
+		}
+
+		const modeIdx = args.findIndex((a) =>
+			["on", "online", "off", "offline"].includes(a.toLowerCase())
+		);
+		if (modeIdx !== -1) {
+			const modeVal = args[modeIdx].toLowerCase();
+			mode = modeVal === "off" || modeVal === "offline" ? "off" : "on";
+			args.splice(modeIdx, 1);
 		}
 
 		// Valida e obtém o nome do canal
@@ -5192,15 +6201,28 @@ class Management {
 			});
 		}
 
-		// Verifica se há uma mensagem citada com mídia ou se a mensagem atual tem mídia
+		if (isDelete) {
+			if (mode === "on") {
+				delete channelConfig.groupPhotoOnline;
+			} else {
+				delete channelConfig.groupPhotoOffline;
+			}
+			await this.database.saveGroup(group);
+			return new ReturnMessage({
+				chatId: group.id,
+				content: `🗑️ Configuração de foto do grupo para eventos ${mode === "on" ? "online" : "offline"} do canal ${channelName} removida.`
+			});
+		}
+
 		let mediaData = null;
+		let capturedFromCurrentGroup = false;
 
 		// 1. Tenta obter da mensagem citada
 		const quotedMsg = await message.origin.getQuotedMessage().catch(() => null);
 		if (quotedMsg && quotedMsg.hasMedia) {
 			try {
 				const media = await quotedMsg.downloadMedia();
-				if (media.mimetype.startsWith("image/")) {
+				if (media && media.mimetype && media.mimetype.startsWith("image/")) {
 					// Salva arquivo no disco em vez de base64 no banco
 					const ext = media.mimetype.split("/")[1].split(";")[0] || "jpg";
 					const fileName = `group-photo-${Date.now()}-${Math.floor(Math.random() * 1000)}.${ext}`;
@@ -5228,7 +6250,8 @@ class Management {
 			}
 
 			if (imageData) {
-				const ext = message.content.mimetype.split("/")[1].split(";")[0] || "jpg";
+				const ext =
+					(message.content.mimetype || "image/jpeg").split("/")[1]?.split(";")[0] || "jpg";
 				const fileName = `group-photo-${Date.now()}-${Math.floor(Math.random() * 1000)}.${ext}`;
 				const mediaDir = path.join(this.dataPath, "media");
 				await fs.mkdir(mediaDir, { recursive: true });
@@ -5238,27 +6261,42 @@ class Management {
 			}
 		}
 
-		// Se não há argumentos e não há mídia, remove a configuração de foto
-		if (args.length === 0 && !mediaData) {
-			if (mode === "on") {
-				delete channelConfig.groupPhotoOnline;
-			} else {
-				delete channelConfig.groupPhotoOffline;
+		// 3. Se usado sem foto anexada/citada, captura a foto atual do grupo no WhatsApp
+		if (!mediaData) {
+			try {
+				let currentPhotoUrl = null;
+				if (typeof bot.getProfilePictureUrl === "function") {
+					currentPhotoUrl = await bot.getProfilePictureUrl(group.id);
+				}
+				if (currentPhotoUrl) {
+					const response = await axios.get(currentPhotoUrl, {
+						responseType: "arraybuffer",
+						timeout: 10000
+					});
+					if (response.data && response.data.length > 0) {
+						const fileName = `group-photo-${Date.now()}-${Math.floor(Math.random() * 1000)}.jpg`;
+						const mediaDir = path.join(this.dataPath, "media");
+						await fs.mkdir(mediaDir, { recursive: true });
+						await fs.writeFile(path.join(mediaDir, fileName), Buffer.from(response.data));
+						mediaData = fileName;
+						capturedFromCurrentGroup = true;
+					}
+				}
+			} catch (photoErr) {
+				this.logger.warn(
+					`Erro ao capturar foto atual do grupo ${group.id}:`,
+					photoErr.message || photoErr
+				);
 			}
-
-			await this.database.saveGroup(group);
-
-			return new ReturnMessage({
-				chatId: group.id,
-				content: `Configuração de foto do grupo para eventos ${mode} do canal ${channelName} removida.`
-			});
 		}
 
-		// Se não há mídia, instrui o usuário
+		// Se não há mídia obtida nem capturada, instrui o usuário
 		if (!mediaData) {
 			return new ReturnMessage({
 				chatId: group.id,
-				content: `Para definir a foto do grupo para eventos ${mode} do canal ${channelName}, envie uma imagem com o comando na legenda ou use o comando como resposta a uma imagem.`
+				content:
+					`⚠️ Não foi possível capturar a foto atual do grupo (ou o grupo não possui foto definida no WhatsApp).\n\n` +
+					`Para definir a foto do grupo para eventos ${mode === "on" ? "online" : "offline"} do canal ${channelName}, envie uma imagem junto com o comando na legenda ou responda a uma imagem.`
 			});
 		}
 
@@ -5269,18 +6307,20 @@ class Management {
 			channelConfig.groupPhotoOffline = mediaData;
 		}
 
-		// Ativa mudança de título se não estiver ativa
-		if (!channelConfig.changeTitleOnEvent) {
-			channelConfig.changeTitleOnEvent = true;
+		// Ativa mudança de foto se não estiver ativa
+		if (!channelConfig.changePhotoOnEvent) {
+			channelConfig.changePhotoOnEvent = true;
 		}
 
 		await this.database.saveGroup(group);
 
+		const originMsg = capturedFromCurrentGroup
+			? "📸 Foto atual do grupo capturada e configurada com sucesso"
+			: "✅ Foto enviada configurada com sucesso";
+
 		return new ReturnMessage({
 			chatId: group.id,
-			content: `Foto do grupo para eventos ${mode === "on" ? "online" : "offline"} do canal ${channelName} configurada com sucesso.
-      
-  A mudança de título para eventos também foi automaticamente ativada.`
+			content: `${originMsg} para eventos ${mode === "on" ? "online" : "offline"} do canal ${channelName}.\n\nA alteração de foto do grupo para eventos deste canal foi automaticamente ativada.`
 		});
 	}
 
@@ -5682,6 +6722,72 @@ class Management {
 
 	async setYoutubeGroupPhoto(bot, message, args, group) {
 		return this.setStreamGroupPhoto(bot, message, args, group, "youtube");
+	}
+
+	async toggleStreamPhotoChange(bot, message, args, group, platform) {
+		if (!group) {
+			return new ReturnMessage({
+				chatId: message.author,
+				content: "Este comando só pode ser usado em grupos."
+			});
+		}
+
+		const channelName = await this.validateChannelName(bot, message, args, group, platform);
+		if (channelName instanceof ReturnMessage) {
+			return channelName;
+		}
+
+		const channelConfig = this.findChannelConfig(group, platform, channelName);
+		if (!channelConfig) {
+			return new ReturnMessage({
+				chatId: group.id,
+				content: `Canal não configurado: ${channelName}. Use !g-${platform}-canal ${channelName} para configurar.`
+			});
+		}
+
+		const isAdmin = await this.isBotAdmin(bot, group);
+		if (!isAdmin) {
+			return new ReturnMessage({
+				chatId: group.id,
+				content:
+					"⚠️ O bot não é administrador do grupo. Para alterar a foto do grupo, o bot precisa ser um administrador. " +
+					"Por favor, adicione o bot como administrador e tente novamente."
+			});
+		}
+
+		channelConfig.changePhotoOnEvent = !channelConfig.changePhotoOnEvent;
+		await this.database.saveGroup(group);
+
+		const status = channelConfig.changePhotoOnEvent ? "ativada" : "desativada";
+		if (channelConfig.changePhotoOnEvent) {
+			return new ReturnMessage({
+				chatId: group.id,
+				content:
+					`Alteração de foto do grupo para eventos do canal ${channelName} ${status}.\n\n` +
+					`• Ao ficar online: usa foto online configurada ou thumbnail da stream\n` +
+					`• Ao ficar offline: usa foto offline configurada ou restaura foto anterior\n\n` +
+					`Para configurar fotos personalizadas:\n` +
+					`!g-${platform}-fotoGrupo on ${channelName}\n` +
+					`!g-${platform}-fotoGrupo off ${channelName}`
+			});
+		} else {
+			return new ReturnMessage({
+				chatId: group.id,
+				content: `Alteração de foto do grupo para eventos do canal ${channelName} ${status}.`
+			});
+		}
+	}
+
+	async toggleTwitchPhotoChange(bot, message, args, group) {
+		return this.toggleStreamPhotoChange(bot, message, args, group, "twitch");
+	}
+
+	async toggleKickPhotoChange(bot, message, args, group) {
+		return this.toggleStreamPhotoChange(bot, message, args, group, "kick");
+	}
+
+	async toggleYoutubePhotoChange(bot, message, args, group) {
+		return this.toggleStreamPhotoChange(bot, message, args, group, "youtube");
 	}
 
 	/**
@@ -6093,12 +7199,34 @@ class Management {
 	 * @param {Object} group - Dados do grupo
 	 * @returns {Promise<ReturnMessage>} Mensagem de retorno
 	 */
+	/**
+	 * Fecha o grupo para que apenas admins possam enviar mensagens ou agenda fechamento
+	 * @param {WhatsAppBot} bot - Instância do bot
+	 * @param {Object} message - Dados da mensagem
+	 * @param {Array} args - Argumentos do comando
+	 * @param {Object} group - Dados do grupo
+	 * @returns {Promise<ReturnMessage>} Mensagem de retorno
+	 */
 	async closeGroup(bot, message, args, group) {
-		return this.toggleGroupMessagesAdminsOnly(bot, message, args, group, true);
+		if (!args || args.length === 0) {
+			const ret = await this.toggleGroupMessagesAdminsOnly(bot, message, args, group, true);
+			if (ret && ret.content && ret.content.startsWith("🔒")) {
+				ret.content +=
+					"\n\n💡 *Dica:* Você pode agendar o fechamento automático!\n" +
+					"• `!g-fechar 13:30` — fecha hoje às 13h30 (ou amanhã se já passou)\n" +
+					"• `!g-fechar 13:30 sex` — toda sexta às 13h30\n" +
+					"• `!g-fechar 13:30 sex 🔒 Boa noite, pessoal!` — com mensagem personalizada\n" +
+					"📋 Use `!g-fechar-lista` para ver os agendamentos e `!g-fechar-del <id>` para remover.\n" +
+					"Também é possível configurar pelo `!g-painel`.";
+			}
+			return ret;
+		}
+
+		return this.handleScheduleGroupAction(bot, message, args, group, "fechar");
 	}
 
 	/**
-	 * Abre o grupo para que todos possam enviar mensagens
+	 * Abre o grupo para que todos possam enviar mensagens ou agenda abertura
 	 * @param {WhatsAppBot} bot - Instância do bot
 	 * @param {Object} message - Dados da mensagem
 	 * @param {Array} args - Argumentos do comando
@@ -6106,7 +7234,274 @@ class Management {
 	 * @returns {Promise<ReturnMessage>} Mensagem de retorno
 	 */
 	async openGroup(bot, message, args, group) {
-		return this.toggleGroupMessagesAdminsOnly(bot, message, args, group, false);
+		if (!args || args.length === 0) {
+			const ret = await this.toggleGroupMessagesAdminsOnly(bot, message, args, group, false);
+			if (ret && ret.content && ret.content.startsWith("🔓")) {
+				ret.content +=
+					"\n\n💡 *Dica:* Você pode agendar a abertura automática!\n" +
+					"• `!g-abrir 07:30` — abre hoje às 07h30 (ou amanhã se já passou)\n" +
+					"• `!g-abrir 07:30 seg` — toda segunda às 07h30\n" +
+					"• `!g-abrir 07:30 seg 🔓 Bom dia, pessoal!` — com mensagem personalizada\n" +
+					"📋 Use `!g-abrir-lista` para ver os agendamentos e `!g-abrir-del <id>` para remover.\n" +
+					"Também é possível configurar pelo `!g-painel`.";
+			}
+			return ret;
+		}
+
+		return this.handleScheduleGroupAction(bot, message, args, group, "abrir");
+	}
+
+	/**
+	 * Manipula a criação de agendamento de fechar ou abrir o grupo
+	 */
+	async handleScheduleGroupAction(bot, message, args, group, tipo) {
+		if (!group) {
+			return new ReturnMessage({
+				chatId: message.author,
+				content: "Este comando só pode ser usado em grupos."
+			});
+		}
+
+		const isAdmin = await this.isBotAdmin(bot, group);
+		if (!isAdmin) {
+			return new ReturnMessage({
+				chatId: group.id,
+				content:
+					"⚠️ O bot precisa ser administrador do grupo para poder alterar as configurações do grupo."
+			});
+		}
+
+		const parsedHora = GrupoAgendamentos.parseHora(args[0]);
+		if (!parsedHora) {
+			return new ReturnMessage({
+				chatId: group.id,
+				content: `❌ Horário inválido! Use formatos como "13:30", "13h30", "7:30" ou "07h30".\nExemplo: !g-${tipo} 13:30`
+			});
+		}
+
+		// 1 argumento: agendamento único para hoje ou amanhã
+		if (args.length === 1) {
+			try {
+				const result = await GrupoAgendamentos.criarAgendamento(
+					bot,
+					group.id,
+					tipo,
+					parsedHora.hora,
+					parsedHora.minuto,
+					null,
+					null
+				);
+				const horaStr = GrupoAgendamentos.formatarHora(parsedHora.hora, parsedHora.minuto);
+				const tempoStr = GrupoAgendamentos.formatarTempoRestante(result.diffMs);
+				const quando = result.isTomorrow ? "amanhã" : "hoje";
+				const acao = tipo === "fechar" ? "fechado" : "aberto";
+
+				return new ReturnMessage({
+					chatId: group.id,
+					content: `✅ Grupo será *${acao}* ${quando} às *${horaStr}* (${tempoStr}).\n📋 Use \`!g-${tipo}-lista\` para ver todos os agendamentos e \`!g-${tipo}-del ${result.agendamento.id}\` para remover.`
+				});
+			} catch (error) {
+				return new ReturnMessage({
+					chatId: group.id,
+					content: `❌ ${error.message}`
+				});
+			}
+		}
+
+		// 2 ou mais argumentos: agendamento semanal recorrente
+		const parsedDia = GrupoAgendamentos.parseDiaSemana(args[1]);
+		if (parsedDia === null) {
+			return new ReturnMessage({
+				chatId: group.id,
+				content: `❌ Dia da semana inválido! Use abreviações ou nomes como "seg", "ter", "qua", "qui", "sex", "sab", "dom".\nExemplo: !g-${tipo} 13:30 sex`
+			});
+		}
+
+		let fraseRaw = null;
+		if (args.length >= 3) {
+			fraseRaw = args.slice(2).join(" ");
+			if (fraseRaw.trim().length < 5) {
+				return new ReturnMessage({
+					chatId: group.id,
+					content: "❌ A frase personalizada deve conter no mínimo 5 caracteres."
+				});
+			}
+		}
+
+		try {
+			const result = await GrupoAgendamentos.criarAgendamento(
+				bot,
+				group.id,
+				tipo,
+				parsedHora.hora,
+				parsedHora.minuto,
+				parsedDia,
+				fraseRaw
+			);
+			const horaStr = GrupoAgendamentos.formatarHora(parsedHora.hora, parsedHora.minuto);
+			const nomeDia = GrupoAgendamentos.DIAS_SEMANA_NOMES[parsedDia];
+			const acao = tipo === "fechar" ? "fechado" : "aberto";
+
+			if (result.agendamento.frase) {
+				return new ReturnMessage({
+					chatId: group.id,
+					content: `✅ Todo(a) *${nomeDia}* às *${horaStr}* o grupo será *${acao}* com a mensagem:\n${result.agendamento.frase}\n📋 Use \`!g-${tipo}-lista\` para ver todos os agendamentos e \`!g-${tipo}-del ${result.agendamento.id}\` para remover.`
+				});
+			} else {
+				return new ReturnMessage({
+					chatId: group.id,
+					content: `✅ Todo(a) *${nomeDia}* às *${horaStr}* o grupo será *${acao}* automaticamente.\n📋 Use \`!g-${tipo}-lista\` para ver todos os agendamentos e \`!g-${tipo}-del ${result.agendamento.id}\` para remover.`
+				});
+			}
+		} catch (error) {
+			return new ReturnMessage({
+				chatId: group.id,
+				content: `❌ ${error.message}`
+			});
+		}
+	}
+
+	/**
+	 * Lista agendamentos de fechamento do grupo
+	 */
+	async listGroupSchedulesClose(bot, message, args, group) {
+		return this.listGroupSchedules(bot, message, args, group, "fechar");
+	}
+
+	/**
+	 * Lista agendamentos de abertura do grupo
+	 */
+	async listGroupSchedulesOpen(bot, message, args, group) {
+		return this.listGroupSchedules(bot, message, args, group, "abrir");
+	}
+
+	/**
+	 * Método compartilhado para listagem de agendamentos
+	 */
+	async listGroupSchedules(bot, message, args, group, tipo) {
+		if (!group) {
+			return new ReturnMessage({
+				chatId: message.author,
+				content: "Este comando só pode ser usado em grupos."
+			});
+		}
+
+		const agendamentos = await GrupoAgendamentos.listarAgendamentos(group.id, tipo);
+		const tipoNome = tipo === "fechar" ? "fechamento" : "abertura";
+		const tipoTitulo = tipo === "fechar" ? "Fechamento" : "Abertura";
+		const emoji = tipo === "fechar" ? "🔒" : "🔓";
+
+		if (!agendamentos || agendamentos.length === 0) {
+			return new ReturnMessage({
+				chatId: group.id,
+				content: `📋 Nenhum agendamento de *${tipoNome}* configurado para este grupo.\nUse \`!g-${tipo} 22:00\` ou \`!g-${tipo} 22:00 sex\` para criar um.`
+			});
+		}
+
+		const unicos = agendamentos.filter((a) => a.dia_semana === null || a.dia_semana === undefined);
+		const semanais = agendamentos.filter(
+			(a) => a.dia_semana !== null && a.dia_semana !== undefined
+		);
+
+		let msg = `📋 *Agendamentos de ${tipoTitulo} — ${group.name || group.titulo || "Grupo"}*\n`;
+
+		if (unicos.length > 0) {
+			msg += `\n${emoji} *Únicos (executar uma vez)*\n`;
+			const agora = Date.now();
+			for (const u of unicos) {
+				const horaStr = GrupoAgendamentos.formatarHora(u.hora, u.minuto);
+				const diff = (u.timestamp_unico || 0) - agora;
+				const tempoStr = GrupoAgendamentos.formatarTempoRestante(diff);
+
+				let diaStr = "";
+				if (u.timestamp_unico) {
+					const d = new Date(u.timestamp_unico);
+					const dtf = new Intl.DateTimeFormat("pt-BR", {
+						timeZone: "America/Sao_Paulo",
+						weekday: "short"
+					});
+					diaStr = ` (${dtf.format(d)})`;
+				}
+
+				msg += `[${u.id}] ${horaStr}${diaStr} — ${tempoStr}`;
+				if (u.frase) msg += ` — "${u.frase}"`;
+				msg += "\n";
+			}
+		}
+
+		if (semanais.length > 0) {
+			msg += `\n${emoji} *Semanais (recorrentes)*\n`;
+			for (const s of semanais) {
+				const horaStr = GrupoAgendamentos.formatarHora(s.hora, s.minuto);
+				const nomeDia = GrupoAgendamentos.DIAS_SEMANA_NOMES[s.dia_semana] || "Dia";
+				msg += `[${s.id}] Todo(a) ${nomeDia} às ${horaStr}`;
+				if (s.frase) msg += ` — "${s.frase}"`;
+				msg += "\n";
+			}
+		}
+
+		msg += `\nUse \`!g-${tipo}-del <id>\` para remover um agendamento.`;
+
+		return new ReturnMessage({
+			chatId: group.id,
+			content: msg.trim()
+		});
+	}
+
+	/**
+	 * Deleta agendamento de fechamento do grupo
+	 */
+	async deleteGroupScheduleClose(bot, message, args, group) {
+		return this.deleteGroupSchedule(bot, message, args, group, "fechar");
+	}
+
+	/**
+	 * Deleta agendamento de abertura do grupo
+	 */
+	async deleteGroupScheduleOpen(bot, message, args, group) {
+		return this.deleteGroupSchedule(bot, message, args, group, "abrir");
+	}
+
+	/**
+	 * Método compartilhado para remoção de agendamentos
+	 */
+	async deleteGroupSchedule(bot, message, args, group, tipo) {
+		if (!group) {
+			return new ReturnMessage({
+				chatId: message.author,
+				content: "Este comando só pode ser usado em grupos."
+			});
+		}
+
+		if (!args || args.length === 0) {
+			return new ReturnMessage({
+				chatId: group.id,
+				content: `❌ Por favor, informe o ID do agendamento que deseja remover. Exemplo: !g-${tipo}-del A\nUse \`!g-${tipo}-lista\` para ver os IDs disponíveis.`
+			});
+		}
+
+		const id = args[0].trim().toUpperCase();
+		const deleted = await GrupoAgendamentos.deletarAgendamento(group.id, id, tipo);
+
+		if (!deleted) {
+			return new ReturnMessage({
+				chatId: group.id,
+				content: `❌ Agendamento *[${id}]* não encontrado. Use \`!g-${tipo}-lista\` para ver os IDs disponíveis.`
+			});
+		}
+
+		const horaStr = GrupoAgendamentos.formatarHora(deleted.hora, deleted.minuto);
+		let detalhe = "";
+		if (deleted.dia_semana !== null && deleted.dia_semana !== undefined) {
+			detalhe = ` (todo(a) ${GrupoAgendamentos.DIAS_SEMANA_NOMES[deleted.dia_semana]} às ${horaStr})`;
+		} else {
+			detalhe = ` (às ${horaStr})`;
+		}
+
+		return new ReturnMessage({
+			chatId: group.id,
+			content: `✅ Agendamento *[${deleted.id}]*${detalhe} removido com sucesso.`
+		});
 	}
 
 	/**
@@ -6254,7 +7649,7 @@ class Management {
 
 		// Inicializa a propriedade mentionAllMembers se não existir
 		if (channelConfig.mentionAllMembers === undefined) {
-			channelConfig.mentionAllMembers = true;
+			channelConfig.mentionAllMembers = false;
 		}
 
 		// Alterna o valor
@@ -6285,14 +7680,167 @@ class Management {
 		return this.toggleStreamMentions(bot, message, args, group, "youtube");
 	}
 
+	async setStreamForwardChannel(bot, message, args, group, platform) {
+		const groupId = group.id;
+
+		// 1. Busca os canais do WhatsApp seguidos pelo grupo em canais.db
+		const followedChannels = await this.database.dbAll(
+			"canais",
+			"SELECT canal_jid, apelido, apelido_normalizado FROM canal_grupos WHERE group_id = ?",
+			[groupId]
+		);
+
+		if (!followedChannels || followedChannels.length === 0) {
+			return new ReturnMessage({
+				chatId: groupId,
+				content:
+					"❌ Este grupo não segue nenhum canal ainda para poder encaminhar mensagens.\n\n" +
+					"Use `!canal-seguir <nome> <link>` para começar a seguir um canal."
+			});
+		}
+
+		// 2. Verifica se há canais de stream configurados no grupo para a plataforma
+		const streamChannels = this.getChannelConfig(group, platform);
+		if (!streamChannels || streamChannels.length === 0) {
+			return new ReturnMessage({
+				chatId: groupId,
+				content: `Nenhum canal de ${platform} configurado neste grupo. Use !g-${platform}-canal <nomeCanal> para adicionar.`
+			});
+		}
+
+		let streamChannelName = null;
+		let followedChannelQuery = null;
+
+		const firstArg = args[0] ? args[0].toLowerCase() : "";
+
+		// Tenta identificar se o primeiro argumento é o nome de um canal de stream configurado
+		const matchedStream = streamChannels.find(
+			(c) => c.channel && c.channel.toLowerCase() === firstArg
+		);
+
+		if (matchedStream) {
+			streamChannelName = matchedStream.channel;
+			followedChannelQuery = args.slice(1).join(" ").trim();
+		} else if (streamChannels.length === 1) {
+			streamChannelName = streamChannels[0].channel;
+			followedChannelQuery = args.join(" ").trim();
+		} else if (args.length === 0) {
+			const channelsList = streamChannels.map((c) => c.channel).join(", ");
+			const followedList = followedChannels.map((c) => c.apelido).join(", ");
+			return new ReturnMessage({
+				chatId: groupId,
+				content:
+					`Múltiplos canais de ${platform} configurados neste grupo.\n\n` +
+					`*Uso:* \`!g-${platform}-encaminharCanal <canalStream> <nomeCanalSeguido>\`\n\n` +
+					`*Streams configuradas:* ${channelsList}\n` +
+					`*Canais seguidos disponíveis:* ${followedList}`
+			});
+		} else {
+			const channelsList = streamChannels.map((c) => c.channel).join(", ");
+			return new ReturnMessage({
+				chatId: groupId,
+				content:
+					`Múltiplos canais de ${platform} configurados. Especifique o canal da stream:\n` +
+					`\`!g-${platform}-encaminharCanal <canalStream> <nomeCanalSeguido>\`\n\n` +
+					`*Streams configuradas:* ${channelsList}`
+			});
+		}
+
+		if (!followedChannelQuery) {
+			const followedList = followedChannels.map((c) => c.apelido).join(", ");
+			return new ReturnMessage({
+				chatId: groupId,
+				content:
+					`Por favor, informe o nome do canal do WhatsApp seguido.\n\n` +
+					`*Exemplo:* \`!g-${platform}-encaminharCanal ${streamChannelName} ${followedChannels[0].apelido}\`\n\n` +
+					`*Canais seguidos no grupo:* ${followedList}`
+			});
+		}
+
+		const streamConfig = this.findChannelConfig(group, platform, streamChannelName);
+		if (!streamConfig) {
+			return new ReturnMessage({
+				chatId: groupId,
+				content: `Canal de ${platform} não encontrado: ${streamChannelName}`
+			});
+		}
+
+		// Procura o canal do WhatsApp pelo apelido ou apelido normalizado
+		const normQuery = followedChannelQuery
+			.normalize("NFD")
+			.replace(/[\u0300-\u036f]/g, "")
+			.toLowerCase();
+
+		const matchedFollowed = followedChannels.find(
+			(ch) =>
+				ch.apelido.toLowerCase() === followedChannelQuery.toLowerCase() ||
+				ch.apelido_normalizado === normQuery ||
+				ch.canal_jid === followedChannelQuery
+		);
+
+		if (!matchedFollowed) {
+			const followedList = followedChannels.map((c) => c.apelido).join(", ");
+			return new ReturnMessage({
+				chatId: groupId,
+				content:
+					`❌ Canal do WhatsApp "${followedChannelQuery}" não encontrado entre os canais seguidos neste grupo.\n\n` +
+					`*Canais disponíveis:* ${followedList}`
+			});
+		}
+
+		// Inicializa a lista forwardToChannels
+		if (!Array.isArray(streamConfig.forwardToChannels)) {
+			streamConfig.forwardToChannels = [];
+		}
+
+		const targetJid = matchedFollowed.canal_jid;
+		const existsIndex = streamConfig.forwardToChannels.indexOf(targetJid);
+		let isAdded = false;
+
+		if (existsIndex !== -1) {
+			streamConfig.forwardToChannels.splice(existsIndex, 1);
+			isAdded = false;
+		} else {
+			streamConfig.forwardToChannels.push(targetJid);
+			isAdded = true;
+		}
+
+		await this.database.saveGroup(group);
+
+		const statusStr = isAdded ? "ativado" : "desativado";
+		return new ReturnMessage({
+			chatId: groupId,
+			content:
+				`✅ Encaminhamento de notificações da stream *${streamConfig.channel}* (${platform}) para o canal do WhatsApp *${matchedFollowed.apelido}* foi *${statusStr}*.\n\n` +
+				`⚠️ *Lembre-se:* O bot deve ser **administrador** do canal no WhatsApp para conseguir enviar as mensagens!`
+		});
+	}
+
+	async setTwitchForwardChannel(bot, message, args, group) {
+		return this.setStreamForwardChannel(bot, message, args, group, "twitch");
+	}
+
+	async setKickForwardChannel(bot, message, args, group) {
+		return this.setStreamForwardChannel(bot, message, args, group, "kick");
+	}
+
+	async setYoutubeForwardChannel(bot, message, args, group) {
+		return this.setStreamForwardChannel(bot, message, args, group, "youtube");
+	}
+
 	async generatePainelCommand(bot, message, args, group, privateManagement) {
 		let targetGroup = group;
 
 		// Se veio no PV, não há grupo ativo ou o usuário quer acessar outro grupo diretamente por g-painel nomegrupo
 		if (!message.group && args.length > 0) {
-			const groupName = args[0].trim().toLowerCase();
+			const groupQuery = args.join(" ").trim().toLowerCase();
 			const groups = await this.database.getGroups();
-			targetGroup = groups.find((g) => g.name.trim().toLowerCase() === groupName);
+			targetGroup =
+				groups.find((g) => (g.id || "").toLowerCase() === groupQuery) ||
+				groups.find((g) => (g.name || "").trim().toLowerCase() === groupQuery) ||
+				(groupQuery.length >= 3
+					? groups.find((g) => (g.name || "").toLowerCase().includes(groupQuery))
+					: null);
 
 			if (targetGroup) {
 				const isUserAdminInTarget = await this.adminUtils.isAdmin(
@@ -6315,7 +7863,7 @@ class Management {
 			} else {
 				return new ReturnMessage({
 					chatId: message.author,
-					content: `Grupo não encontrado: ${groupName}`,
+					content: `Grupo não encontrado: ${groupQuery}`,
 					reaction: "🙅‍♂️"
 				});
 			}
@@ -6336,7 +7884,8 @@ class Management {
 		const expiration = new Date(now.getTime() + expirationMinutes * 60000);
 
 		// Format for display
-		const formattedExpiration = expiration.toLocaleDateString("pt-BR", {
+		const formattedExpiration = expiration.toLocaleString("pt-BR", {
+			timeZone: "America/Sao_Paulo",
 			day: "2-digit",
 			month: "2-digit",
 			year: "numeric",
@@ -6359,10 +7908,24 @@ class Management {
 		await this.saveWebManagementToken(webManagementData);
 		const managementLink = `${process.env.BOT_DOMAIN}/manage/${token}`;
 
-		return new ReturnMessage({
-			chatId: message.author,
-			content: `Link para gerenciamento do grupo criado com sucesso!\n\nAcesse: ${managementLink}\n\nEste link é válido até ${formattedExpiration}.`
-		});
+		const returnMessages = [
+			new ReturnMessage({
+				chatId: message.author,
+				content: `Link para gerenciamento do grupo *${targetGroup.name}* criado com sucesso!\n\nAcesse: ${managementLink}\n\nEste link é válido até ${formattedExpiration}.`
+			})
+		];
+
+		if (message.group) {
+			returnMessages.push(
+				new ReturnMessage({
+					chatId: message.group,
+					content: `🔗 O link do painel de administração foi enviado no seu chat privado!`,
+					reaction: "📩"
+				})
+			);
+		}
+
+		return returnMessages;
 	}
 
 	generateRandomToken(length) {
@@ -6623,7 +8186,12 @@ class Management {
 			response += `- ${emojis} @${number} (${currentCount}) ❗️\n`;
 		}
 
-		response += "\n⚠️ _Respeitem as regras do grupo!_ 🚔";
+		if (group.regras && group.regras.trim().length > 0) {
+			response += `\n📜 *Regras do Grupo:*\n${group.regras}`;
+		} else {
+			const prefixo = group.prefix ?? "!";
+			response += `\n⚠️ _Respeitem as regras do grupo!_ 🚔\n> Os administradores podem cadastrar as regras usando ${prefixo}g-regras`;
+		}
 
 		//this.logger.debug(`[advertencias] `, { response, mentions });
 
@@ -6750,6 +8318,117 @@ class Management {
 			}
 		});
 	}
+
+	/**
+	 * Define, exibe ou remove as regras do grupo
+	 * @param {WhatsAppBot} bot - Instância do bot
+	 * @param {Object} message - Dados da mensagem
+	 * @param {Array} args - Argumentos do comando
+	 * @param {Object} group - Dados do grupo
+	 * @returns {Promise<ReturnMessage>} Mensagem de retorno
+	 */
+	async handleGroupRules(bot, message, args, group) {
+		if (!group) {
+			return new ReturnMessage({
+				chatId: message.author,
+				content: "Este comando só pode ser usado em grupos."
+			});
+		}
+
+		// Verifica se a mensagem é uma resposta a outra mensagem
+		const quotedMsg = await message.origin?.getQuotedMessage?.().catch(() => null);
+
+		// Extrai o texto após o comando preservando quebras de linha e formatação
+		let texto = "";
+		if (message.origin && message.origin.body) {
+			const bodyStr = message.origin.body;
+			const lower = bodyStr.toLowerCase();
+			const idx = lower.indexOf("g-regras");
+			if (idx !== -1) {
+				texto = bodyStr.substring(idx + "g-regras".length).trim();
+			}
+		}
+
+		if (!texto && args && args.length > 0) {
+			texto = args.join(" ").trim();
+		}
+
+		// Se não foi passado texto no comando mas marcou uma mensagem
+		if (!texto && quotedMsg) {
+			let quotedText = "";
+			if (typeof quotedMsg.body === "string" && quotedMsg.body.trim()) {
+				quotedText = quotedMsg.body.trim();
+			} else if (typeof quotedMsg.caption === "string" && quotedMsg.caption.trim()) {
+				quotedText = quotedMsg.caption.trim();
+			} else if (typeof quotedMsg.content === "string" && quotedMsg.content.trim()) {
+				quotedText = quotedMsg.content.trim();
+			} else if (
+				quotedMsg._data &&
+				typeof quotedMsg._data.body === "string" &&
+				quotedMsg._data.body.trim()
+			) {
+				quotedText = quotedMsg._data.body.trim();
+			}
+
+			if (quotedText) {
+				texto = quotedText;
+			} else {
+				return new ReturnMessage({
+					chatId: group.id,
+					content: "A mensagem marcada precisa conter texto para ser definida como regras."
+				});
+			}
+		}
+
+		// Se após checar argumentos e reply não houver texto
+		if (!texto) {
+			if (group.regras && group.regras.trim().length > 0) {
+				const regrasAnteriores = group.regras;
+				group.regras = null;
+				await this.database.saveGroup(group);
+
+				return new ReturnMessage({
+					chatId: group.id,
+					content: `📜 *Regras anteriores do grupo:*\n\n${regrasAnteriores}\n\n🗑️ _As regras foram removidas do grupo._`
+				});
+			} else {
+				const prefixo = group.prefix ?? "!";
+				return new ReturnMessage({
+					chatId: group.id,
+					content: `Este grupo não possui regras cadastradas.\n\nPara definir regras:\n- ${prefixo}g-regras <texto das regras>\n- Ou responda a uma mensagem de texto com ${prefixo}g-regras`
+				});
+			}
+		}
+
+		// Há texto: define as regras
+		let foiCortado = false;
+		if (texto.length > 5000) {
+			texto = texto.slice(0, 5000);
+			foiCortado = true;
+		}
+
+		if (typeof texto.isWellFormed === "function" && !texto.isWellFormed()) {
+			texto = texto
+				.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/gu, "")
+				.toWellFormed();
+		}
+
+		group.regras = texto;
+		await this.database.saveGroup(group);
+
+		let response = "✅ *Regras do grupo atualizadas com sucesso!*";
+		if (foiCortado) {
+			response +=
+				"\n\n⚠️ *Aviso:* O texto ultrapassou o limite máximo de 5000 caracteres e foi cortado.";
+		}
+		response += `\n\n📜 *Regras:*\n${texto}`;
+
+		return new ReturnMessage({
+			chatId: group.id,
+			content: response
+		});
+	}
+
 	/**
 	 * Remove o ID do grupo de todos os bots ignorados e limpa blacklist local
 	 * @param {Object} group - Dados do grupo
@@ -6810,7 +8489,8 @@ class Management {
 				try {
 					const p = JSON.parse(d.dossier_json);
 					const date = new Date(d.created_at).toLocaleString("pt-BR");
-					response += `*${i + 1}. [${date}]* (Nota: ${p.problematic_score}/10)\n`;
+					const underageTag = p.is_underage ? " 👶 [Menores]" : "";
+					response += `*${i + 1}. [${date}]* (Nota: ${p.problematic_score}/10)${underageTag}\n`;
 					response += `> *Tipo:* ${p.type}\n`;
 					response += `> *Resumo:* ${p.summary}\n\n`;
 				} catch (e) {
@@ -7022,153 +8702,1204 @@ class Management {
 	}
 
 	/**
-	 * Remove membros mencionados do grupo
-	 * @param {WhatsAppBot} bot - Instância do bot
-	 * @param {Object} message - Dados da mensagem
-	 * @param {Array} args - Argumentos do comando
-	 * @param {Object} group - Dados do grupo
-	 * @returns {Promise<ReturnMessage>} Mensagem de retorno
+	 * Alias de banir (banGroupMembers)
 	 */
 	async banUser(bot, message, args, group) {
-		if (!group || !bot.privado) return null;
+		return this.banGroupMembers(bot, message, args, group);
+	}
 
-		const isAdmin = await this.isBotAdmin(bot, group);
-		if (!isAdmin) {
+	/**
+	 * Alias de banir/bloquear (banGroupMembers)
+	 */
+	async blockGroupUser(bot, message, args, group) {
+		return this.banGroupMembers(bot, message, args, group);
+	}
+
+	/**
+	 * Verifica se o bot é privado. Retorna ReturnMessage de erro caso não seja.
+	 * @param {WhatsAppBot} bot
+	 * @param {Object} group
+	 * @param {Object} message
+	 * @returns {ReturnMessage|null}
+	 */
+	requirePrivateBot(bot, group, message) {
+		if (!bot.privado) {
 			return new ReturnMessage({
-				chatId: group.id,
-				content: "⚠️ O bot precisa ser administrador do grupo para remover membros."
+				chatId: message.managementResponseChatId || group.id,
+				content:
+					"Este comando gera muito risco de ban no chip (add/remover pessoas de grupo), então é restrito às ravenas privadas, onde o dono é responsável pelo chip."
+			});
+		}
+		return null;
+	}
+
+	/**
+	 * Fixa a mensagem marcada (em reply)
+	 * @param {WhatsAppBot} bot
+	 * @param {Object} message
+	 * @param {Array} args
+	 * @param {Object} group
+	 * @returns {Promise<ReturnMessage>}
+	 */
+	async pinMessage(bot, message, args, group) {
+		if (!group) {
+			return new ReturnMessage({
+				chatId: message.author,
+				content: "Este comando só pode ser usado em grupos."
+			});
+		}
+
+		const isBotAdmin = await this.isBotAdmin(bot, group);
+		if (!isBotAdmin) {
+			return new ReturnMessage({
+				chatId: message.managementResponseChatId || group.id,
+				content: "⚠️ O bot precisa ser administrador do grupo para fixar mensagens."
+			});
+		}
+
+		let quotedMsg = null;
+		try {
+			quotedMsg = await message.origin?.getQuotedMessage?.();
+		} catch (e) {
+			// Sem mensagem citada
+		}
+
+		const quotedId = message.quotedMessageId || quotedMsg?.id?._serialized || quotedMsg?.id;
+		if (!quotedId) {
+			return new ReturnMessage({
+				chatId: message.managementResponseChatId || group.id,
+				content: "⚠️ Responda (em reply) à mensagem que você deseja fixar com `!g-pin`."
+			});
+		}
+
+		const participant = quotedMsg?.author || quotedMsg?.from || null;
+		const fromMe = Boolean(quotedMsg?.fromMe);
+
+		try {
+			if (typeof bot.pinMessage === "function") {
+				await bot.pinMessage(group.id, quotedId, participant, fromMe, "pin");
+			}
+
+			return new ReturnMessage({
+				chatId: message.managementResponseChatId || group.id,
+				reaction: "📌",
+				content: "📌 Mensagem fixada com sucesso!"
+			});
+		} catch (err) {
+			this.logger.error(`Erro ao fixar mensagem ${quotedId} no grupo ${group.id}:`, err);
+			return new ReturnMessage({
+				chatId: message.managementResponseChatId || group.id,
+				content: "❌ Falha ao fixar mensagem. Verifique se o bot possui permissão no grupo."
+			});
+		}
+	}
+
+	/**
+	 * Promove pessoas mencionadas a administradores do grupo (máx 10)
+	 * @param {WhatsAppBot} bot
+	 * @param {Object} message
+	 * @param {Array} args
+	 * @param {Object} group
+	 * @returns {Promise<ReturnMessage>}
+	 */
+	async promoteMembers(bot, message, args, group) {
+		if (!group) {
+			return new ReturnMessage({
+				chatId: message.author,
+				content: "Este comando só pode ser usado em grupos."
+			});
+		}
+
+		const isBotAdmin = await this.isBotAdmin(bot, group);
+		if (!isBotAdmin) {
+			return new ReturnMessage({
+				chatId: message.managementResponseChatId || group.id,
+				content: "⚠️ O bot precisa ser administrador do grupo para promover membros."
 			});
 		}
 
 		const mentions = message.mentions ?? [];
 		if (mentions.length === 0) {
 			return new ReturnMessage({
-				chatId: group.id,
-				content: "⚠️ Por favor, mencione pelo menos uma pessoa para remover."
+				chatId: message.managementResponseChatId || group.id,
+				content:
+					"⚠️ Por favor, mencione as pessoas que deseja promover a administrador (máximo 10). Exemplo: `!g-promover @usuario`"
 			});
 		}
 
-		// Remove cada pessoa mencionada
-		const removed = [];
-		const failed = [];
-		for (const target of mentions) {
-			try {
-				await bot.removeFromGroup(group.id, [target]);
-				removed.push(target.split("@")[0]);
-			} catch (err) {
-				this.logger.error(`Erro ao banir usuário ${target} do grupo ${group.id}:`, err);
-				failed.push(target.split("@")[0]);
-			}
+		if (mentions.length > 10) {
+			return new ReturnMessage({
+				chatId: message.managementResponseChatId || group.id,
+				content: "⚠️ Você só pode promover no máximo 10 pessoas por comando."
+			});
 		}
 
-		let response = "";
-		if (removed.length > 0) {
-			response += `✅ Removido(s) do grupo: @${removed.join(", @")}\n`;
+		const botPhoneClean = this.adminUtils._normalizeId(bot.phoneNumber);
+		const authorClean = this.adminUtils._normalizeId(message.author);
+
+		const validTargets = [];
+		const ignored = [];
+
+		for (const target of mentions) {
+			const targetClean = this.adminUtils._normalizeId(target);
+			if (targetClean === botPhoneClean || targetClean === authorClean) {
+				ignored.push(targetClean);
+				continue;
+			}
+			validTargets.push(target);
 		}
-		if (failed.length > 0) {
-			response += `❌ Falha ao remover: @${failed.join(", @")}\n`;
+
+		if (validTargets.length === 0) {
+			return new ReturnMessage({
+				chatId: message.managementResponseChatId || group.id,
+				content: "⚠️ Nenhum alvo válido para promover."
+			});
+		}
+
+		try {
+			if (typeof bot.promoteInGroup === "function") {
+				await bot.promoteInGroup(group.id, validTargets);
+			}
+
+			const promotedMentions = validTargets.map((t) => `@${this.adminUtils._normalizeId(t)}`);
+			return new ReturnMessage({
+				chatId: message.managementResponseChatId || group.id,
+				content: `👑 *Promovido(s) a Administrador:* ${promotedMentions.join(", ")}`,
+				options: {
+					mentions: validTargets
+				}
+			});
+		} catch (err) {
+			this.logger.error(`Erro ao promover membros no grupo ${group.id}:`, err);
+			return new ReturnMessage({
+				chatId: message.managementResponseChatId || group.id,
+				content: "❌ Falha ao promover os membros. Verifique se o bot é administrador do grupo."
+			});
+		}
+	}
+
+	/**
+	 * Remove admin dos membros mencionados no grupo (máx 10)
+	 * @param {WhatsAppBot} bot
+	 * @param {Object} message
+	 * @param {Array} args
+	 * @param {Object} group
+	 * @returns {Promise<ReturnMessage>}
+	 */
+	async demoteMembers(bot, message, args, group) {
+		if (!group) {
+			return new ReturnMessage({
+				chatId: message.author,
+				content: "Este comando só pode ser usado em grupos."
+			});
+		}
+
+		const isBotAdmin = await this.isBotAdmin(bot, group);
+		if (!isBotAdmin) {
+			return new ReturnMessage({
+				chatId: message.managementResponseChatId || group.id,
+				content: "⚠️ O bot precisa ser administrador do grupo para rebaixar administradores."
+			});
+		}
+
+		const mentions = message.mentions ?? [];
+		if (mentions.length === 0) {
+			return new ReturnMessage({
+				chatId: message.managementResponseChatId || group.id,
+				content:
+					"⚠️ Por favor, mencione as pessoas que deseja rebaixar de administrador (máximo 10). Exemplo: `!g-rebaixar @usuario`"
+			});
+		}
+
+		if (mentions.length > 10) {
+			return new ReturnMessage({
+				chatId: message.managementResponseChatId || group.id,
+				content: "⚠️ Você só pode rebaixar no máximo 10 pessoas por comando."
+			});
+		}
+
+		const botPhoneClean = this.adminUtils._normalizeId(bot.phoneNumber);
+		const authorClean = this.adminUtils._normalizeId(message.author);
+
+		const validTargets = [];
+		const protectedTargets = [];
+
+		for (const target of mentions) {
+			const targetClean = this.adminUtils._normalizeId(target);
+			if (
+				targetClean === botPhoneClean ||
+				targetClean === authorClean ||
+				this.adminUtils.isSuperAdmin(targetClean)
+			) {
+				protectedTargets.push(targetClean);
+				continue;
+			}
+			validTargets.push(target);
+		}
+
+		if (validTargets.length === 0) {
+			return new ReturnMessage({
+				chatId: message.managementResponseChatId || group.id,
+				content: "⚠️ Não é permitido rebaixar o próprio bot, o autor do comando ou super admins."
+			});
+		}
+
+		try {
+			if (typeof bot.demoteInGroup === "function") {
+				await bot.demoteInGroup(group.id, validTargets);
+			}
+
+			const demotedMentions = validTargets.map((t) => `@${this.adminUtils._normalizeId(t)}`);
+			let replyText = `👤 *Rebaixado(s) de Administrador:* ${demotedMentions.join(", ")}`;
+			if (protectedTargets.length > 0) {
+				replyText += `\n_(${protectedTargets.length} protegido(s) e ignorado(s))_`;
+			}
+
+			return new ReturnMessage({
+				chatId: message.managementResponseChatId || group.id,
+				content: replyText,
+				options: {
+					mentions: validTargets
+				}
+			});
+		} catch (err) {
+			this.logger.error(`Erro ao rebaixar membros no grupo ${group.id}:`, err);
+			return new ReturnMessage({
+				chatId: message.managementResponseChatId || group.id,
+				content: "❌ Falha ao rebaixar os membros. Verifique se o bot é administrador do grupo."
+			});
+		}
+	}
+
+	/**
+	 * Remove pessoas mencionadas do grupo e da comunidade, impedindo reentrada (máx 5, cooldown 30m) ou lista banidos
+	 * @param {WhatsAppBot} bot
+	 * @param {Object} message
+	 * @param {Array} args
+	 * @param {Object} group
+	 * @returns {Promise<ReturnMessage>}
+	 */
+	async banGroupMembers(bot, message, args, group) {
+		if (!group) {
+			return new ReturnMessage({
+				chatId: message.author,
+				content: "Este comando só pode ser usado em grupos."
+			});
+		}
+
+		const privCheck = this.requirePrivateBot(bot, group, message);
+		if (privCheck) return privCheck;
+
+		const mentions = message.mentions ?? [];
+
+		// Se não houver mentions, listar os banidos
+		if (mentions.length === 0) {
+			if (
+				!group.bannedUsers ||
+				!Array.isArray(group.bannedUsers) ||
+				group.bannedUsers.length === 0
+			) {
+				return new ReturnMessage({
+					chatId: message.managementResponseChatId || group.id,
+					content:
+						"📋 Não há usuários banidos neste grupo.\nPara banir alguém: `!g-banir @usuario` (máx 5 mentions)."
+				});
+			}
+
+			let listText = `📋 *Usuários banidos deste grupo (${group.bannedUsers.length}):*\n`;
+			group.bannedUsers.forEach((b, idx) => {
+				const id = typeof b === "string" ? b : b.phone || b.id || b.lid;
+				const dateStr = b.date ? ` _(${new Date(b.date).toLocaleDateString("pt-BR")})_` : "";
+				listText += `${idx + 1}. \`${id}\`${dateStr}\n`;
+			});
+			listText += `\nPara desbanir: \`!g-desbanir <numero/LID>\``;
+			return new ReturnMessage({
+				chatId: message.managementResponseChatId || group.id,
+				content: listText.trim()
+			});
+		}
+
+		// Cooldown de 5 segundos por grupo (anti-flood)
+		const now = Date.now();
+		const COOLDOWN_MS = 5 * 1000;
+		if (group.lastBanAt && now - group.lastBanAt < COOLDOWN_MS) {
+			const remainingSec = Math.ceil((COOLDOWN_MS - (now - group.lastBanAt)) / 1000);
+			return new ReturnMessage({
+				chatId: message.managementResponseChatId || group.id,
+				content: `⏳ Aguarde ${remainingSec} segundo(s) para usar o comando de banir novamente.`
+			});
+		}
+
+		if (mentions.length > 5) {
+			return new ReturnMessage({
+				chatId: message.managementResponseChatId || group.id,
+				content: "⚠️ Você só pode banir no máximo 5 pessoas por comando."
+			});
+		}
+
+		const isBotAdmin = await this.isBotAdmin(bot, group);
+		if (!isBotAdmin) {
+			return new ReturnMessage({
+				chatId: message.managementResponseChatId || group.id,
+				content: "⚠️ O bot precisa ser administrador do grupo para remover e banir membros."
+			});
+		}
+
+		const botPhoneClean = this.adminUtils._normalizeId(bot.phoneNumber);
+		const authorClean = this.adminUtils._normalizeId(message.author);
+
+		const validTargets = [];
+		const protectedTargets = [];
+
+		for (const target of mentions) {
+			const targetClean = this.adminUtils._normalizeId(target);
+			if (
+				targetClean === botPhoneClean ||
+				targetClean === authorClean ||
+				this.adminUtils.isSuperAdmin(targetClean)
+			) {
+				protectedTargets.push(targetClean);
+				continue;
+			}
+			validTargets.push(target);
+		}
+
+		if (validTargets.length === 0) {
+			return new ReturnMessage({
+				chatId: message.managementResponseChatId || group.id,
+				content: "⚠️ Não é permitido banir o próprio bot, o autor do comando ou super admins."
+			});
+		}
+
+		if (!group.bannedUsers || !Array.isArray(group.bannedUsers)) {
+			group.bannedUsers = [];
+		}
+
+		let chat = null;
+		try {
+			chat = await bot.client?.getChatById?.(group.id);
+		} catch (e) {
+			// Ignora erro ao obter chat
+		}
+
+		const bannedMentions = [];
+
+		for (const target of validTargets) {
+			let pn = this.adminUtils._normalizeId(target);
+			let lid = null;
+
+			try {
+				const contact = await bot.client?.getContactById?.(target);
+				if (contact) {
+					if (contact.id?._serialized) {
+						pn = this.adminUtils._normalizeId(contact.id._serialized);
+					}
+					if (contact.lid) {
+						lid = contact.lid.split("@")[0];
+					}
+				}
+			} catch (contactErr) {
+				// Ignora erro de contato
+			}
+
+			// Evita duplicatas em group.bannedUsers
+			const alreadyBanned = group.bannedUsers.some((b) => {
+				if (!b) return false;
+				if (typeof b === "string") {
+					const cleanB = b.split("@")[0].replace(/\D/g, "");
+					return cleanB === pn || (lid && b.split("@")[0] === lid);
+				}
+				const bPhone = b.phone ? String(b.phone).split("@")[0].replace(/\D/g, "") : null;
+				const bLid = b.lid ? String(b.lid).split("@")[0] : null;
+				return (bPhone && bPhone === pn) || (bLid && lid && bLid === lid);
+			});
+
+			if (!alreadyBanned) {
+				group.bannedUsers.push({
+					phone: pn,
+					lid,
+					id: target,
+					bannedBy: message.author,
+					date: now
+				});
+			}
+
+			// Remove do grupo
+			try {
+				await bot.removeFromGroup(group.id, [target]);
+			} catch (remErr) {
+				this.logger.error(`Erro ao remover banido ${target} do grupo ${group.id}:`, remErr);
+			}
+
+			// Remove da comunidade se houver
+			if (chat?.linkedParentJid) {
+				try {
+					await bot.removeFromCommunity(chat.linkedParentJid, [target]);
+				} catch (commErr) {
+					this.logger.error(
+						`Erro ao remover banido ${target} da comunidade ${chat.linkedParentJid}:`,
+						commErr
+					);
+				}
+			}
+
+			bannedMentions.push(`@${pn}`);
+		}
+
+		group.lastBanAt = now;
+		await this.database.saveGroup(group);
+
+		let replyText = `🔨 *Usuário(s) banido(s) do grupo e comunidade:*\n${bannedMentions.join("\n")}\n\nSe tentarem entrar novamente, serão removidos imediatamente.\nPara desbanir: \`!g-desbanir <numero>\``;
+		if (protectedTargets.length > 0) {
+			replyText += `\n\n_(${protectedTargets.length} protegido(s) e ignorado(s))_`;
 		}
 
 		return new ReturnMessage({
-			chatId: group.id,
-			content: response.trim(),
+			chatId: message.managementResponseChatId || group.id,
+			content: replyText,
 			options: {
-				mentions
+				mentions: validTargets
 			}
 		});
 	}
 
 	/**
-	 * Remove membros mencionados do grupo e os bloqueia no banco de dados
-	 * @param {WhatsAppBot} bot - Instância do bot
-	 * @param {Object} message - Dados da mensagem
-	 * @param {Array} args - Argumentos do comando
-	 * @param {Object} group - Dados do grupo
-	 * @returns {Promise<ReturnMessage>} Mensagem de retorno
+	 * Remove o ban de uma pessoa permitindo que entre no grupo novamente
+	 * @param {WhatsAppBot} bot
+	 * @param {Object} message
+	 * @param {Array} args
+	 * @param {Object} group
+	 * @returns {Promise<ReturnMessage>}
 	 */
-	async blockGroupUser(bot, message, args, group) {
-		if (!group || !bot.privado) return null;
-
-		const isAdmin = await this.isBotAdmin(bot, group);
-		if (!isAdmin) {
+	async unbanGroupMembers(bot, message, args, group) {
+		if (!group) {
 			return new ReturnMessage({
-				chatId: group.id,
-				content: "⚠️ O bot precisa ser administrador do grupo para remover e bloquear membros."
+				chatId: message.author,
+				content: "Este comando só pode ser usado em grupos."
 			});
 		}
+
+		const privCheck = this.requirePrivateBot(bot, group, message);
+		if (privCheck) return privCheck;
 
 		const mentions = message.mentions ?? [];
-		if (mentions.length === 0) {
+		const targetsToUnban = [];
+
+		if (mentions.length > 0) {
+			for (const m of mentions) {
+				targetsToUnban.push(this.adminUtils._normalizeId(m));
+			}
+		}
+
+		if (args.length > 0) {
+			for (const arg of args) {
+				const cleanArg = arg.replace(/[@<>\s]/g, "").trim();
+				if (cleanArg) {
+					targetsToUnban.push(this.adminUtils._normalizeId(cleanArg) || cleanArg.split("@")[0]);
+				}
+			}
+		}
+
+		if (targetsToUnban.length === 0) {
 			return new ReturnMessage({
-				chatId: group.id,
-				content: "⚠️ Por favor, mencione pelo menos uma pessoa para bloquear."
+				chatId: message.managementResponseChatId || group.id,
+				content:
+					"⚠️ Especifique quem deseja desbanir (mencione @usuario, ou digite o número/LID).\nExemplo: `!g-desbanir 5511999999999` ou `!g-desbanir @usuario`."
 			});
 		}
 
-		// Garante que o array filters.people está inicializado
-		if (!group.filters) {
-			group.filters = {};
+		if (!group.bannedUsers || !Array.isArray(group.bannedUsers) || group.bannedUsers.length === 0) {
+			return new ReturnMessage({
+				chatId: message.managementResponseChatId || group.id,
+				content: "📋 Não há usuários banidos neste grupo."
+			});
 		}
-		if (!group.filters.people || !Array.isArray(group.filters.people)) {
-			group.filters.people = [];
-		}
 
-		const removed = [];
-		const failed = [];
+		const unbanned = [];
+		group.bannedUsers = group.bannedUsers.filter((b) => {
+			if (!b) return false;
+			let bPhone = null;
+			let bLid = null;
+			let bId = null;
 
-		for (const target of mentions) {
-			try {
-				// Resolve o contato para obter o número e o LID correto
-				let pn = target.split("@")[0];
-				let lid = null;
-				try {
-					const contact = await bot.client.getContactById(target);
-					if (contact) {
-						pn = contact.id._serialized.split("@")[0];
-						if (contact.lid) {
-							lid = contact.lid.split("@")[0];
-						}
-					}
-				} catch (e) {
-					this.logger.error(`Erro ao obter contato para obter LID de ${target}:`, e.message);
-				}
-
-				// Adiciona ao banco de dados (group.filters.people)
-				if (!group.filters.people.includes(pn)) {
-					group.filters.people.push(pn);
-				}
-				if (lid && !group.filters.people.includes(lid) && lid !== pn) {
-					group.filters.people.push(lid);
-				}
-
-				// Remove a pessoa do grupo
-				await bot.removeFromGroup(group.id, [target]);
-				removed.push(pn);
-			} catch (err) {
-				this.logger.error(`Erro ao bloquear/remover usuário ${target} do grupo ${group.id}:`, err);
-				failed.push(target.split("@")[0]);
+			if (typeof b === "string") {
+				bPhone = b.split("@")[0].replace(/\D/g, "");
+				bLid = b.split("@")[0];
+			} else {
+				bPhone = b.phone ? String(b.phone).split("@")[0].replace(/\D/g, "") : null;
+				bLid = b.lid ? String(b.lid).split("@")[0] : null;
+				bId = b.id ? String(b.id).split("@")[0].replace(/\D/g, "") : null;
 			}
+
+			const shouldRemove = targetsToUnban.some((target) => {
+				const targetClean = target.replace(/\D/g, "");
+				return (
+					(targetClean && bPhone && targetClean === bPhone) ||
+					(targetClean && bId && targetClean === bId) ||
+					(target && bLid && target === bLid) ||
+					(target && bPhone && target === bPhone)
+				);
+			});
+
+			if (shouldRemove) {
+				unbanned.push(bPhone || bLid || bId || JSON.stringify(b));
+				return false;
+			}
+			return true;
+		});
+
+		if (unbanned.length === 0) {
+			return new ReturnMessage({
+				chatId: message.managementResponseChatId || group.id,
+				content: "❌ Usuário(s) não encontrado(s) na lista de banidos deste grupo."
+			});
 		}
 
-		// Salva o grupo atualizado
 		await this.database.saveGroup(group);
 
-		let response = "";
-		if (removed.length > 0) {
-			response += `🔒 Removido(s) e bloqueado(s) do grupo: @${removed.join(", @")}\n`;
-		}
-		if (failed.length > 0) {
-			response += `❌ Falha ao remover/bloquear: @${failed.join(", @")}\n`;
-		}
-
 		return new ReturnMessage({
-			chatId: group.id,
-			content: response.trim(),
-			options: {
-				mentions
-			}
+			chatId: message.managementResponseChatId || group.id,
+			content: `✅ Usuário(s) desbanido(s) com sucesso: ${unbanned.join(", ")}.\nAgora ele(a) pode entrar no grupo novamente.`
 		});
 	}
 }
 
+const helper = {
+	about: "Sistema completo de gerenciamento administrativo e configuração de grupos do bot",
+	implementation:
+		"Classe Management com mapeamento de comandos de controle, persistência em SQLite e interface de administração",
+	tags: "gerenciamento,admin,grupo,configuracao,moderação,filtros,streams,customizacao",
+	cmds: [
+		{
+			cmd: "!g-pin",
+			desc: "Fixa a mensagem marcada (em resposta)",
+			usage: ["!g-pin"],
+			category: "gerenciamento"
+		},
+		{
+			cmd: "!g-promover",
+			desc: "Transforma pessoas mencionadas em administradores do grupo (máx 10)",
+			usage: ["!g-promover @usuario"],
+			category: "gerenciamento"
+		},
+		{
+			cmd: "!g-rebaixar",
+			desc: "Remove privilégios de administrador das pessoas mencionadas (máx 10)",
+			usage: ["!g-rebaixar @usuario"],
+			category: "gerenciamento"
+		},
+		{
+			cmd: "!g-banir",
+			desc: "Remove pessoas mencionadas do grupo e comunidade, impedindo reentrada (máx 5) ou lista banidos",
+			usage: ["!g-banir @usuario", "!g-banir"],
+			category: "gerenciamento"
+		},
+		{
+			cmd: "!g-desbanir",
+			desc: "Remove o ban de uma pessoa pelo mention, número ou LID",
+			usage: ["!g-desbanir 5511999999999", "!g-desbanir @usuario"],
+			category: "gerenciamento"
+		},
+		{
+			cmd: "!g-setNome",
+			desc: "ID/Nome do grupo (nome stickers, gerenciamento)",
+			usage: ["!g-setNome"],
+			category: "gerenciamento"
+		},
+		{
+			cmd: "!g-setPrefixo",
+			desc: "Altera o prefixo de comandos do *grupo* (padrão !)",
+			usage: ["!g-setPrefixo"],
+			category: "gerenciamento"
+		},
+		{
+			cmd: "!g-setCustomSemPrefixo",
+			desc: "Faz com que comandos personalizados não precisem de prefixo",
+			usage: ["!g-setCustomSemPrefixo"],
+			category: "gerenciamento"
+		},
+		{
+			cmd: "!g-setBoasvindas",
+			desc: "Mensagem quando alguém entra no grupo. Você pode usar as variáveis {pessoa",
+			usage: ["!g-setBoasvindas"],
+			category: "gerenciamento"
+		},
+		{
+			cmd: "!g-delBoasvindas",
+			desc: "Remove um tipo de mídia específico da mensagem de boas-vindas (text, image, audio, video, sticker)",
+			usage: ["!g-delBoasvindas"],
+			category: "gerenciamento"
+		},
+		{
+			cmd: "!g-setDespedida",
+			desc: "Mensagem quando alguém sai do grupo",
+			usage: ["!g-setDespedida"],
+			category: "gerenciamento"
+		},
+		{
+			cmd: "!g-delDespedida",
+			desc: "Remove um tipo de mídia específico da mensagem de despedida (text, image, audio, video, sticker)",
+			usage: ["!g-delDespedida"],
+			category: "gerenciamento"
+		},
+		{
+			cmd: "!g-autoStt",
+			desc: "Ativa/desativa conversão automática de voz para texto",
+			usage: ["!g-autoStt"],
+			category: "gerenciamento"
+		},
+		{
+			cmd: "!g-info",
+			desc: "Mostra informações detalhadas do grupo (debug)",
+			usage: ["!g-info"],
+			category: "gerenciamento"
+		},
+		{
+			cmd: "!g-manage",
+			desc: "Ativa o gerenciamento do grupo pelo PV do bot",
+			usage: ["!g-manage"],
+			category: "gerenciamento"
+		},
+		{
+			cmd: "!g-setAutoTranslate",
+			desc: "Define o idioma para tradução automática de todas as respostas do bot (Ex: Spanish (ES))",
+			usage: ["!g-setAutoTranslate"],
+			category: "gerenciamento"
+		},
+		{
+			cmd: "!g-addCmd",
+			desc: "Cria um comando personalizado",
+			usage: ["!g-addCmd"],
+			category: "custom-cmds"
+		},
+		{
+			cmd: "!g-addCmdReply",
+			desc: "Adiciona outra resposta a um comando existente",
+			usage: ["!g-addCmdReply"],
+			category: "custom-cmds"
+		},
+		{
+			cmd: "!g-delCmd",
+			desc: "Exclui um comando personalizado",
+			usage: ["!g-delCmd"],
+			category: "custom-cmds"
+		},
+		{
+			cmd: "!g-cmd-enable",
+			desc: "Habilita comando (comandos personalizados)",
+			usage: ["!g-cmd-enable"],
+			category: "custom-cmds"
+		},
+		{
+			cmd: "!g-cmd-disable",
+			desc: "Desabilita comando (comandos personalizados)",
+			usage: ["!g-cmd-disable"],
+			category: "custom-cmds"
+		},
+		{
+			cmd: "!g-cmd-setPV",
+			desc: "A resposta do comando será enviada no PV (comandos personalizados)",
+			usage: ["!g-cmd-setPV"],
+			category: "custom-cmds"
+		},
+		{
+			cmd: "!g-cmd-enviarTudo",
+			desc: "Envia todas as respostas do comando (se houver mais de uma)",
+			usage: ["!g-cmd-enviarTudo"],
+			category: "custom-cmds"
+		},
+		{
+			cmd: "!g-cmd-responder",
+			desc: "Ativa/Desativa se o comando deve responder citando a mensagem",
+			usage: ["!g-cmd-responder"],
+			category: "custom-cmds"
+		},
+		{
+			cmd: "!g-cmd-react",
+			desc: "Reaçao quando usar o comando",
+			usage: ["!g-cmd-react"],
+			category: "custom-cmds"
+		},
+		{
+			cmd: "!g-cmd-startReact",
+			desc: "Reaçao pré-comando (útil para APIs, como loading)",
+			usage: ["!g-cmd-startReact"],
+			category: "custom-cmds"
+		},
+		{
+			cmd: "!g-cmd-setAdm",
+			desc: "Define que apenas admins podem usar um comando",
+			usage: ["!g-cmd-setAdm"],
+			category: "custom-cmds"
+		},
+		{
+			cmd: "!g-cmd-setInteragir",
+			desc: "Define que comando seja usado nas interações aleatórias",
+			usage: ["!g-cmd-setInteragir"],
+			category: "custom-cmds"
+		},
+		{
+			cmd: "!g-cmd-cd",
+			desc: "Define o cooldown (em segundos) de um comando personalizado. Uso: !g-cmd-cd <comando> <segundos>",
+			usage: ["!g-cmd-cd"],
+			category: "custom-cmds"
+		},
+		{
+			cmd: "!g-cmd-setHoras",
+			desc: "Define horários permitidos para um comando",
+			usage: ["!g-cmd-setHoras"],
+			category: "custom-cmds"
+		},
+		{
+			cmd: "!g-cmd-setDias",
+			desc: "Define dias permitidos para um comando",
+			usage: ["!g-cmd-setDias"],
+			category: "custom-cmds"
+		},
+		{
+			cmd: "!g-filtro-palavra",
+			desc: "Detecta e Apaga mensagens com a palavra/frase especificada",
+			usage: ["!g-filtro-palavra"],
+			category: "filtros"
+		},
+		{
+			cmd: "!g-filtro-regex",
+			desc: "Detecta e Apaga mensagens que correspondam à expressão regular (regex) especificada",
+			usage: ["!g-filtro-regex \\b(palavra1|palavra2)\\b", "!g-filtro-regex /padrão/i"],
+			category: "filtros"
+		},
+		{
+			cmd: "!g-filtro-links",
+			desc: "Detecta e Apaga mensagens com links",
+			usage: ["!g-filtro-links"],
+			category: "filtros"
+		},
+		{
+			cmd: "!g-filtro-permitirLink",
+			desc: "Adiciona/remove ou lista domínios e padrões de links permitidos",
+			usage: [
+				"!g-filtro-permitirLink",
+				"!g-filtro-permitirLink terra.com.br",
+				"!g-filtro-permitirLink *youtube*"
+			],
+			category: "filtros"
+		},
+		{
+			cmd: "!g-filtro-linksConfiaveis",
+			desc: "Adiciona ou remove principais sites confiáveis da lista de links permitidos",
+			usage: ["!g-filtro-linksConfiaveis", "!g-filtro-linksConfiaveis remover"],
+			category: "filtros"
+		},
+		{
+			cmd: "!g-filtro-permitirAdm",
+			desc: "Habilita/desabilita a filtragem de mensagens de administradores do grupo",
+			usage: ["!g-filtro-permitirAdm"],
+			category: "filtros"
+		},
+		{
+			cmd: "!g-filtro-pessoa",
+			desc: "Detecta e Apaga mensagens desta pessoa (Marcar com @)",
+			usage: ["!g-filtro-pessoa"],
+			category: "filtros"
+		},
+		{
+			cmd: "!g-filtro-nsfw",
+			desc: "Ativa/desativa ou define a intensidade (0-100) do filtro NSFW",
+			usage: ["!g-filtro-nsfw", "!g-filtro-nsfw 30"],
+			category: "filtros"
+		},
+		{
+			cmd: "!g-banirSpammers",
+			desc: "Ativa/desativa o monitoramento e banimento de spammers (DDI 62/63/380) no grupo",
+			usage: ["!g-banirSpammers"],
+			category: "filtros"
+		},
+		{
+			cmd: "!g-apelido",
+			desc: "Define apelido de *outro membro* no grupo",
+			usage: ["!g-apelido"],
+			category: "gerenciamento"
+		},
+		{
+			cmd: "!g-ignorar",
+			desc: "O bot irá ignorar as mensagens desta pessoa",
+			usage: ["!g-ignorar"],
+			category: "gerenciamento"
+		},
+		{
+			cmd: "!g-mute",
+			desc: "Desativa/ativa comando com a palavra especificada",
+			usage: ["!g-mute"],
+			category: "gerenciamento"
+		},
+		{
+			cmd: "!g-muteCategoria [categoria]",
+			desc: "Desativa/ativa todos os comandos da categoria especificada (ex: canais, outros, jogos, downloaders, ia, etc)",
+			usage: ["!g-muteCategoria canais", "!g-muteCategoria outros"],
+			category: "gerenciamento"
+		},
+		{
+			cmd: "!g-customAdmin",
+			desc: "Adiciona pessoas como administradoras fixas do bot no grupo",
+			usage: ["!g-customAdmin"],
+			category: "gerenciamento"
+		},
+		{
+			cmd: "!g-pausar",
+			desc: "Pausa/retoma a atividade do bot no grupo",
+			usage: ["!g-pausar"],
+			category: "gerenciamento"
+		},
+		{
+			cmd: "!g-interagir",
+			desc: "Ativa/desativa interações automáticas do bot",
+			usage: ["!g-interagir"],
+			category: "interacao"
+		},
+		{
+			cmd: "!g-interagir-cmd",
+			desc: "Ativa/desativa interações automáticas do bot usando comandos do grupo",
+			usage: ["!g-interagir-cmd"],
+			category: "interacao"
+		},
+		{
+			cmd: "!g-interagir-cd",
+			desc: "Define o tempo de espera entre interações automáticas",
+			usage: ["!g-interagir-cd"],
+			category: "interacao"
+		},
+		{
+			cmd: "!g-interagir-chance",
+			desc: "Define a chance de ocorrer interações automáticas",
+			usage: ["!g-interagir-chance"],
+			category: "interacao"
+		},
+		{
+			cmd: "!g-interagir-proporcao",
+			desc: "Define a proporção entre comandos e IA para interações automáticas",
+			usage: ["!g-interagir-proporcao"],
+			category: "interacao"
+		},
+		{
+			cmd: "!g-fechar",
+			desc: "Fecha o grupo ou agenda fechamento automático",
+			usage: [
+				"!g-fechar",
+				"!g-fechar 13:30",
+				"!g-fechar 13:30 sex",
+				"!g-fechar 13:30 sex 🔒 Boa noite!"
+			],
+			category: "gerenciamento"
+		},
+		{
+			cmd: "!g-fechar-lista",
+			desc: "Lista agendamentos de fechamento do grupo",
+			usage: ["!g-fechar-lista"],
+			category: "gerenciamento"
+		},
+		{
+			cmd: "!g-fechar-del",
+			desc: "Remove agendamento de fechamento pelo ID",
+			usage: ["!g-fechar-del A"],
+			category: "gerenciamento"
+		},
+		{
+			cmd: "!g-abrir",
+			desc: "Abre o grupo ou agenda abertura automática",
+			usage: ["!g-abrir", "!g-abrir 07:30", "!g-abrir 07:30 seg", "!g-abrir 07:30 seg 🔓 Bom dia!"],
+			category: "gerenciamento"
+		},
+		{
+			cmd: "!g-abrir-lista",
+			desc: "Lista agendamentos de abertura do grupo",
+			usage: ["!g-abrir-lista"],
+			category: "gerenciamento"
+		},
+		{
+			cmd: "!g-abrir-del",
+			desc: "Remove agendamento de abertura pelo ID",
+			usage: ["!g-abrir-del A"],
+			category: "gerenciamento"
+		},
+		{
+			cmd: "!g-notificar-grupoFechado",
+			desc: "Ativa/desativa a notificação quando o grupo é fechado",
+			usage: ["!g-notificar-grupoFechado"],
+			category: "gerenciamento"
+		},
+		{
+			cmd: "!g-notificar-grupoAberto",
+			desc: "Ativa/desativa a notificação quando o grupo é aberto",
+			usage: ["!g-notificar-grupoAberto"],
+			category: "gerenciamento"
+		},
+		{
+			cmd: "!g-setPersonalidade",
+			desc: "Define uma personalidade para os comandos de IA (max. 1500 caracteres)",
+			usage: ["!g-setPersonalidade"],
+			category: "gerenciamento"
+		},
+		{
+			cmd: "!g-setApelido",
+			desc: "Define apelido de *outro membro* no grupo (@marcar_pessoa)",
+			usage: ["!g-setApelido"],
+			category: "gerenciamento"
+		},
+		{
+			cmd: "!g-twitch-canal",
+			desc: "Adiciona/remove canal da Twitch para monitoramento",
+			usage: ["!g-twitch-canal"],
+			category: "streams"
+		},
+		{
+			cmd: "!g-twitch-mudarTitulo",
+			desc: "Ativa/desativa mudança de título do grupo para eventos da Twitch",
+			usage: ["!g-twitch-mudarTitulo"],
+			category: "streams"
+		},
+		{
+			cmd: "!g-twitch-titulo",
+			desc: "Define título do grupo para eventos de canal da Twitch",
+			usage: ["!g-twitch-titulo"],
+			category: "streams"
+		},
+		{
+			cmd: "!g-twitch-fotoGrupo",
+			desc: "Define foto do grupo para eventos de canal da Twitch",
+			usage: ["!g-twitch-fotoGrupo"],
+			category: "streams"
+		},
+		{
+			cmd: "!g-twitch-midia",
+			desc: "Define mídia para notificação de canal da Twitch",
+			usage: ["!g-twitch-midia"],
+			category: "streams"
+		},
+		{
+			cmd: "!g-twitch-midia-del",
+			desc: "Remove mídia específica da notificação de canal da Twitch",
+			usage: ["!g-twitch-midia-del"],
+			category: "streams"
+		},
+		{
+			cmd: "!g-twitch-usarIA",
+			desc: "Ativa/desativa uso de IA para gerar mensagens de notificação",
+			usage: ["!g-twitch-usarIA"],
+			category: "streams"
+		},
+		{
+			cmd: "!g-twitch-usarThumbnail",
+			desc: "Ativa/desativa o envio da thumbnail da stream junto com o texto",
+			usage: ["!g-twitch-usarThumbnail"],
+			category: "streams"
+		},
+		{
+			cmd: "!g-twitch-marcar",
+			desc: "Ativa/desativa menção a todos os membros nas notificações de canal da Twitch",
+			usage: ["!g-twitch-marcar"],
+			category: "streams"
+		},
+		{
+			cmd: "!g-twitch-encaminharCanal",
+			desc: "Ativa/desativa encaminhamento de notificações da Twitch para canal do WhatsApp seguido",
+			usage: ["!g-twitch-encaminharCanal <canalStream> <nomeCanalSeguido>"],
+			category: "streams"
+		},
+		{
+			cmd: "!g-kick-canal",
+			desc: "Adiciona/remove canal do Kick para monitoramento",
+			usage: ["!g-kick-canal"],
+			category: "streams"
+		},
+		{
+			cmd: "!g-kick-mudarTitulo",
+			desc: "Ativa/desativa mudança de título do grupo para eventos do Kick",
+			usage: ["!g-kick-mudarTitulo"],
+			category: "streams"
+		},
+		{
+			cmd: "!g-kick-titulo",
+			desc: "Define título do grupo para eventos de canal do Kick",
+			usage: ["!g-kick-titulo"],
+			category: "streams"
+		},
+		{
+			cmd: "!g-kick-fotoGrupo",
+			desc: "Define foto do grupo para eventos de canal do Kick",
+			usage: ["!g-kick-fotoGrupo"],
+			category: "streams"
+		},
+		{
+			cmd: "!g-kick-midia",
+			desc: "Define mídia para notificação de canal do Kick",
+			usage: ["!g-kick-midia"],
+			category: "streams"
+		},
+		{
+			cmd: "!g-kick-midia-del",
+			desc: "Remove mídia específica da notificação de canal do Kick",
+			usage: ["!g-kick-midia-del"],
+			category: "streams"
+		},
+		{
+			cmd: "!g-kick-usarIA",
+			desc: "Ativa/desativa uso de IA para gerar mensagens de notificação",
+			usage: ["!g-kick-usarIA"],
+			category: "streams"
+		},
+		{
+			cmd: "!g-kick-usarThumbnail",
+			desc: "Ativa/desativa o envio da thumbnail da stream junto com o texto",
+			usage: ["!g-kick-usarThumbnail"],
+			category: "streams"
+		},
+		{
+			cmd: "!g-kick-marcar",
+			desc: "Ativa/desativa menção a todos os membros nas notificações de canal do Kick",
+			usage: ["!g-kick-marcar"],
+			category: "streams"
+		},
+		{
+			cmd: "!g-kick-encaminharCanal",
+			desc: "Ativa/desativa encaminhamento de notificações do Kick para canal do WhatsApp seguido",
+			usage: ["!g-kick-encaminharCanal <canalStream> <nomeCanalSeguido>"],
+			category: "streams"
+		},
+		{
+			cmd: "!g-youtube-canal",
+			desc: "Adiciona/remove canal do YouTube para monitoramento",
+			usage: ["!g-youtube-canal"],
+			category: "streams"
+		},
+		{
+			cmd: "!g-youtube-mudarTitulo",
+			desc: "Ativa/desativa mudança de título do grupo para eventos do YouTube",
+			usage: ["!g-youtube-mudarTitulo"],
+			category: "streams"
+		},
+		{
+			cmd: "!g-youtube-titulo",
+			desc: "Define título do grupo para eventos de canal do YouTube",
+			usage: ["!g-youtube-titulo"],
+			category: "streams"
+		},
+		{
+			cmd: "!g-youtube-fotoGrupo",
+			desc: "Define foto do grupo para eventos de canal do YouTube",
+			usage: ["!g-youtube-fotoGrupo"],
+			category: "streams"
+		},
+		{
+			cmd: "!g-youtube-midia",
+			desc: "Define mídia para notificações de novos vídeos ou lives do YouTube",
+			usage: [
+				"!g-youtube-midia [video|on|off] <canal>",
+				"!g-youtube-midia <canal> (padrão: novos vídeos)",
+				"!g-youtube-midia on <canal> (lives online)",
+				"!g-youtube-midia off <canal> (lives offline)"
+			],
+			category: "streams"
+		},
+		{
+			cmd: "!g-youtube-midia-del",
+			desc: "Remove mídia específica de vídeo ou live do YouTube",
+			usage: ["!g-youtube-midia-del [video|on|off] <tipo> <canal>"],
+			category: "streams"
+		},
+		{
+			cmd: "!g-youtube-usarIA",
+			desc: "Ativa/desativa uso de IA para gerar mensagens de notificação",
+			usage: ["!g-youtube-usarIA"],
+			category: "streams"
+		},
+		{
+			cmd: "!g-youtube-usarThumbnail",
+			desc: "Ativa/desativa o envio da thumbnail da stream junto com o texto",
+			usage: ["!g-youtube-usarThumbnail"],
+			category: "streams"
+		},
+		{
+			cmd: "!g-youtube-marcar",
+			desc: "Ativa/desativa menção a todos os membros nas notificações de canal do YouTube",
+			usage: ["!g-youtube-marcar"],
+			category: "streams"
+		},
+		{
+			cmd: "!g-youtube-encaminharCanal",
+			desc: "Ativa/desativa encaminhamento de notificações do YouTube para canal do WhatsApp seguido",
+			usage: ["!g-youtube-encaminharCanal <canalStream> <nomeCanalSeguido>"],
+			category: "streams"
+		},
+		{
+			cmd: "!g-variaveis",
+			desc: "Lista todas as variáveis disponíveis para comandos personalizados",
+			usage: ["!g-variaveis"],
+			category: "gerenciamento"
+		},
+		{
+			cmd: "!g-painel",
+			desc: "Gera um link para gerenciar o bot via web",
+			usage: ["!g-painel"],
+			category: "gerenciamento"
+		},
+		{
+			cmd: "!g-setWebhook",
+			desc: "Cria ou atualiza um webhook para este grupo",
+			usage: ["!g-setWebhook"],
+			category: "gerenciamento"
+		},
+		{
+			cmd: "!g-delWebhook",
+			desc: "Apaga um webhook deste grupo",
+			usage: ["!g-delWebhook"],
+			category: "gerenciamento"
+		},
+		{
+			cmd: "!g-advertir",
+			desc: "Adiciona uma advertência aos membros mencionados",
+			usage: ["!g-advertir"],
+			category: "gerenciamento"
+		},
+		{
+			cmd: "!g-advertencias",
+			desc: "Lista as advertências atuais do grupo",
+			usage: ["!g-advertencias"],
+			category: "gerenciamento"
+		},
+		{
+			cmd: "!g-limpar-advertencias",
+			desc: "Remove as advertências dos membros mencionados",
+			usage: ["!g-limpar-advertencias"],
+			category: "gerenciamento"
+		},
+		{
+			cmd: "!g-streamRefresh",
+			desc: "Reseta a lista de bots ativos/ignorados para as notificações de stream",
+			usage: ["!g-streamRefresh"],
+			category: "gerenciamento"
+		},
+		{
+			cmd: "!g-dossie",
+			desc: "Exibe o histórico de dossiês deste grupo",
+			usage: ["!g-dossie"],
+			category: "gerenciamento"
+		},
+		{
+			cmd: "!g-copiarCmds",
+			desc: "Copia os comandos do grupoOrigem pro grupoDestino",
+			usage: ["!g-copiarCmds"],
+			category: "gerenciamento"
+		},
+		{
+			cmd: "!g-regras",
+			desc: "Define, exibe ou remove as regras deste grupo",
+			usage: ["!g-regras", "!g-regras <texto>", "!g-regras (em resposta a uma mensagem)"],
+			category: "gerenciamento"
+		}
+	]
+};
+
+Management.helper = helper;
+
 module.exports = Management;
+module.exports.helper = helper;

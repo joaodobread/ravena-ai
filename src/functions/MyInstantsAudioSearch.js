@@ -7,19 +7,109 @@ const ReturnMessage = require("../models/ReturnMessage");
 // Cria novo logger
 const logger = new Logger("myinstants-audio");
 
+const DEFAULT_USER_AGENT =
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0";
+
+const REQUEST_HEADERS = {
+	"User-Agent": DEFAULT_USER_AGENT,
+	Accept: "*/*",
+	Referer: "https://www.myinstants.com/"
+};
+
+let browserClient;
+
+function isCloudflareChallenge(data) {
+	const html = data.toString("utf8", 0, 4096);
+	return /<title>\s*(?:Just a moment|Um momento|Attention Required)|_cf_chl_opt/i.test(html);
+}
+
+/**
+ * Usa uma conexão com TLS e HTTP de navegador quando o MyInstants bloqueia o Axios.
+ * @param {string} url
+ * @returns {Promise<{status: number, data: Buffer, contentType: string}>}
+ */
+async function fetchViaBrowser(url) {
+	if (!browserClient) {
+		const { Impit } = require("impit");
+		browserClient = new Impit({ browser: "chrome", timeout: 15000 });
+	}
+
+	const response = await browserClient.fetch(url, {
+		headers: { Referer: REQUEST_HEADERS.Referer }
+	});
+	if (response.status !== 200 && response.status !== 404) {
+		response.abort();
+		throw new Error(`MyInstants retornou HTTP ${response.status}`);
+	}
+
+	const data = Buffer.from(await response.arrayBuffer());
+	if (isCloudflareChallenge(data)) {
+		throw new Error("O MyInstants bloqueou a requisição com uma verificação do Cloudflare");
+	}
+	if (response.status === 200 && data.length === 0) {
+		throw new Error("O MyInstants retornou uma resposta vazia");
+	}
+
+	return {
+		status: response.status,
+		data,
+		contentType: response.headers.get("content-type") || ""
+	};
+}
+
+/**
+ * Faz requisição HTTP para o MyInstants com fallback para uma conexão de navegador
+ * a fim de contornar bloqueios de TLS/JA4 do Cloudflare no Node 20.
+ * @param {string} url
+ * @returns {Promise<{status: number, data: Buffer, contentType: string}>}
+ */
+async function fetchMyInstants(url) {
+	try {
+		const res = await axios.get(url, {
+			headers: REQUEST_HEADERS,
+			responseType: "arraybuffer",
+			timeout: 5000,
+			validateStatus: (s) => s < 500
+		});
+		if (res.status === 200 || res.status === 404) {
+			const data = Buffer.from(res.data);
+			if (!isCloudflareChallenge(data) && (res.status === 404 || data.length > 0)) {
+				return {
+					status: res.status,
+					data,
+					contentType: res.headers["content-type"] || ""
+				};
+			}
+		}
+	} catch (e) {
+		// Tenta a conexão de navegador se o Axios falhar ou for bloqueado.
+	}
+
+	return await fetchViaBrowser(url);
+}
+
 /**
  * Busca áudios no myinstants.com
  * @param {string} pesquisa
  * @returns {Promise<Array<{title: string, mp3: string}>>}
  */
 async function buscarAudios(pesquisa) {
-	const query = encodeURIComponent(pesquisa);
+	if (!pesquisa || typeof pesquisa !== "string" || !pesquisa.trim()) {
+		return [];
+	}
+
+	const query = encodeURIComponent(pesquisa.trim());
 	const base = "https://www.myinstants.com";
-	const url = `${base}/search/?name=${query}`;
+	const url = `${base}/en/search/?name=${query}`;
 
 	try {
-		const { data } = await axios.get(url);
-		const $ = cheerio.load(data);
+		const { data, status } = await fetchMyInstants(url);
+
+		if (status === 404 || !data || data.length === 0) {
+			return [];
+		}
+
+		const $ = cheerio.load(data.toString("utf8"));
 		const botoes = $(".instant");
 
 		const resultados = [];
@@ -27,8 +117,9 @@ async function buscarAudios(pesquisa) {
 		botoes.each((i, el) => {
 			const a = $(el).find("a.instant-link").first();
 			const title = a.text().trim();
-			const onclick = $(el).find("button").attr("onclick");
-			const match = onclick && onclick.match(/play\('([^']+)'/);
+			const playBtn = $(el).find("button.small-button, button[onclick*='play']").first();
+			const onclick = playBtn.attr("onclick") || $(el).find("button").attr("onclick");
+			const match = onclick && onclick.match(/play\(['"]([^'"]+)['"]/i);
 			const mp3 = match ? new URL(match[1], base).href : null;
 
 			if (mp3 && title) {
@@ -38,9 +129,49 @@ async function buscarAudios(pesquisa) {
 
 		return resultados;
 	} catch (err) {
-		logger.error("Erro ao buscar áudios:", err);
-		return [];
+		logger.error("Erro ao buscar áudios:", err.message || err);
+		throw err;
 	}
+}
+
+/**
+ * Baixa o áudio MP3 com headers de navegador e prepara o objeto de mídia
+ * @param {Object} bot
+ * @param {string} mp3Url
+ * @param {string} title
+ * @returns {Promise<Object>}
+ */
+async function baixarAudioComoMedia(bot, mp3Url, title) {
+	const { data, status, contentType } = await fetchMyInstants(mp3Url);
+
+	if (status !== 200 || !data || data.length === 0) {
+		throw new Error(`Falha ao baixar áudio: status ${status}`);
+	}
+	if (/text\/html|application\/xhtml\+xml/i.test(contentType)) {
+		throw new Error("O MyInstants retornou uma página HTML em vez do áudio");
+	}
+
+	const base64Data = data.toString("base64");
+	const mimetype = "audio/mpeg";
+	const safeName =
+		(title || "audio")
+			.replace(/[/\\?%*:|"<>]/g, "")
+			.slice(0, 50)
+			.trim() || "audio";
+	const filename = `${safeName}.mp3`;
+
+	if (bot && typeof bot.createMediaFromBase64 === "function") {
+		return await bot.createMediaFromBase64(base64Data, mimetype, filename);
+	}
+
+	return {
+		mimetype,
+		data: base64Data,
+		filename,
+		source: "base64",
+		isMessageMedia: true,
+		size: data.length
+	};
 }
 
 /**
@@ -55,7 +186,7 @@ async function audioCommand(bot, message, args, group) {
 	const chatId = message.group ?? message.author;
 
 	try {
-		if (args.length < 1) {
+		if (!args || args.length < 1) {
 			return new ReturnMessage({
 				chatId,
 				content: "🔇 Digite o nome do áudio para buscar no site MyInstants\n!audio nome do áudio",
@@ -66,12 +197,23 @@ async function audioCommand(bot, message, args, group) {
 			});
 		}
 
-		const termo = args.slice(0, -1).join(" ").trim();
 		const ultimoArg = args[args.length - 1];
-		const index = parseInt(ultimoArg);
-		const numeroInformado = !isNaN(index);
+		const index = parseInt(ultimoArg, 10);
+		const numeroInformado = args.length > 1 && !isNaN(index);
 
-		const query = numeroInformado ? termo : args.join(" ").trim();
+		const query = (numeroInformado ? args.slice(0, -1).join(" ") : args.join(" ")).trim();
+
+		if (!query) {
+			return new ReturnMessage({
+				chatId,
+				content: "🔇 Digite o nome do áudio para buscar no site MyInstants\n!audio nome do áudio",
+				options: {
+					quotedMessageId: message.origin?.id?._serialized,
+					goReply: message.origin
+				}
+			});
+		}
+
 		const resultados = await buscarAudios(query);
 
 		if (!resultados.length) {
@@ -111,9 +253,21 @@ async function audioCommand(bot, message, args, group) {
 			});
 		}
 
-		const audio = await bot.createMediaFromURL(resultado.mp3);
-
-		logger.info(`Enviando áudio: ${resultado.title}`);
+		logger.info(`Baixando e enviando áudio: ${resultado.title}`);
+		let audio;
+		try {
+			audio = await baixarAudioComoMedia(bot, resultado.mp3, resultado.title);
+		} catch (downErr) {
+			logger.error(`Erro ao baixar áudio "${resultado.title}":`, downErr.message || downErr);
+			return new ReturnMessage({
+				chatId,
+				content: `❌ Não foi possível baixar o áudio "${resultado.title}". Tente escolher outro número.`,
+				options: {
+					quotedMessageId: message.origin?.id?._serialized,
+					goReply: message.origin
+				}
+			});
+		}
 
 		return [
 			new ReturnMessage({
@@ -146,6 +300,7 @@ async function audioCommand(bot, message, args, group) {
 const commands = [
 	new Command({
 		name: "audio",
+		aliases: ["áudio", "som"],
 		description: "Busca um áudio no site MyInstants (não é música)",
 		usage: "!audio <nome_do_áudio> <número>",
 		category: "busca",
@@ -168,11 +323,47 @@ const commands = [
 			error: "❌"
 		},
 		method: audioCommand
+	}),
+	new Command({
+		name: "som",
+		hidden: true,
+		description: "Busca um áudio no site MyInstants",
+		usage: "!som <nome_do_áudio> <número>",
+		category: "busca",
+		reactions: {
+			before: process.env.LOADING_EMOJI ?? "⌛️",
+			after: "🔊",
+			error: "❌"
+		},
+		method: audioCommand
 	})
 ];
 
 // Exporta o módulo
+const helper = {
+	about: "Pesquisa e envio instantâneo de áudios e memes do MyInstants",
+	implementation:
+		"Faz web scraping e buscas no site MyInstants, baixa o arquivo de áudio MP3 e envia como mensagem de voz / áudio",
+	tags: "myinstants,audios,memes,sons,efeitos sonoros,audio,som",
+	cmds: [
+		{
+			cmd: "!audio",
+			desc: "Pesquisa e envia um áudio do site MyInstants",
+			usage: ["!audio vinheta globo", "!audio vinheta globo 1", "!audio acertou mizeravi 1"],
+			category: "busca"
+		},
+		{
+			cmd: "!som",
+			desc: "Pesquisa e envia um áudio do site MyInstants (alias para !audio)",
+			usage: ["!som vinheta globo", "!som acertou mizeravi 1"],
+			category: "busca"
+		}
+	]
+};
+
 module.exports = {
+	helper,
 	commands,
-	buscarAudios
+	buscarAudios,
+	baixarAudioComoMedia
 };

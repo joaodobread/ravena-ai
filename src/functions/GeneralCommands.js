@@ -19,7 +19,7 @@ async function pingCommand(bot, message, args, group) {
 		message.responseTime ??
 		bot.getCurrentTimestamp() -
 			(message.origin.timestamp ?? message.origin.messageTimestamp ?? bot.getCurrentTimestamp());
-	console.log(message.origin);
+	logger.debug("Message origin:", message.origin);
 	logger.debug(`Executando comando ping para ${chatId}`);
 
 	return new ReturnMessage({
@@ -178,10 +178,11 @@ async function conviteCommand(bot, message, args, group) {
 		return todas;
 	} catch (error) {
 		logger.warn("Erro ao ler invites_xxx.txt:", error);
+		const botName = bot?.nomeExibir || "ravenabot";
 		return [
 			new ReturnMessage({
 				chatId,
-				content: `🐦‍⬛ Então você quer a *ravenabot* no seu grupo?
+				content: `🐦‍⬛ Então você quer a *${botName}* no seu grupo?
 Pra começar, me envie o *LINK*, apenas o _LINK_ do seu grupo.
 Se você enviar um convite tradicional, não vai adiantar de nada, pois não consigo aceitar por aqui.
 Após o link, siga as instruções do bot, enviando uma mensagem explicando o motivo de querer o bot no seu grupo.`
@@ -457,9 +458,10 @@ async function statusCommand(bot, message, args, group) {
 			const servicesData = await Status.getServicesStatus();
 
 			const getEmoji = (status) => {
-				if (status === "up") return "🟢";
-				if (status === "backup") return "🟠";
-				if (status === "down") return "🔴";
+				const s = typeof status === "object" && status !== null ? status.status : status;
+				if (s === "up") return "🟢";
+				if (s === "backup") return "🟠";
+				if (s === "down") return "🔴";
 				return "⚫";
 			};
 
@@ -662,4 +664,47 @@ const commands = [
 // Registra os comandos sendo exportados
 //logger.debug(`Exportando ${commands.length} comandos:`, commands.map(cmd => cmd.name));
 
-module.exports = { commands, getUserNickname };
+const helper = {
+	about: "Comandos gerais e utilitários essenciais do bot (status, apelido, avisos, etc.)",
+	implementation:
+		"Obtém métricas do sistema operacional, gerencia apelidos no banco e coordena mensagens de aviso",
+	tags: "geral,status,sistema,ping,apelido,avisos,utilidades",
+	cmds: [
+		{
+			cmd: "!status",
+			desc: "Exibe o status do bot, tempo online, memória e latência",
+			usage: ["!status"],
+			category: "geral"
+		},
+		{
+			cmd: "!avisos",
+			desc: "Exibe o canal de avisos e novidades da comunidade do bot",
+			usage: ["!avisos"],
+			category: "geral"
+		},
+		{
+			cmd: "!apelido",
+			desc: "Define ou altera o seu apelido de exibição no grupo",
+			usage: ["!apelido Moothz", "!apelido Rei do Zap"],
+			category: "geral"
+		},
+		{
+			cmd: "!codigo",
+			desc: "Exibe o link do repositório de código-fonte do bot",
+			usage: ["!codigo"],
+			category: "geral"
+		},
+		{
+			cmd: "!atencao",
+			desc: "Envia um alerta sonoro/visual para chamar a atenção no chat",
+			usage: ["!atencao"],
+			category: "geral"
+		}
+	]
+};
+
+module.exports = {
+	helper,
+	commands,
+	getUserNickname
+};

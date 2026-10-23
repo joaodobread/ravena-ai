@@ -777,4 +777,52 @@ const commands = [
 	})
 ];
 
-module.exports = { commands, formatarRetornoPlaca, consultarFipeHistory };
+const helper = {
+	about: "Consulta de veículos por placa no padrão brasileiro e Mercosul com tabela FIPE",
+	implementation:
+		"Consulta APIs veiculares públicas para obter modelo, ano, cor, cidade/UF e histórico de preços da tabela FIPE",
+	tags: "placa,carro,moto,veiculo,fipe,consulta,automovel",
+	cmds: [
+		{
+			cmd: "!placa",
+			desc: "Consulta dados e histórico de preço FIPE de um veículo pela placa",
+			usage: ["!placa ABC1234", "!placa ABC1D23"],
+			category: "utilidades"
+		}
+	]
+};
+
+/**
+ * Consulta informações completas de veículo por placa via SiPt ou FIPE
+ * @param {string} placaInput - Placa do veículo
+ * @returns {Promise<string>}
+ */
+async function fetchVehicleInfo(placaInput) {
+	if (!placaInput || typeof placaInput !== "string" || placaInput.trim().length === 0) {
+		return "Por favor, informe uma placa de veículo válida (ex: ABC1234 ou ABC1D23).";
+	}
+
+	const { valid, placa } = validarPlaca(placaInput);
+	if (!valid) {
+		return `Placa "${placaInput}" inválida. Formato esperado: padrão antigo (ABC1234) ou Mercosul (ABC1D23).`;
+	}
+
+	try {
+		const resultados = await getSiPtPlaca(placa, "llm-assistant");
+		if (resultados && resultados.length > 0 && resultados[0].msg) {
+			return resultados[0].msg;
+		}
+		return `Não foi possível obter dados para o veículo com placa "${placa}".`;
+	} catch (err) {
+		logger.error(`Erro ao consultar veículo para placa ${placaInput}:`, err.message);
+		return `Erro ao consultar veículo para a placa "${placaInput}": ${err.message}`;
+	}
+}
+
+module.exports = {
+	helper,
+	commands,
+	formatarRetornoPlaca,
+	consultarFipeHistory,
+	fetchVehicleInfo
+};

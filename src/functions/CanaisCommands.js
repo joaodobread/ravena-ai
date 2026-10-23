@@ -1,0 +1,1988 @@
+const fs = require("fs");
+const path = require("path");
+const chrono = require("chrono-node");
+const mime = require("mime-types");
+const Logger = require("../utils/Logger");
+const Command = require("../models/Command");
+const ReturnMessage = require("../models/ReturnMessage");
+const Database = require("../utils/Database");
+const GroupContextHelper = require("../utils/GroupContextHelper");
+
+const logger = new Logger("canais-commands");
+const database = Database.getInstance();
+const DB_NAME = "canais";
+const MAX_CANAIS_POR_GRUPO = 7;
+const BACKFILL_COUNT = 30;
+
+// Diretório base para mídias
+const MEDIA_DIR = path.join(__dirname, "../../data/media/canais");
+if (!fs.existsSync(MEDIA_DIR)) {
+	fs.mkdirSync(MEDIA_DIR, { recursive: true });
+}
+
+// Inicialização do Banco SQLite
+database.getSQLiteDb(
+	DB_NAME,
+	`
+  CREATE TABLE IF NOT EXISTS canais (
+    jid TEXT PRIMARY KEY,
+    invite TEXT,
+    link TEXT,
+    nome_oficial TEXT,
+    descricao TEXT,
+    criado_em INTEGER
+  );
+
+  CREATE TABLE IF NOT EXISTS canal_grupos (
+    group_id TEXT NOT NULL,
+    canal_jid TEXT NOT NULL,
+    apelido TEXT NOT NULL,
+    apelido_normalizado TEXT NOT NULL,
+    tipos_midia TEXT,
+    encaminhar INTEGER DEFAULT 0,
+    header INTEGER DEFAULT 1,
+    criado_por TEXT,
+    criado_em INTEGER,
+    PRIMARY KEY (group_id, canal_jid),
+    UNIQUE (group_id, apelido_normalizado)
+  );
+
+  CREATE TABLE IF NOT EXISTS canal_posts (
+    canal_jid TEXT NOT NULL,
+    msg_id TEXT NOT NULL,
+    ts INTEGER,
+    dia TEXT NOT NULL,
+    tipo TEXT NOT NULL,
+    texto TEXT,
+    arquivo TEXT,
+    mimetype TEXT,
+    PRIMARY KEY (canal_jid, msg_id)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_canal_posts_dia ON canal_posts(canal_jid, dia);
+  CREATE INDEX IF NOT EXISTS idx_canal_grupos_group ON canal_grupos(group_id);
+`,
+	true
+);
+
+// Migração retroativa para tabelas já existentes
+(async () => {
+	try {
+		await database.dbRun(
+			DB_NAME,
+			"ALTER TABLE canal_grupos ADD COLUMN encaminhar INTEGER DEFAULT 0"
+		);
+	} catch (e) {
+		// Coluna já existe
+	}
+	try {
+		await database.dbRun(DB_NAME, "ALTER TABLE canal_grupos ADD COLUMN header INTEGER DEFAULT 1");
+	} catch (e) {
+		// Coluna já existe
+	}
+})();
+
+// Cache em memória dos canais monitorados (JID -> Set de tipos permitidos em todos os grupos ou 'all')
+let monitoredChannelsCache = new Map();
+let cacheLoaded = false;
+
+// Controle de intervalo de header para mídias sem legenda (áudio/sticker): no máximo 1 header a cada 15 min
+const HEADER_COOLDOWN_MS = 15 * 60 * 1000;
+const lastChannelForwardActivity = new Map(); // `${chatId}:${canalJid}` -> timestamp ms
+
+function resetForwardActivity() {
+	lastChannelForwardActivity.clear();
+}
+
+/**
+ * Atualiza o cache em memória dos canais monitorados
+ */
+async function refreshTrackedChannelsCache() {
+	try {
+		const rows = await database.dbAll(
+			DB_NAME,
+			"SELECT DISTINCT canal_jid, tipos_midia, encaminhar FROM canal_grupos"
+		);
+		const newMap = new Map();
+
+		for (const row of rows) {
+			if (!newMap.has(row.canal_jid)) {
+				newMap.set(row.canal_jid, new Set());
+			}
+			const set = newMap.get(row.canal_jid);
+			if (!row.tipos_midia) {
+				set.add("all");
+			} else {
+				try {
+					const types = JSON.parse(row.tipos_midia);
+					if (Array.isArray(types)) {
+						types.forEach((t) => set.add(t));
+					}
+				} catch (e) {
+					set.add("all");
+				}
+			}
+		}
+
+		monitoredChannelsCache = newMap;
+		cacheLoaded = true;
+	} catch (error) {
+		logger.error("Erro ao carregar cache de canais monitorados:", error);
+	}
+}
+
+// Inicializa o cache
+refreshTrackedChannelsCache();
+
+/**
+ * Normaliza strings para busca/comparação (sem acentos, minúsculas, trim)
+ */
+function normalizeString(str) {
+	if (!str || typeof str !== "string") return "";
+	return str
+		.toLowerCase()
+		.normalize("NFD")
+		.replace(/[\u0300-\u036f]/g, "")
+		.trim();
+}
+
+/**
+ * Gera string de data atual (YYYY-MM-DD) no fuso de Brasília
+ */
+function getTodayBrasilia(referenceDate = new Date()) {
+	const dtf = new Intl.DateTimeFormat("en-US", {
+		timeZone: "America/Sao_Paulo",
+		year: "numeric",
+		month: "2-digit",
+		day: "2-digit"
+	});
+	const parts = dtf.formatToParts(referenceDate);
+	const map = {};
+	for (const p of parts) {
+		map[p.type] = p.value;
+	}
+	return `${map.year}-${map.month}-${map.day}`;
+}
+
+/**
+ * Converte timestamp (segundos ou ms ou Date) para YYYY-MM-DD em Brasília
+ */
+function timestampToDayBrasilia(ts) {
+	let date;
+	if (typeof ts === "number") {
+		date = ts < 10000000000 ? new Date(ts * 1000) : new Date(ts);
+	} else if (typeof ts === "string") {
+		const num = Number(ts);
+		date = isNaN(num) ? new Date(ts) : num < 10000000000 ? new Date(num * 1000) : new Date(num);
+	} else if (ts instanceof Date) {
+		date = ts;
+	} else {
+		date = new Date();
+	}
+
+	return getTodayBrasilia(date);
+}
+
+/**
+ * Normaliza os tipos de mídias informados pelo usuário
+ * Tipos canônicos: texto, imagem, audio, sticker, video, documento
+ */
+function parseMediaTypes(typesStr) {
+	if (!typesStr || typeof typesStr !== "string" || typesStr.trim() === "") {
+		return null;
+	}
+
+	const rawParts = typesStr.split(/\s*,\s*/);
+	const validMap = {
+		texto: "texto",
+		text: "texto",
+		chat: "texto",
+		imagem: "imagem",
+		image: "imagem",
+		img: "imagem",
+		foto: "imagem",
+		photo: "imagem",
+		audio: "audio",
+		áudio: "audio",
+		som: "audio",
+		voice: "audio",
+		voz: "audio",
+		sticker: "sticker",
+		figurinha: "sticker",
+		fig: "sticker",
+		stk: "sticker",
+		video: "video",
+		vídeo: "video",
+		vid: "video",
+		gif: "video",
+		documento: "documento",
+		doc: "documento",
+		arquivo: "documento",
+		file: "documento"
+	};
+
+	const result = new Set();
+	const invalid = [];
+
+	for (const part of rawParts) {
+		const clean = normalizeString(part);
+		if (!clean) continue;
+		if (clean === "todas" || clean === "todos" || clean === "all") {
+			return null;
+		}
+		if (validMap[clean]) {
+			result.add(validMap[clean]);
+		} else {
+			invalid.push(part.trim());
+		}
+	}
+
+	if (invalid.length > 0) {
+		return {
+			valid: false,
+			error: `Tipos de mídia inválidos: *${invalid.join(", ")}*.\nTipos suportados: *texto, imagem, audio, sticker, video, documento*.`
+		};
+	}
+
+	return {
+		valid: true,
+		types: Array.from(result)
+	};
+}
+
+/**
+ * Extrai o nome (apelido) e o link do canal a partir dos argumentos
+ */
+function parseNameAndLink(inputStr) {
+	if (!inputStr || typeof inputStr !== "string") {
+		return null;
+	}
+
+	const linkRegex =
+		/(https?:\/\/(?:www\.)?whatsapp\.com\/channel\/[a-zA-Z0-9_-]+|whatsapp\.com\/channel\/[a-zA-Z0-9_-]+)/i;
+	const match = inputStr.match(linkRegex);
+
+	if (!match) {
+		if (inputStr.includes("chat.whatsapp.com")) {
+			return {
+				error:
+					"❌ O link informado é de um grupo (chat.whatsapp.com).\nUse um link de canal do WhatsApp: https://whatsapp.com/channel/..."
+			};
+		}
+		return {
+			error:
+				"❌ Link de canal não encontrado!\nFormato esperado: `!canal-seguir <nome> https://whatsapp.com/channel/...`"
+		};
+	}
+
+	const rawLink = match[0];
+	const fullLink = rawLink.startsWith("http") ? rawLink : `https://${rawLink}`;
+
+	// Nome é tudo antes do link (ou após se inverterem)
+	const beforeLink = inputStr.substring(0, match.index).trim();
+	const afterLink = inputStr.substring(match.index + rawLink.length).trim();
+	const rawName = beforeLink || afterLink;
+
+	return {
+		link: fullLink,
+		rawName: rawName || null
+	};
+}
+
+/**
+ * Simplifica o nome oficial do canal quando o usuário não informa um nome personalizado:
+ * - Apenas alfanumérico (letras e números)
+ * - Espaços viram "_"
+ * - Máximo de 3 palavras
+ */
+function simplifyChannelName(nomeOficial, fallback = "canal") {
+	if (!nomeOficial || typeof nomeOficial !== "string") {
+		return fallback;
+	}
+
+	// Remove acentos para garantir caracteres limpos
+	const semAcentos = nomeOficial.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+
+	// Mantém apenas alfanumérico e espaços (remove pontuação, emojis e símbolos)
+	const apenasAlfaEspaco = semAcentos.replace(/[^a-zA-Z0-9\s]/g, " ");
+
+	// Divide em palavras e pega até 3
+	const palavras = apenasAlfaEspaco
+		.trim()
+		.split(/\s+/)
+		.filter((w) => w.length > 0)
+		.slice(0, 3);
+
+	if (palavras.length === 0) {
+		return fallback;
+	}
+
+	return palavras.join("_");
+}
+
+/**
+ * Encontra o canal que casa com o apelido informado, suportando tanto espaços quanto underscores
+ */
+function matchCanalInGroup(canaisDoGrupo, fullText) {
+	if (!Array.isArray(canaisDoGrupo) || canaisDoGrupo.length === 0 || !fullText) {
+		return { matchedCanal: null, remainder: null };
+	}
+
+	const fullNorm = normalizeString(fullText);
+	const fullNormSpace = fullNorm.replace(/_/g, " ");
+
+	// Ordena por comprimento decrescente para casar nomes mais longos primeiro
+	const sorted = [...canaisDoGrupo].sort(
+		(a, b) => b.apelido_normalizado.length - a.apelido_normalizado.length
+	);
+
+	for (const c of sorted) {
+		const cNorm = c.apelido_normalizado;
+		const cNormSpace = cNorm.replace(/_/g, " ");
+
+		// 1. Casa exato
+		if (fullNorm === cNorm || fullNormSpace === cNormSpace) {
+			return { matchedCanal: c, remainder: null };
+		}
+
+		// 2. Casa prefixo com espaço ou underscore
+		if (fullNorm.startsWith(`${cNorm} `) || fullNorm.startsWith(`${cNorm}_`)) {
+			const remainder = fullText.substring(c.apelido.length).trim();
+			return { matchedCanal: c, remainder: remainder || null };
+		}
+		if (fullNormSpace.startsWith(`${cNormSpace} `)) {
+			const remainder = fullText.substring(c.apelido.length).trim();
+			return { matchedCanal: c, remainder: remainder || null };
+		}
+	}
+
+	// 3. Fallback: tenta casar pelo primeiro argumento
+	const firstArg = fullText.split(/\s+/)[0];
+	const firstArgNorm = normalizeString(firstArg);
+	const firstArgNormSpace = firstArgNorm.replace(/_/g, " ");
+
+	for (const c of sorted) {
+		const cNorm = c.apelido_normalizado;
+		const cNormSpace = cNorm.replace(/_/g, " ");
+		if (firstArgNorm === cNorm || firstArgNormSpace === cNormSpace) {
+			const remainder = fullText.substring(firstArg.length).trim();
+			return { matchedCanal: c, remainder: remainder || null };
+		}
+	}
+
+	return { matchedCanal: null, remainder: null };
+}
+
+/**
+ * Parser de data flexível (hoje, ontem, DD/MM/YYYY, YYYY-MM-DD, linguagem natural)
+ */
+function parseDateInput(dateExpression) {
+	if (!dateExpression || typeof dateExpression !== "string") {
+		return getTodayBrasilia();
+	}
+
+	const lowerExpr = normalizeString(dateExpression);
+
+	if (lowerExpr === "hoje") {
+		return getTodayBrasilia();
+	}
+	if (lowerExpr === "ontem") {
+		return getTodayBrasilia(new Date(Date.now() - 24 * 60 * 60 * 1000));
+	}
+	if (/^\d{4}-\d{2}-\d{2}$/.test(dateExpression.trim())) {
+		return dateExpression.trim();
+	}
+
+	// DD/MM/YYYY ou DD-MM-YYYY ou DD/MM
+	const dmyMatch = dateExpression.trim().match(/^(\d{1,2})[/.-](\d{1,2})(?:[/.-](\d{4}))?$/);
+	if (dmyMatch) {
+		const day = dmyMatch[1].padStart(2, "0");
+		const month = dmyMatch[2].padStart(2, "0");
+		const year = dmyMatch[3] || getTodayBrasilia().split("-")[0];
+		return `${year}-${month}-${day}`;
+	}
+
+	// Extração textual "dd de mês de yyyy"
+	const textDateRegex = /(\d{1,2})\s+de\s+([\wÇç]+)(?:\s+de\s+(\d{4}))?/i;
+	const matchText = dateExpression.match(textDateRegex);
+	if (matchText) {
+		const monthMap = {
+			janeiro: "01",
+			fevereiro: "02",
+			março: "03",
+			marco: "03",
+			abril: "04",
+			maio: "05",
+			junho: "06",
+			julho: "07",
+			agosto: "08",
+			setembro: "09",
+			outubro: "10",
+			novembro: "11",
+			dezembro: "12"
+		};
+		const day = matchText[1].padStart(2, "0");
+		const month = monthMap[matchText[2].toLowerCase()];
+		const year = matchText[3] || getTodayBrasilia().split("-")[0];
+		if (month) {
+			return `${year}-${month}-${day}`;
+		}
+	}
+
+	// Chrono natural language
+	const defaultDate = getTodayBrasilia();
+	const [dYear, dMonth, dDay] = defaultDate.split("-").map(Number);
+	const referenceDate = new Date(Date.UTC(dYear, dMonth - 1, dDay, 12, 0, 0));
+	const parsedDate = chrono.pt.parse(dateExpression, referenceDate, { forwardDate: false });
+
+	if (parsedDate && parsedDate.length > 0) {
+		const resultDate = parsedDate[0].start.date();
+		const rYear = resultDate.getUTCFullYear();
+		const rMonth = String(resultDate.getUTCMonth() + 1).padStart(2, "0");
+		const rDay = String(resultDate.getUTCDate()).padStart(2, "0");
+		return `${rYear}-${rMonth}-${rDay}`;
+	}
+
+	return null;
+}
+
+/**
+ * Normaliza o tipo de mensagem para salvar no banco
+ */
+function classifyMessageType(msgType) {
+	if (!msgType) return "texto";
+	const lower = msgType.toLowerCase();
+	if (lower.includes("image") || lower === "imagem") return "imagem";
+	if (lower.includes("audio") || lower === "ptt" || lower === "voz") return "audio";
+	if (lower.includes("video") || lower === "gif") return "video";
+	if (lower.includes("sticker")) return "sticker";
+	if (lower.includes("document") || lower === "documento") return "documento";
+	return "texto";
+}
+
+/**
+ * Salva um arquivo de mídia no diretório seguro de canais
+ */
+function saveMediaFile(canalJid, msgId, bufferOrBase64, extension) {
+	try {
+		const safeJid = canalJid.replace(/[^a-zA-Z0-9_-]/g, "_");
+		const channelDir = path.join(MEDIA_DIR, safeJid);
+		if (!fs.existsSync(channelDir)) {
+			fs.mkdirSync(channelDir, { recursive: true });
+		}
+
+		const ext = extension ? extension.replace(/^\./, "") : "bin";
+		const fileName = `${msgId}.${ext}`;
+		const targetPath = path.join(channelDir, fileName);
+
+		if (Buffer.isBuffer(bufferOrBase64)) {
+			fs.writeFileSync(targetPath, bufferOrBase64);
+		} else if (typeof bufferOrBase64 === "string") {
+			const cleanBase64 = bufferOrBase64.replace(/^data:.*?;base64,/, "");
+			fs.writeFileSync(targetPath, Buffer.from(cleanBase64, "base64"));
+		}
+
+		return path.relative(path.join(__dirname, "../.."), targetPath);
+	} catch (error) {
+		logger.error("Erro ao salvar arquivo de mídia de canal:", error);
+		return null;
+	}
+}
+
+/**
+ * Puxa e salva as últimas 30 mensagens de um canal recém-seguido
+ */
+async function backfillRecentMessages(bot, canalJid, tiposMidiaArray = null) {
+	try {
+		if (!bot?.apiClient) return 0;
+		logger.info(
+			`[Canais] Iniciando backfill de ${BACKFILL_COUNT} mensagens para canal ${canalJid}...`
+		);
+
+		const res = await bot.apiClient.post("/newsletter/messages", {
+			jid: canalJid,
+			count: BACKFILL_COUNT
+		});
+
+		const messages = res?.data || res?.messages || [];
+		if (!Array.isArray(messages) || messages.length === 0) {
+			logger.info(`[Canais] Nenhuma mensagem retornada no backfill de ${canalJid}.`);
+			return 0;
+		}
+
+		let savedCount = 0;
+		for (const item of messages) {
+			try {
+				const msgId = item.MessageID || item.id;
+				if (!msgId) continue;
+
+				// Verifica se já existe
+				const existing = await database.dbGet(
+					DB_NAME,
+					"SELECT 1 FROM canal_posts WHERE canal_jid = ? AND msg_id = ?",
+					[canalJid, msgId]
+				);
+				if (existing) continue;
+
+				const ts = item.Timestamp ? new Date(item.Timestamp).getTime() : Date.now();
+				const dia = timestampToDayBrasilia(ts);
+				const rawMsg = item.Message || {};
+
+				// Identifica tipo e conteúdo
+				let tipo = "texto";
+				let texto = "";
+				let mediaMsg = null;
+				let mimetype = null;
+
+				if (rawMsg.imageMessage) {
+					tipo = "imagem";
+					mediaMsg = rawMsg.imageMessage;
+					texto = rawMsg.imageMessage.caption || "";
+					mimetype = rawMsg.imageMessage.mimetype || "image/jpeg";
+				} else if (rawMsg.audioMessage) {
+					tipo = "audio";
+					mediaMsg = rawMsg.audioMessage;
+					mimetype = rawMsg.audioMessage.mimetype || "audio/ogg";
+				} else if (rawMsg.videoMessage) {
+					tipo = "video";
+					mediaMsg = rawMsg.videoMessage;
+					texto = rawMsg.videoMessage.caption || "";
+					mimetype = rawMsg.videoMessage.mimetype || "video/mp4";
+				} else if (rawMsg.stickerMessage) {
+					tipo = "sticker";
+					mediaMsg = rawMsg.stickerMessage;
+					mimetype = rawMsg.stickerMessage.mimetype || "image/webp";
+				} else if (rawMsg.documentMessage) {
+					tipo = "documento";
+					mediaMsg = rawMsg.documentMessage;
+					texto = rawMsg.documentMessage.caption || rawMsg.documentMessage.fileName || "";
+					mimetype = rawMsg.documentMessage.mimetype || "application/octet-stream";
+				} else {
+					tipo = "texto";
+					texto =
+						rawMsg.conversation ||
+						rawMsg.extendedTextMessage?.text ||
+						item.body ||
+						item.content ||
+						"";
+				}
+
+				// Enquetes ou mensagens especiais vazias
+				if (rawMsg.pollCreationMessage || rawMsg.pollCreationMessageV3) {
+					continue; // Ignora enquetes conforme pedido
+				}
+
+				let arquivo = null;
+				const shouldDownloadMedia =
+					mediaMsg && (!tiposMidiaArray || tiposMidiaArray.includes(tipo));
+
+				if (shouldDownloadMedia) {
+					try {
+						const dlRes = await bot.apiClient.post("/message/downloadmedia", {
+							message: rawMsg
+						});
+						if (dlRes?.data?.base64) {
+							const ext = mime.extension(mimetype) || (tipo === "sticker" ? "webp" : "bin");
+							arquivo = saveMediaFile(canalJid, msgId, dlRes.data.base64, ext);
+						}
+					} catch (dlErr) {
+						logger.warn(
+							`[Canais] Falha no download de mídia do post ${msgId}: ${dlErr.message || dlErr}`
+						);
+					}
+				}
+
+				await database.dbRun(
+					DB_NAME,
+					`INSERT OR IGNORE INTO canal_posts (canal_jid, msg_id, ts, dia, tipo, texto, arquivo, mimetype)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+					[canalJid, msgId, ts, dia, tipo, texto, arquivo, mimetype]
+				);
+
+				savedCount++;
+			} catch (itemErr) {
+				logger.error(`[Canais] Erro ao processar mensagem individual do backfill:`, itemErr);
+			}
+		}
+
+		logger.info(`[Canais] Backfill concluído para ${canalJid}: ${savedCount} mensagens salvas.`);
+		return savedCount;
+	} catch (error) {
+		logger.error(`[Canais] Erro ao executar backfill de ${canalJid}:`, error);
+		return 0;
+	}
+}
+
+/**
+ * Detector de mensagens de canais invocado pelo EventHandler
+ */
+async function detectPost(bot, message) {
+	try {
+		if (!message || !message.isNewsletter) return false;
+
+		const channelJid = message.from;
+		if (!channelJid) return false;
+
+		// Ignora se não houver canais no cache ou se este canal não for monitorado
+		if (!cacheLoaded) await refreshTrackedChannelsCache();
+		if (!monitoredChannelsCache.has(channelJid)) {
+			return false;
+		}
+
+		const msgId = message.id || message.origin?.id?._serialized_v3 || message.origin?.id?.id;
+		if (!msgId) return false;
+
+		// Deduplicação
+		const existing = await database.dbGet(
+			DB_NAME,
+			"SELECT 1 FROM canal_posts WHERE canal_jid = ? AND msg_id = ?",
+			[channelJid, msgId]
+		);
+		if (existing) return true;
+
+		const ts = message.timestamp ? Number(message.timestamp) * 1000 : Date.now();
+		const dia = timestampToDayBrasilia(ts);
+		const tipo = classifyMessageType(message.type);
+
+		// Enquetes: ignora
+		if (
+			message.goMessageData?.pollCreationMessage ||
+			message.goMessageData?.pollCreationMessageV2 ||
+			message.goMessageData?.pollCreationMessageV3 ||
+			message.goMessageData?.Message?.pollCreationMessage ||
+			message.goMessageData?.Message?.pollCreationMessageV2 ||
+			message.goMessageData?.Message?.pollCreationMessageV3 ||
+			message.type === "poll"
+		) {
+			return false;
+		}
+
+		// Extração segura de texto (garante que nunca seja um objeto ou não-string)
+		let postTexto = "";
+		if (typeof message.caption === "string" && message.caption.trim()) {
+			postTexto = message.caption;
+		} else if (typeof message.body === "string" && message.body.trim()) {
+			postTexto = message.body;
+		} else if (typeof message.content === "string" && message.content.trim()) {
+			postTexto = message.content;
+		}
+
+		let arquivo = null;
+		let mimetype = null;
+
+		// Verifica se algum grupo quer essa mídia
+		const allowedSet = monitoredChannelsCache.get(channelJid);
+		const wantsMedia =
+			message.hasMedia && allowedSet && (allowedSet.has("all") || allowedSet.has(tipo));
+
+		if (wantsMedia && typeof message.downloadMedia === "function") {
+			try {
+				const media = await message.downloadMedia();
+				if (media && (media.data || media.filePath)) {
+					mimetype = media.mimetype || null;
+					const ext =
+						mime.extension(mimetype) ||
+						(media.filename ? path.extname(media.filename) : null) ||
+						(tipo === "sticker" ? "webp" : "bin");
+
+					if (media.filePath && fs.existsSync(media.filePath)) {
+						const safeJid = channelJid.replace(/[^a-zA-Z0-9_-]/g, "_");
+						const channelDir = path.join(MEDIA_DIR, safeJid);
+						if (!fs.existsSync(channelDir)) fs.mkdirSync(channelDir, { recursive: true });
+						const targetPath = path.join(channelDir, `${msgId}.${ext.replace(/^\./, "")}`);
+						fs.copyFileSync(media.filePath, targetPath);
+						arquivo = path.relative(path.join(__dirname, "../.."), targetPath);
+					} else if (media.data) {
+						arquivo = saveMediaFile(channelJid, msgId, media.data, ext);
+					}
+				}
+			} catch (downloadErr) {
+				logger.error(
+					`[Canais] Erro ao baixar mídia do post ${msgId} de ${channelJid}:`,
+					downloadErr
+				);
+			}
+		}
+
+		await database.dbRun(
+			DB_NAME,
+			`INSERT OR IGNORE INTO canal_posts (canal_jid, msg_id, ts, dia, tipo, texto, arquivo, mimetype)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			[channelJid, msgId, ts, dia, tipo, postTexto, arquivo || null, mimetype || null]
+		);
+
+		logger.info(`[Canais] Post ${msgId} capturado de ${channelJid} (tipo: ${tipo}, dia: ${dia})`);
+
+		// Encaminhamento automático em tempo real para grupos com encaminhar = 1
+		try {
+			const forwardingGroups = await database.dbAll(
+				DB_NAME,
+				"SELECT group_id, apelido, tipos_midia, header FROM canal_grupos WHERE canal_jid = ? AND encaminhar = 1",
+				[channelJid]
+			);
+
+			if (forwardingGroups && forwardingGroups.length > 0) {
+				const postData = {
+					canal_jid: channelJid,
+					msg_id: msgId,
+					ts,
+					dia,
+					tipo,
+					texto: postTexto,
+					arquivo,
+					mimetype
+				};
+
+				for (const grp of forwardingGroups) {
+					try {
+						if (grp.tipos_midia) {
+							const allowed = JSON.parse(grp.tipos_midia);
+							if (Array.isArray(allowed) && !allowed.includes(tipo)) {
+								continue;
+							}
+						}
+
+						const showHeader = grp.header !== 0;
+
+						const activityKey = `${grp.group_id}:${channelJid}`;
+						const lastActivity = lastChannelForwardActivity.get(activityKey) || 0;
+						const now = Date.now();
+						const elapsed = now - lastActivity;
+
+						const isNoCaptionMedia = tipo === "audio" || tipo === "sticker";
+						const needsHeader =
+							showHeader && isNoCaptionMedia && (!lastActivity || elapsed > HEADER_COOLDOWN_MS);
+
+						// Atualiza o timestamp de atividade para este canal neste grupo
+						lastChannelForwardActivity.set(activityKey, now);
+
+						const postReturnMsg = await createPostReturnMessage(
+							bot,
+							grp.group_id,
+							postData,
+							grp.apelido,
+							true,
+							{ includeHeader: needsHeader, showHeader }
+						);
+
+						if (postReturnMsg && typeof bot.sendReturnMessages === "function") {
+							const msgsToSend = Array.isArray(postReturnMsg) ? postReturnMsg : [postReturnMsg];
+							for (let idx = 0; idx < msgsToSend.length; idx++) {
+								if (!msgsToSend[idx].delay) {
+									msgsToSend[idx].delay = idx === 0 ? 500 : 1000;
+								}
+							}
+							await bot.sendReturnMessages(msgsToSend);
+							logger.info(
+								`[Canais] Post ${msgId} encaminhado para grupo ${grp.group_id} (${grp.apelido})`
+							);
+						}
+					} catch (forwardErr) {
+						logger.error(
+							`[Canais] Erro ao encaminhar post ${msgId} para grupo ${grp.group_id}:`,
+							forwardErr
+						);
+					}
+				}
+			}
+		} catch (fwdErr) {
+			logger.error("[Canais] Erro no fluxo de encaminhamento:", fwdErr);
+		}
+
+		return true;
+	} catch (error) {
+		logger.error("[Canais] Erro ao detectar postagem de canal:", error);
+		return false;
+	}
+}
+
+/**
+ * Constrói array de ReturnMessage estruturadas com a regra de agrupamento de canal-ver:
+ * - Se < 4 posts: mensagens separadas
+ * - Se 4 a 10 posts: agrupa a cada 3 com '------------'
+ * - Se > 10 posts: agrupa a cada 10
+ */
+async function buildGroupedReturnMessages(
+	bot,
+	chatId,
+	posts,
+	apelido,
+	diaFormatado,
+	canalJid = null,
+	allowedTypes = null,
+	showHeader = true
+) {
+	const total = posts.length;
+	const returnMessages = [];
+
+	if (total === 0) {
+		let extraTip = "";
+		if (canalJid) {
+			try {
+				let dateQuery = "SELECT dia, COUNT(*) as qtd FROM canal_posts WHERE canal_jid = ?";
+				const dateParams = [canalJid];
+				if (Array.isArray(allowedTypes) && allowedTypes.length > 0) {
+					const placeholders = allowedTypes.map(() => "?").join(", ");
+					dateQuery += ` AND tipo IN (${placeholders})`;
+					dateParams.push(...allowedTypes);
+				}
+				dateQuery += " GROUP BY dia ORDER BY dia DESC";
+				const datasDisponiveis = await database.dbAll(DB_NAME, dateQuery, dateParams);
+
+				if (datasDisponiveis && datasDisponiveis.length > 0) {
+					const listaDatas = datasDisponiveis
+						.map((d) => {
+							const [ano, mes, dia] = d.dia.split("-");
+							const plural = d.qtd === 1 ? "postagem" : "postagens";
+							return `• *${dia}/${mes}/${ano}* — ${d.qtd} ${plural}`;
+						})
+						.join("\n");
+
+					const [recAno, recMes, recDia] = datasDisponiveis[0].dia.split("-");
+					extraTip = `\n\n📅 *Datas com postagens disponíveis:*\n${listaDatas}\n\n💡 _Para ver: \`!canal-ver ${apelido} ${recDia}/${recMes}\` ou \`!canal-rnd ${apelido}\`_`;
+				}
+			} catch (e) {
+				// ignore
+			}
+		}
+
+		return [
+			new ReturnMessage({
+				chatId,
+				content: `📭 Nenhuma postagem encontrada para o canal *${apelido}* na data *${diaFormatado}*.${extraTip}`
+			})
+		];
+	}
+
+	// Sem agrupamento: envia cada postagem individualmente
+	let lastPostTs = 0;
+	for (const post of posts) {
+		const isNoCaptionMedia = post.tipo === "audio" || post.tipo === "sticker";
+		let includeHeader = false;
+		if (showHeader && isNoCaptionMedia) {
+			if (!lastPostTs || (post.ts && post.ts - lastPostTs > HEADER_COOLDOWN_MS)) {
+				includeHeader = true;
+			}
+		}
+		if (post.ts) lastPostTs = post.ts;
+
+		const postMsg = await createPostReturnMessage(bot, chatId, post, apelido, false, {
+			includeHeader,
+			showHeader
+		});
+		if (postMsg) {
+			if (Array.isArray(postMsg)) {
+				returnMessages.push(...postMsg);
+			} else {
+				returnMessages.push(postMsg);
+			}
+		}
+	}
+
+	return returnMessages;
+}
+
+/**
+ * Cria um ReturnMessage individual (ou array com header + mídia) para uma postagem
+ */
+async function createPostReturnMessage(
+	bot,
+	chatId,
+	post,
+	apelido,
+	isForward = false,
+	options = {}
+) {
+	const showHeader =
+		options.showHeader !== undefined
+			? Boolean(options.showHeader)
+			: options.header !== undefined
+				? Boolean(options.header)
+				: true;
+
+	const horaStr = post.ts
+		? new Date(post.ts).toLocaleTimeString("pt-BR", {
+				timeZone: "America/Sao_Paulo",
+				hour: "2-digit",
+				minute: "2-digit"
+			})
+		: "";
+	const header = horaStr ? `🕒 *[${horaStr}]* ` : "";
+	const prefix = isForward || options.includeHeader ? `📢 *${apelido}*\n` : "";
+	const captionText = showHeader
+		? `${prefix}${header}${post.texto || ""}`.trim()
+		: post.texto || "";
+
+	// Se não tem arquivo, envia como texto
+	if (!post.arquivo) {
+		return new ReturnMessage({
+			chatId,
+			content: showHeader ? captionText || `📢 *${apelido}*` : captionText,
+			options: {
+				linkPreview: true
+			}
+		});
+	}
+
+	const absPath = path.isAbsolute(post.arquivo)
+		? post.arquivo
+		: path.join(__dirname, "../..", post.arquivo);
+
+	if (!fs.existsSync(absPath)) {
+		// Arquivo não está no disco, envia como texto
+		const fallbackContent = showHeader
+			? `${captionText}\n_(Mídia não disponível no disco)_`.trim()
+			: captionText
+				? `${captionText}\n_(Mídia não disponível no disco)_`
+				: "_(Mídia não disponível no disco)_";
+		return new ReturnMessage({
+			chatId,
+			content: fallbackContent,
+			options: {
+				linkPreview: true
+			}
+		});
+	}
+
+	try {
+		if (typeof bot?.createMedia === "function") {
+			const mediaObj = await bot.createMedia(absPath, post.mimetype);
+			if (post.tipo === "sticker") {
+				const stickerMsg = new ReturnMessage({
+					chatId,
+					content: mediaObj,
+					options: {
+						sendMediaAsSticker: true
+					}
+				});
+				if (showHeader && options.includeHeader) {
+					const headerMsg = new ReturnMessage({
+						chatId,
+						content: captionText || `📢 *${apelido}*`,
+						options: {
+							linkPreview: true
+						}
+					});
+					stickerMsg.delay = 1000;
+					return [headerMsg, stickerMsg];
+				}
+				return stickerMsg;
+			} else if (post.tipo === "audio") {
+				const audioMsg = new ReturnMessage({
+					chatId,
+					content: mediaObj,
+					options: {
+						sendAudioAsVoice: true
+					}
+				});
+				if (showHeader && options.includeHeader) {
+					const headerMsg = new ReturnMessage({
+						chatId,
+						content: captionText || `📢 *${apelido}*`,
+						options: {
+							linkPreview: true
+						}
+					});
+					audioMsg.delay = 1000;
+					return [headerMsg, audioMsg];
+				}
+				return audioMsg;
+			} else {
+				return new ReturnMessage({
+					chatId,
+					content: mediaObj,
+					options: {
+						caption: showHeader ? captionText || (isForward ? `📢 *${apelido}*` : "") : captionText,
+						linkPreview: true
+					}
+				});
+			}
+		} else {
+			// Fallback para texto se o bot não suportar createMedia
+			return new ReturnMessage({
+				chatId,
+				content: showHeader ? captionText || `📢 *${apelido}*` : captionText,
+				options: {
+					linkPreview: true
+				}
+			});
+		}
+	} catch (err) {
+		logger.error(`[Canais] Erro ao anexar mídia para post ${post.msg_id}:`, err);
+		return new ReturnMessage({
+			chatId,
+			content: showHeader ? captionText || `📢 *${apelido}*` : captionText,
+			options: {
+				linkPreview: true
+			}
+		});
+	}
+}
+
+// -------------------------------------------------------------
+// IMPLEMENTAÇÃO DOS COMANDOS
+// -------------------------------------------------------------
+
+/**
+ * !canal-seguir <nome> <link>
+ */
+async function seguirCommand(bot, message, args, group) {
+	const {
+		targetGroup,
+		responseChatId: chatId,
+		errorResponse
+	} = await GroupContextHelper.resolveGroupAndAdmin(bot, message, group, {
+		featureName: "os canais seguidos"
+	});
+	if (errorResponse) return errorResponse;
+
+	const rawInput = args.join(" ").trim();
+	if (!rawInput) {
+		return new ReturnMessage({
+			chatId,
+			content:
+				"ℹ️ *Como usar:* `!canal-seguir <nome> <link>`\n\n*Exemplo:*\n`!canal-seguir Carros https://whatsapp.com/channel/0029VbANSmKEgGfFVs1NtU0I`"
+		});
+	}
+
+	const parsed = parseNameAndLink(rawInput);
+	if (parsed.error) {
+		return new ReturnMessage({ chatId, content: parsed.error });
+	}
+
+	const { link, rawName } = parsed;
+
+	// Verifica o limite de canais no grupo
+	const totalCanaisGrupo = await database.dbGet(
+		DB_NAME,
+		"SELECT COUNT(*) as count FROM canal_grupos WHERE group_id = ?",
+		[targetGroup.id]
+	);
+
+	if (totalCanaisGrupo && totalCanaisGrupo.count >= MAX_CANAIS_POR_GRUPO) {
+		return new ReturnMessage({
+			chatId,
+			content: `❌ Este grupo já atingiu o limite máximo de *${MAX_CANAIS_POR_GRUPO}* canais seguidos!\nUse \`!canal-lista\` para ver os canais ativos ou \`!canal-del <nome>\` para remover algum.`
+		});
+	}
+
+	// Resolve o link via whatsgoapi
+	let metadata = null;
+	try {
+		const linkRes = await bot.apiClient.post("/newsletter/link", { key: link });
+		metadata = linkRes?.data || linkRes;
+	} catch (e) {
+		logger.error("Erro ao resolver link do canal:", e);
+		return new ReturnMessage({
+			chatId,
+			content: `❌ Erro ao consultar o canal no WhatsApp: ${e.message || "Link inválido ou canal não encontrado."}`
+		});
+	}
+
+	const canalJid = metadata?.id;
+	if (!canalJid) {
+		return new ReturnMessage({
+			chatId,
+			content: "❌ Não foi possível obter o ID do canal a partir do link informado."
+		});
+	}
+
+	const nomeOficial = metadata?.thread_metadata?.name?.text || "Canal sem nome";
+	const descricao = metadata?.thread_metadata?.description?.text || "";
+	const inviteCode = metadata?.thread_metadata?.invite || "";
+
+	let apelidoFinal = rawName
+		? rawName.trim()
+		: simplifyChannelName(nomeOficial, inviteCode ? `canal_${inviteCode.slice(0, 6)}` : "canal");
+	let apelidoNorm = normalizeString(apelidoFinal);
+
+	if (!rawName) {
+		let counter = 2;
+		let candidate = apelidoFinal;
+		let candidateNorm = apelidoNorm;
+		while (
+			await database.dbGet(
+				DB_NAME,
+				"SELECT 1 FROM canal_grupos WHERE group_id = ? AND apelido_normalizado = ?",
+				[targetGroup.id, candidateNorm]
+			)
+		) {
+			candidate = `${apelidoFinal}_${counter}`;
+			candidateNorm = normalizeString(candidate);
+			counter++;
+		}
+		apelidoFinal = candidate;
+		apelidoNorm = candidateNorm;
+	}
+
+	if (apelidoNorm.length < 2 || apelidoNorm.length > 40) {
+		return new ReturnMessage({
+			chatId,
+			content: "❌ O nome do canal deve ter entre 2 e 40 caracteres."
+		});
+	}
+
+	// Verifica se o canal já é seguido neste grupo
+	const canalJaExisteNoGrupo = await database.dbGet(
+		DB_NAME,
+		"SELECT apelido FROM canal_grupos WHERE group_id = ? AND canal_jid = ?",
+		[targetGroup.id, canalJid]
+	);
+	if (canalJaExisteNoGrupo) {
+		return new ReturnMessage({
+			chatId,
+			content: `⚠️ Este canal já está sendo seguido neste grupo com o apelido *${canalJaExisteNoGrupo.apelido}*.`
+		});
+	}
+
+	// Verifica se o apelido já está em uso por outro canal no grupo
+	const apelidoEmUso = await database.dbGet(
+		DB_NAME,
+		"SELECT 1 FROM canal_grupos WHERE group_id = ? AND apelido_normalizado = ?",
+		[targetGroup.id, apelidoNorm]
+	);
+	if (apelidoEmUso) {
+		return new ReturnMessage({
+			chatId,
+			content: `❌ O apelido *${apelidoFinal}* já está sendo utilizado por outro canal neste grupo. Escolha um nome diferente.`
+		});
+	}
+
+	// Salva na tabela geral de canais
+	const agora = Date.now();
+	await database.dbRun(
+		DB_NAME,
+		`INSERT INTO canais (jid, invite, link, nome_oficial, descricao, criado_em)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(jid) DO UPDATE SET
+       link = excluded.link,
+       nome_oficial = excluded.nome_oficial,
+       descricao = excluded.descricao`,
+		[canalJid, inviteCode, link, nomeOficial, descricao, agora]
+	);
+
+	// Salva o vínculo do grupo
+	await database.dbRun(
+		DB_NAME,
+		`INSERT INTO canal_grupos (group_id, canal_jid, apelido, apelido_normalizado, tipos_midia, criado_por, criado_em)
+     VALUES (?, ?, ?, ?, NULL, ?, ?)`,
+		[targetGroup.id, canalJid, apelidoFinal, apelidoNorm, message.author, agora]
+	);
+
+	// Atualiza cache em memória
+	await refreshTrackedChannelsCache();
+
+	// Segue o canal na conta WhatsApp via whatsgoapi
+	try {
+		await bot.apiClient.post("/newsletter/follow", { jid: canalJid });
+		logger.info(`[Canais] Instância ${bot.instanceName} seguiu o canal ${canalJid}`);
+	} catch (followErr) {
+		logger.warn(
+			`[Canais] Aviso ao tentar dar follow no canal ${canalJid}: ${followErr.message || followErr}`
+		);
+	}
+
+	// Executa backfill das últimas 30 mensagens em segundo plano
+	backfillRecentMessages(bot, canalJid, null).catch((err) => {
+		logger.error(`[Canais] Erro em segundo plano no backfill de ${canalJid}:`, err);
+	});
+
+	let streamHintText = `\n\n📢 *Encaminhamento de Lives:*
+Se você for o dono deste canal e o bot for administrador dele, você pode encaminhar notificações de transmissões ao vivo (Twitch, Kick, YouTube) diretamente para este canal!`;
+
+	const adminInviteHintText = `\n\n👑 *Convite para Administrador:*
+Ao convidar o bot para ser administrador do canal, ele tentará aceitar o convite automaticamente. Se por algum motivo não for aceito de imediato, você pode usar o comando \`!canal-aceitarinvite ${apelidoFinal}\` para forçar o aceite.`;
+
+	try {
+		const groupObj = await database.getGroup(targetGroup.id);
+		if (groupObj) {
+			let platform = null;
+			let streamName = null;
+
+			if (Array.isArray(groupObj.twitch) && groupObj.twitch.length > 0) {
+				platform = "twitch";
+				streamName = groupObj.twitch[0].channel;
+			} else if (Array.isArray(groupObj.kick) && groupObj.kick.length > 0) {
+				platform = "kick";
+				streamName = groupObj.kick[0].channel;
+			} else if (Array.isArray(groupObj.youtube) && groupObj.youtube.length > 0) {
+				platform = "youtube";
+				streamName = groupObj.youtube[0].channel;
+			}
+
+			if (platform && streamName) {
+				streamHintText += `\n*Exemplo para este grupo:* \`!g-${platform}-encaminharCanal ${streamName} ${apelidoFinal}\``;
+			}
+		}
+	} catch (err) {
+		logger.warn(`[Canais] Erro ao carregar grupo para dica de stream:`, err);
+	}
+
+	const responseText = `✅ Canal *${nomeOficial}* cadastrado com sucesso para o grupo *${targetGroup.name || targetGroup.id}*!
+🏷️ Apelido no grupo: *${apelidoFinal}*
+📥 Baixando até ${BACKFILL_COUNT} mensagens recentes em segundo plano...
+
+📌 *Comandos que você pode usar:*
+• \`!canal-ver ${apelidoFinal} [data]\` — Ver as postagens do dia
+• \`!canal-rnd ${apelidoFinal} [tipos]\` — Postagem aleatória
+• \`!canal-encaminhar ${apelidoFinal}\` — Ativar/desativar encaminhamento automático
+• \`!canais-header ${apelidoFinal}\` — Ativar/desativar cabeçalho nas mensagens
+• \`!canal-midias ${apelidoFinal} <tipos>\` — Definir mídias capturadas
+• \`!canal-aceitarinvite ${apelidoFinal}\` — Aceitar convite de admin do canal
+• \`!canal-lista\` — Listar canais do grupo
+• \`!canal-del ${apelidoFinal}\` — Deixar de seguir
+
+💡 *Dica de Alias:*
+Crie um atalho rápido no grupo para este canal:
+\`!g-addCmd ${apelidoNorm} {cmd-canal-rnd ${apelidoFinal}}\`
+Depois é só digitar \`!${apelidoNorm}\` para receber um post aleatório!${adminInviteHintText}${streamHintText}`;
+
+	return new ReturnMessage({
+		chatId,
+		content: responseText
+	});
+}
+
+/**
+ * !canal-lista
+ */
+async function listaCommand(bot, message, args, group) {
+	const {
+		targetGroup,
+		responseChatId: chatId,
+		errorResponse
+	} = await GroupContextHelper.resolveGroup(bot, message, group, {
+		featureName: "listar os canais"
+	});
+	if (errorResponse) return errorResponse;
+
+	const rows = await database.dbAll(
+		DB_NAME,
+		`SELECT g.apelido, g.tipos_midia, g.encaminhar, g.header, c.nome_oficial, c.link, c.jid,
+            (SELECT COUNT(*) FROM canal_posts p WHERE p.canal_jid = g.canal_jid) as total_posts
+     FROM canal_grupos g
+     JOIN canais c ON g.canal_jid = c.jid
+     WHERE g.group_id = ?
+     ORDER BY g.criado_em ASC`,
+		[targetGroup.id]
+	);
+
+	if (!rows || rows.length === 0) {
+		return new ReturnMessage({
+			chatId,
+			content: `📭 Nenhum canal está sendo seguido no grupo *${targetGroup.name || targetGroup.id}*.\n\nPara seguir um canal, use:\n\`!canal-seguir <nome> <link>\``
+		});
+	}
+
+	let text = `📢 *Canais seguidos no grupo ${targetGroup.name || targetGroup.id} (${rows.length}/${MAX_CANAIS_POR_GRUPO}):*\n\n`;
+
+	rows.forEach((row, i) => {
+		let midiasStr = "Todas";
+		if (row.tipos_midia) {
+			try {
+				const arr = JSON.parse(row.tipos_midia);
+				if (Array.isArray(arr) && arr.length > 0) {
+					midiasStr = arr.join(", ");
+				}
+			} catch (e) {
+				midiasStr = "Todas";
+			}
+		}
+
+		text += `*${i + 1}. ${row.apelido}*\n`;
+		if (row.nome_oficial && row.nome_oficial !== row.apelido) {
+			text += `   ↳ Oficial: _${row.nome_oficial}_\n`;
+		}
+		text += `   ↳ Link: ${row.link}\n`;
+		text += `   ↳ Mídias: ${midiasStr}\n`;
+		text += `   ↳ Postagens salvas: ${row.total_posts}\n`;
+		if (row.encaminhar === 1) {
+			text += `   ↳ ⏩ *Encaminhando mensagens*\n`;
+		}
+		if (row.header === 0) {
+			text += `   ↳ 🔕 *Cabeçalho desativado*\n`;
+		}
+		text += "\n";
+	});
+
+	text += `💡 _Para ver postagens: \`!canal-ver <nome> [data]\`_`;
+
+	return new ReturnMessage({ chatId, content: text.trim() });
+}
+
+/**
+ * !canal-del <nome>
+ */
+async function delCommand(bot, message, args, group) {
+	const {
+		targetGroup,
+		responseChatId: chatId,
+		errorResponse
+	} = await GroupContextHelper.resolveGroupAndAdmin(bot, message, group, {
+		featureName: "remover canais seguidos"
+	});
+	if (errorResponse) return errorResponse;
+
+	const targetName = args.join(" ").trim();
+	if (!targetName) {
+		return new ReturnMessage({
+			chatId,
+			content:
+				"ℹ️ *Como usar:* `!canal-del <nome>`\n\nExemplo: `!canal-del Carros`\nUse `!canal-lista` para ver os nomes."
+		});
+	}
+
+	const canaisDoGrupo = await database.dbAll(
+		DB_NAME,
+		"SELECT canal_jid, apelido, apelido_normalizado FROM canal_grupos WHERE group_id = ?",
+		[targetGroup.id]
+	);
+
+	const { matchedCanal } = matchCanalInGroup(canaisDoGrupo, targetName);
+
+	if (!matchedCanal) {
+		return new ReturnMessage({
+			chatId,
+			content: `❌ Canal *${targetName}* não encontrado no grupo *${targetGroup.name || targetGroup.id}*. Use \`!canal-lista\` para conferir.`
+		});
+	}
+
+	// Remove vínculo do grupo
+	await database.dbRun(DB_NAME, "DELETE FROM canal_grupos WHERE group_id = ? AND canal_jid = ?", [
+		targetGroup.id,
+		matchedCanal.canal_jid
+	]);
+
+	await refreshTrackedChannelsCache();
+
+	// Verifica se algum outro grupo ainda segue esse canal
+	const remaining = await database.dbGet(
+		DB_NAME,
+		"SELECT COUNT(*) as count FROM canal_grupos WHERE canal_jid = ?",
+		[matchedCanal.canal_jid]
+	);
+
+	if (!remaining || remaining.count === 0) {
+		// Ninguém mais segue: dá unfollow no WhatsApp
+		try {
+			await bot.apiClient.post("/newsletter/unfollow", { jid: matchedCanal.canal_jid });
+			logger.info(
+				`[Canais] Instância ${bot.instanceName} deu unfollow no canal ${matchedCanal.canal_jid}`
+			);
+		} catch (unfErr) {
+			logger.warn(
+				`[Canais] Aviso ao dar unfollow em ${matchedCanal.canal_jid}: ${unfErr.message || unfErr}`
+			);
+		}
+	}
+
+	return new ReturnMessage({
+		chatId,
+		content: `✅ O canal *${matchedCanal.apelido}* deixou de ser seguido no grupo *${targetGroup.name || targetGroup.id}*.\n_(As mídias já salvas foram preservadas no banco de dados)._`
+	});
+}
+
+/**
+ * !canal-encaminhar <nome>
+ */
+async function encaminharCommand(bot, message, args, group) {
+	const {
+		targetGroup,
+		responseChatId: chatId,
+		errorResponse
+	} = await GroupContextHelper.resolveGroupAndAdmin(bot, message, group, {
+		featureName: "o encaminhamento de canais"
+	});
+	if (errorResponse) return errorResponse;
+
+	const targetName = args.join(" ").trim();
+	if (!targetName) {
+		return new ReturnMessage({
+			chatId,
+			content:
+				"ℹ️ *Como usar:* `!canal-encaminhar <nome>`\n\nAtiva ou desativa o encaminhamento automático de novas mensagens do canal para este grupo em tempo real.\nUse `!canal-lista` para ver os canais ativos."
+		});
+	}
+
+	const canaisDoGrupo = await database.dbAll(
+		DB_NAME,
+		"SELECT canal_jid, apelido, apelido_normalizado, encaminhar FROM canal_grupos WHERE group_id = ?",
+		[targetGroup.id]
+	);
+
+	const { matchedCanal } = matchCanalInGroup(canaisDoGrupo, targetName);
+
+	if (!matchedCanal) {
+		return new ReturnMessage({
+			chatId,
+			content: `❌ Canal *${targetName}* não encontrado no grupo *${targetGroup.name || targetGroup.id}*. Use \`!canal-lista\` para conferir.`
+		});
+	}
+
+	const novoStatus = matchedCanal.encaminhar === 1 ? 0 : 1;
+
+	await database.dbRun(
+		DB_NAME,
+		"UPDATE canal_grupos SET encaminhar = ? WHERE group_id = ? AND canal_jid = ?",
+		[novoStatus, targetGroup.id, matchedCanal.canal_jid]
+	);
+
+	await refreshTrackedChannelsCache();
+
+	if (novoStatus === 1) {
+		return new ReturnMessage({
+			chatId,
+			content: `⏩ *Encaminhamento ativado!* As novas postagens do canal *${matchedCanal.apelido}* serão encaminhadas automaticamente para o grupo *${targetGroup.name || targetGroup.id}* em tempo real.\n\n_Para desativar, use novamente:_ \`!canal-encaminhar ${matchedCanal.apelido}\``
+		});
+	} else {
+		return new ReturnMessage({
+			chatId,
+			content: `⏹️ *Encaminhamento desativado.* As postagens do canal *${matchedCanal.apelido}* não serão mais enviadas automaticamente para o grupo *${targetGroup.name || targetGroup.id}*.`
+		});
+	}
+}
+
+/**
+ * !canais-header <nome>
+ */
+async function headerCommand(bot, message, args, group) {
+	const {
+		targetGroup,
+		responseChatId: chatId,
+		errorResponse
+	} = await GroupContextHelper.resolveGroupAndAdmin(bot, message, group, {
+		featureName: "o cabeçalho de canais"
+	});
+	if (errorResponse) return errorResponse;
+
+	const targetName = args.join(" ").trim();
+	if (!targetName) {
+		return new ReturnMessage({
+			chatId,
+			content:
+				"ℹ️ *Como usar:* `!canais-header <nome>`\n\nAtiva ou desativa o envio do cabeçalho (canal e horário) nas mensagens deste canal.\nUse `!canal-lista` para ver os canais ativos."
+		});
+	}
+
+	const canaisDoGrupo = await database.dbAll(
+		DB_NAME,
+		"SELECT canal_jid, apelido, apelido_normalizado, header FROM canal_grupos WHERE group_id = ?",
+		[targetGroup.id]
+	);
+
+	const { matchedCanal } = matchCanalInGroup(canaisDoGrupo, targetName);
+
+	if (!matchedCanal) {
+		return new ReturnMessage({
+			chatId,
+			content: `❌ Canal *${targetName}* não encontrado no grupo *${targetGroup.name || targetGroup.id}*. Use \`!canal-lista\` para conferir.`
+		});
+	}
+
+	const isCurrentlyEnabled = matchedCanal.header !== 0;
+	const novoStatus = isCurrentlyEnabled ? 0 : 1;
+
+	await database.dbRun(
+		DB_NAME,
+		"UPDATE canal_grupos SET header = ? WHERE group_id = ? AND canal_jid = ?",
+		[novoStatus, targetGroup.id, matchedCanal.canal_jid]
+	);
+
+	if (novoStatus === 1) {
+		return new ReturnMessage({
+			chatId,
+			content: `🏷️ *Cabeçalho ativado!* As mensagens do canal *${matchedCanal.apelido}* voltarão a incluir o nome do canal e horário.\n\n_Para desativar, use novamente:_ \`!canais-header ${matchedCanal.apelido}\``
+		});
+	} else {
+		return new ReturnMessage({
+			chatId,
+			content: `⏹️ *Cabeçalho desativado!* As mensagens e legendas do canal *${matchedCanal.apelido}* serão enviadas na íntegra, sem adicionar horário ou nome do canal.`
+		});
+	}
+}
+
+/**
+ * !canal-ver <nome> [data]
+ */
+async function verCommand(bot, message, args, group) {
+	const {
+		targetGroup,
+		responseChatId: chatId,
+		errorResponse
+	} = await GroupContextHelper.resolveGroup(bot, message, group, {
+		featureName: "ver as postagens do canal"
+	});
+	if (errorResponse) return errorResponse;
+
+	if (args.length === 0) {
+		return new ReturnMessage({
+			chatId,
+			content:
+				"ℹ️ *Como usar:* `!canal-ver <nome> [data]`\n\n*Exemplos:*\n• `!canal-ver Carros` (postagens de hoje)\n• `!canal-ver Carros ontem`\n• `!canal-ver Carros 19/04/2025`"
+		});
+	}
+
+	// Procura o canal no grupo casando o prefixo dos argumentos
+	const canaisDoGrupo = await database.dbAll(
+		DB_NAME,
+		"SELECT canal_jid, apelido, apelido_normalizado, tipos_midia, header FROM canal_grupos WHERE group_id = ?",
+		[targetGroup.id]
+	);
+
+	if (!canaisDoGrupo || canaisDoGrupo.length === 0) {
+		return new ReturnMessage({
+			chatId,
+			content: `📭 Nenhum canal está sendo seguido no grupo *${targetGroup.name || targetGroup.id}*.\nUse \`!canal-seguir <nome> <link>\` para começar.`
+		});
+	}
+
+	const fullText = args.join(" ").trim();
+	const { matchedCanal, remainder: dateStrArg } = matchCanalInGroup(canaisDoGrupo, fullText);
+
+	if (!matchedCanal) {
+		const nomesDisponiveis = canaisDoGrupo.map((c) => `*${c.apelido}*`).join(", ");
+		return new ReturnMessage({
+			chatId,
+			content: `❌ Canal não encontrado no grupo *${targetGroup.name || targetGroup.id}*.\nCanais disponíveis: ${nomesDisponiveis}`
+		});
+	}
+
+	// Parse da data
+	const targetDia = parseDateInput(dateStrArg);
+	if (!targetDia) {
+		return new ReturnMessage({
+			chatId,
+			content: `❌ Formato de data não reconhecido: *${dateStrArg}*.\nUse formatos como "hoje", "ontem", "19/04/2025" ou "YYYY-MM-DD".`
+		});
+	}
+
+	// Tipos de mídias permitidos pelo grupo
+	let allowedTypes = null;
+	if (matchedCanal.tipos_midia) {
+		try {
+			allowedTypes = JSON.parse(matchedCanal.tipos_midia);
+		} catch (e) {
+			allowedTypes = null;
+		}
+	}
+
+	// Busca posts do dia (limite: 10 mais recentes)
+	let query = "SELECT * FROM canal_posts WHERE canal_jid = ? AND dia = ?";
+	const params = [matchedCanal.canal_jid, targetDia];
+
+	if (Array.isArray(allowedTypes) && allowedTypes.length > 0) {
+		const placeholders = allowedTypes.map(() => "?").join(", ");
+		query += ` AND tipo IN (${placeholders})`;
+		params.push(...allowedTypes);
+	}
+
+	query += " ORDER BY ts DESC, msg_id DESC LIMIT 10";
+
+	const posts = await database.dbAll(DB_NAME, query, params);
+	// Ordena cronologicamente para exibição no chat
+	posts.reverse();
+
+	const [ano, mes, dia] = targetDia.split("-");
+	const diaFormatado = `${dia}/${mes}/${ano}`;
+	const showHeader = matchedCanal.header !== 0;
+
+	return await buildGroupedReturnMessages(
+		bot,
+		chatId,
+		posts,
+		matchedCanal.apelido,
+		diaFormatado,
+		matchedCanal.canal_jid,
+		allowedTypes,
+		showHeader
+	);
+}
+
+/**
+ * !canal-midias <nome> [texto,imagem,audio,sticker,video,documento]
+ */
+async function midiasCommand(bot, message, args, group) {
+	const {
+		targetGroup,
+		responseChatId: chatId,
+		errorResponse
+	} = await GroupContextHelper.resolveGroupAndAdmin(bot, message, group, {
+		featureName: "as mídias capturadas do canal"
+	});
+	if (errorResponse) return errorResponse;
+
+	if (args.length === 0) {
+		return new ReturnMessage({
+			chatId,
+			content:
+				"ℹ️ *Como usar:* `!canal-midias <nome> [tipos]`\n\n*Exemplos:*\n• `!canal-midias Carros texto, imagem, audio`\n• `!canal-midias Carros` (ativa captura de todos os tipos)"
+		});
+	}
+
+	const canaisDoGrupo = await database.dbAll(
+		DB_NAME,
+		"SELECT canal_jid, apelido, apelido_normalizado, tipos_midia FROM canal_grupos WHERE group_id = ?",
+		[targetGroup.id]
+	);
+
+	if (!canaisDoGrupo || canaisDoGrupo.length === 0) {
+		return new ReturnMessage({
+			chatId,
+			content: `📭 Nenhum canal está sendo seguido no grupo *${targetGroup.name || targetGroup.id}*.\nUse \`!canal-seguir <nome> <link>\` para começar.`
+		});
+	}
+
+	const fullText = args.join(" ").trim();
+	const { matchedCanal, remainder: typesRawArg } = matchCanalInGroup(canaisDoGrupo, fullText);
+
+	if (!matchedCanal) {
+		const nomes = canaisDoGrupo.map((c) => `*${c.apelido}*`).join(", ");
+		return new ReturnMessage({
+			chatId,
+			content: `❌ Canal não encontrado no grupo *${targetGroup.name || targetGroup.id}*.\nCanais disponíveis: ${nomes}`
+		});
+	}
+
+	// Sem tipos: ativa todos
+	if (!typesRawArg) {
+		await database.dbRun(
+			DB_NAME,
+			"UPDATE canal_grupos SET tipos_midia = NULL WHERE group_id = ? AND canal_jid = ?",
+			[targetGroup.id, matchedCanal.canal_jid]
+		);
+		await refreshTrackedChannelsCache();
+
+		return new ReturnMessage({
+			chatId,
+			content: `✅ Captura de *todos os tipos de mídia* ativada para o canal *${matchedCanal.apelido}* no grupo *${targetGroup.name || targetGroup.id}*!\n\n💡 *Dica:* Para restringir apenas a mídias específicas, envie a lista separada por vírgula:\n\`!canal-midias ${matchedCanal.apelido} texto, imagem, audio\``
+		});
+	}
+
+	const parsed = parseMediaTypes(typesRawArg);
+	if (parsed === null) {
+		// "todas" ou "all"
+		await database.dbRun(
+			DB_NAME,
+			"UPDATE canal_grupos SET tipos_midia = NULL WHERE group_id = ? AND canal_jid = ?",
+			[targetGroup.id, matchedCanal.canal_jid]
+		);
+		await refreshTrackedChannelsCache();
+
+		return new ReturnMessage({
+			chatId,
+			content: `✅ Captura de *todas as mídias* ativada para o canal *${matchedCanal.apelido}* no grupo *${targetGroup.name || targetGroup.id}*!`
+		});
+	}
+
+	if (parsed.valid === false) {
+		return new ReturnMessage({ chatId, content: parsed.error });
+	}
+
+	const jsonTypes = JSON.stringify(parsed.types);
+	await database.dbRun(
+		DB_NAME,
+		"UPDATE canal_grupos SET tipos_midia = ? WHERE group_id = ? AND canal_jid = ?",
+		[jsonTypes, targetGroup.id, matchedCanal.canal_jid]
+	);
+	await refreshTrackedChannelsCache();
+
+	return new ReturnMessage({
+		chatId,
+		content: `✅ Tipos de mídia para *${matchedCanal.apelido}* atualizados com sucesso no grupo *${targetGroup.name || targetGroup.id}*!\n📌 Mídias ativas: *${parsed.types.join(", ")}*`
+	});
+}
+
+/**
+ * !canal-rnd <nome> [tipos]
+ */
+async function rndCommand(bot, message, args, group) {
+	const {
+		targetGroup,
+		responseChatId: chatId,
+		errorResponse
+	} = await GroupContextHelper.resolveGroup(bot, message, group, {
+		featureName: "postagem aleatória de canal"
+	});
+	if (errorResponse) return errorResponse;
+
+	if (args.length === 0) {
+		return new ReturnMessage({
+			chatId,
+			content:
+				"ℹ️ *Como usar:* `!canal-rnd <nome> [tipos]`\n\n*Exemplos:*\n• `!canal-rnd Carros`\n• `!canal-rnd Carros audio,imagem`"
+		});
+	}
+
+	const canaisDoGrupo = await database.dbAll(
+		DB_NAME,
+		"SELECT canal_jid, apelido, apelido_normalizado, tipos_midia, header FROM canal_grupos WHERE group_id = ?",
+		[targetGroup.id]
+	);
+
+	if (!canaisDoGrupo || canaisDoGrupo.length === 0) {
+		return new ReturnMessage({
+			chatId,
+			content: `📭 Nenhum canal está sendo seguido no grupo *${targetGroup.name || targetGroup.id}*.\nUse \`!canal-seguir <nome> <link>\` para começar.`
+		});
+	}
+
+	const fullText = args.join(" ").trim();
+	const { matchedCanal, remainder: typesRawArg } = matchCanalInGroup(canaisDoGrupo, fullText);
+
+	if (!matchedCanal) {
+		const nomes = canaisDoGrupo.map((c) => `*${c.apelido}*`).join(", ");
+		return new ReturnMessage({
+			chatId,
+			content: `❌ Canal não encontrado no grupo *${targetGroup.name || targetGroup.id}*.\nCanais disponíveis: ${nomes}`
+		});
+	}
+
+	// Filtro de tipos do comando cruzado com o grupo
+	let effectiveTypes = null;
+
+	if (typesRawArg) {
+		const parsedCmd = parseMediaTypes(typesRawArg);
+		if (parsedCmd && parsedCmd.valid === false) {
+			return new ReturnMessage({ chatId, content: parsedCmd.error });
+		}
+		if (parsedCmd && parsedCmd.types) {
+			effectiveTypes = parsedCmd.types;
+		}
+	}
+
+	if (!effectiveTypes && matchedCanal.tipos_midia) {
+		try {
+			effectiveTypes = JSON.parse(matchedCanal.tipos_midia);
+		} catch (e) {
+			effectiveTypes = null;
+		}
+	}
+
+	let query = "SELECT * FROM canal_posts WHERE canal_jid = ?";
+	const params = [matchedCanal.canal_jid];
+
+	if (Array.isArray(effectiveTypes) && effectiveTypes.length > 0) {
+		const placeholders = effectiveTypes.map(() => "?").join(", ");
+		query += ` AND tipo IN (${placeholders})`;
+		params.push(...effectiveTypes);
+	}
+
+	query += " ORDER BY RANDOM() LIMIT 1";
+
+	const post = await database.dbGet(DB_NAME, query, params);
+
+	if (!post) {
+		return new ReturnMessage({
+			chatId,
+			content: `📭 Nenhuma postagem encontrada para o canal *${matchedCanal.apelido}* com os filtros aplicados.`
+		});
+	}
+
+	const showHeader = matchedCanal.header !== 0;
+
+	return await createPostReturnMessage(bot, chatId, post, matchedCanal.apelido, false, {
+		includeHeader: showHeader && (post.tipo === "audio" || post.tipo === "sticker"),
+		showHeader
+	});
+}
+
+/**
+ * Aceita convite de admin de um canal (Newsletter)
+ */
+async function aceitarInviteCommand(bot, message, args) {
+	const chatId = message.group || message.from;
+	const linkOrJid = args[0]?.trim();
+
+	if (!linkOrJid) {
+		return new ReturnMessage({
+			chatId,
+			content:
+				"❌ *Uso incorreto!*\nInforme o link do canal, o JID ou o apelido do canal seguido no grupo.\n*Exemplo:* `!canal-aceitarinvite https://whatsapp.com/channel/xxx` ou `!canal-aceitarinvite meu-canal`",
+			options: { quoted: message.origin }
+		});
+	}
+
+	let canalJid = null;
+
+	// 1. Se for link do WhatsApp Channel
+	if (linkOrJid.includes("whatsapp.com/channel/") || linkOrJid.includes("chat.whatsapp.com/")) {
+		try {
+			const linkRes = await bot.apiClient.post("/newsletter/link", { key: linkOrJid });
+			if (linkRes?.data?.ID) {
+				canalJid = linkRes.data.ID;
+			} else if (linkRes?.data?.JID) {
+				canalJid = linkRes.data.JID;
+			}
+		} catch (e) {
+			logger.error(`[aceitarInviteCommand] Erro ao resolver link do canal:`, e);
+		}
+	}
+
+	// 2. Tenta encontrar por apelido/nome nos canais seguidos do grupo se não resolveu por link
+	if (!canalJid && message.group) {
+		const matched = await matchCanalInGroup(message.group, linkOrJid);
+		if (matched) {
+			canalJid = matched.canal_jid;
+		}
+	}
+
+	// 3. Se parece com JID direto
+	if (!canalJid) {
+		if (linkOrJid.endsWith("@newsletter")) {
+			canalJid = linkOrJid;
+		} else if (/^\d+$/.test(linkOrJid)) {
+			canalJid = `${linkOrJid}@newsletter`;
+		}
+	}
+
+	if (!canalJid) {
+		return new ReturnMessage({
+			chatId,
+			content: `❌ *Canal não encontrado!* Não foi possível identificar o JID do canal a partir de "${linkOrJid}".`,
+			options: { quoted: message.origin }
+		});
+	}
+
+	try {
+		await bot.acceptNewsletterAdminInvite(canalJid);
+		return new ReturnMessage({
+			chatId,
+			content: `✅ *Convite de Admin Aceito com Sucesso!*\n\nO bot agora aceitou o convite de administrador para o canal (\`${canalJid}\`).`,
+			options: { quoted: message.origin }
+		});
+	} catch (error) {
+		logger.error(`[aceitarInviteCommand] Erro ao aceitar convite para ${canalJid}:`, error);
+		const errMsg = error.message || error.data?.message || "Erro desconhecido ao aceitar convite.";
+		return new ReturnMessage({
+			chatId,
+			content: `❌ *Falha ao aceitar convite:* ${errMsg}\n\nVerifique se o convite para ser admin do canal ainda está ativo e se o bot é seguidor do canal.`,
+			options: { quoted: message.origin }
+		});
+	}
+}
+
+// -------------------------------------------------------------
+// DEFINIÇÃO DOS COMANDOS EXPORTADOS
+// -------------------------------------------------------------
+
+const commands = [
+	new Command({
+		name: "canal-seguir",
+		aliases: ["seguir-canal", "canalseguir"],
+		description: "Cadastra um canal do WhatsApp para seguir neste grupo",
+		usage: "!canal-seguir <nome> <link>",
+		category: "canais",
+		adminOnly: true,
+		caseSensitive: false,
+		timeout: 120,
+		method: seguirCommand
+	}),
+	new Command({
+		name: "canal-lista",
+		aliases: ["canais", "canais-lista", "lista-canais"],
+		description: "Lista os canais do WhatsApp seguidos neste grupo",
+		usage: "!canal-lista",
+		category: "canais",
+		adminOnly: false,
+		caseSensitive: false,
+		timeout: 30,
+		method: listaCommand
+	}),
+	new Command({
+		name: "canal-del",
+		aliases: ["canal-remover", "remover-canal", "canaldel"],
+		description: "Para de seguir um canal do WhatsApp neste grupo",
+		usage: "!canal-del <nome>",
+		category: "canais",
+		adminOnly: true,
+		caseSensitive: false,
+		timeout: 30,
+		method: delCommand
+	}),
+	new Command({
+		name: "canal-ver",
+		aliases: ["canalver"],
+		description: "Exibe as postagens do dia de um canal seguido no grupo",
+		usage: "!canal-ver <nome> [data]",
+		category: "canais",
+		adminOnly: false,
+		caseSensitive: false,
+		timeout: 120,
+		method: verCommand
+	}),
+	new Command({
+		name: "canal-midias",
+		aliases: ["canal-midia", "canalmidias"],
+		description: "Configura quais tipos de mídias serão capturados do canal",
+		usage: "!canal-midias <nome> [texto,imagem,audio,sticker,video,documento]",
+		category: "canais",
+		adminOnly: true,
+		caseSensitive: false,
+		timeout: 30,
+		method: midiasCommand
+	}),
+	new Command({
+		name: "canal-rnd",
+		aliases: ["canal-random", "canalrnd"],
+		description: "Envia uma postagem aleatória de um canal seguido",
+		usage: "!canal-rnd <nome> [tipos]",
+		category: "canais",
+		adminOnly: false,
+		caseSensitive: false,
+		timeout: 60,
+		method: rndCommand
+	}),
+	new Command({
+		name: "canal-encaminhar",
+		aliases: ["canalencaminhar", "encaminhar-canal"],
+		description:
+			"Ativa ou desativa o encaminhamento de mensagens do canal para o grupo em tempo real",
+		usage: "!canal-encaminhar <nome>",
+		category: "canais",
+		adminOnly: true,
+		caseSensitive: false,
+		timeout: 30,
+		method: encaminharCommand
+	}),
+	new Command({
+		name: "canais-header",
+		aliases: ["canal-header", "canaisheader", "canalheader"],
+		description: "Ativa ou desativa o envio de cabeçalho (canal/horário) nas mensagens do canal",
+		usage: "!canais-header <nome>",
+		category: "canais",
+		adminOnly: true,
+		caseSensitive: false,
+		timeout: 30,
+		method: headerCommand
+	}),
+	new Command({
+		name: "canal-aceitarinvite",
+		aliases: ["canal-aceitar", "aceitar-canal", "canal-aceitar-convite", "canalaceitar"],
+		description: "Aceita um convite de administrador para um canal (Newsletter) do WhatsApp",
+		usage: "!canal-aceitarinvite <linkOuJidOuApelido>",
+		category: "canais",
+		adminOnly: true,
+		caseSensitive: false,
+		timeout: 30,
+		method: aceitarInviteCommand
+	})
+];
+
+module.exports = {
+	commands,
+	detectPost,
+	createPostReturnMessage,
+	parseNameAndLink,
+	parseMediaTypes,
+	parseDateInput,
+	buildGroupedReturnMessages,
+	classifyMessageType,
+	refreshTrackedChannelsCache,
+	simplifyChannelName,
+	matchCanalInGroup,
+	headerCommand,
+	MAX_CANAIS_POR_GRUPO,
+	HEADER_COOLDOWN_MS,
+	lastChannelForwardActivity,
+	resetForwardActivity
+};

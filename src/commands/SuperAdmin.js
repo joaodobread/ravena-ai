@@ -1,11 +1,16 @@
 const fs = require("fs").promises;
 const path = require("path");
+const axios = require("axios");
 const Logger = require("../utils/Logger");
 const Database = require("../utils/Database");
 const ReturnMessage = require("../models/ReturnMessage");
 const AdminUtils = require("../utils/AdminUtils");
 const LLMService = require("../services/LLMService");
+const DonorBonusService = require("../services/DonorBonusService");
+const GameEventService = require("../services/GameEventService");
 const { execFile } = require("child_process");
+const PhoneUtils = require("../utils/PhoneUtils");
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
  * Manipula comandos super admin (apenas para admins do sistema)
@@ -25,6 +30,8 @@ class SuperAdmin {
 
 		// Mapeamento de comando para método
 		this.commandMap = {
+			evento: { method: "manageGameEvent", description: "Cria ou cancela evento temporário" },
+			eventos: { method: "listGameEvents", description: "Lista eventos temporários ativos" },
 			retrospectiva: { method: "endYearMsg", description: "Retrospectiva" },
 			testeMsg: { method: "testeMsg", description: "Testar Retorno msg" },
 			sendMsg: { method: "sendMsg", description: "Envia mensagem para chatId" },
@@ -32,6 +39,10 @@ class SuperAdmin {
 			joinGrupoSilencioso: {
 				method: "joinGroupSilent",
 				description: "Entra em um grupo via link de convite SEM enviar mensagem de boas-vindas"
+			},
+			filaInvites: {
+				method: "filaInvites",
+				description: "Mostra os últimos 10 aceitos e a fila de invites pendentes com ETA"
 			},
 			modoSilencioso: {
 				method: "toggleSilentMode",
@@ -124,6 +135,60 @@ class SuperAdmin {
 			addUserGp: {
 				method: "addUserGp",
 				description: "Adiciona um usuário ao grupo: !sa-addUserGp <grupoJid> <contato>"
+			},
+			"streams-cleanup": {
+				method: "streamsCleanup",
+				description:
+					"Limpa canais inexistentes de Twitch/Kick e remove canais de grupos sem bots presentes"
+			},
+			streamsCleanup: {
+				method: "streamsCleanup",
+				description:
+					"Limpa canais inexistentes de Twitch/Kick e remove canais de grupos sem bots presentes"
+			},
+			"streams-rate": {
+				method: "streamsRate",
+				description: "Exibe métricas de velocidade de busca e rate limit do StreamMonitor"
+			},
+			streamsRate: {
+				method: "streamsRate",
+				description: "Exibe métricas de velocidade de busca e rate limit do StreamMonitor"
+			},
+			removerFig: {
+				method: "removerFig",
+				description:
+					"Remove figurinha(s) do Lovecell do cache, adiciona à blacklist e limpa estatísticas (suporta múltiplos IDs)"
+			},
+			"remover-fig": {
+				method: "removerFig",
+				description:
+					"Remove figurinha(s) do Lovecell do cache, adiciona à blacklist e limpa estatísticas (suporta múltiplos IDs)"
+			},
+			waifuCasar: {
+				method: "waifuCasar",
+				description:
+					"Casa administrativamente um usuário com um personagem: !sa-waifuCasar <numero> <personagem>"
+			},
+			waifucasar: {
+				method: "waifuCasar",
+				description: "Alias de waifuCasar"
+			},
+			"waifu-casar": {
+				method: "waifuCasar",
+				description: "Alias de waifuCasar"
+			},
+			remudae: {
+				method: "removerMudaePersonagem",
+				description:
+					"Remove personagem problemático do catálogo Waifuletes, desfaz casamentos com reembolso e apaga vínculos: !sa-remudae <id/nome> [motivo]"
+			},
+			removerMudae: {
+				method: "removerMudaePersonagem",
+				description: "Alias de remudae"
+			},
+			"remover-mudae": {
+				method: "removerMudaePersonagem",
+				description: "Alias de remudae"
 			}
 		};
 
@@ -154,6 +219,129 @@ class SuperAdmin {
 
 	isComuAdmin(bot, userId) {
 		return this.adminUtils.isComuAdmin(userId, bot);
+	}
+
+	/**
+	 * Extrai o código de convite de uma URL do WhatsApp ou retorna o próprio código limpo.
+	 * Suporta formatos como:
+	 * - https://chat.whatsapp.com/D17CRtfxTCM1bCVYdmVyZs
+	 * - http://chat.whatsapp.com/D17CRtfxTCM1bCVYdmVyZs
+	 * - chat.whatsapp.com/D17CRtfxTCM1bCVYdmVyZs
+	 * - https://chat.whatsapp.com/invite/D17CRtfxTCM1bCVYdmVyZs
+	 * - D17CRtfxTCM1bCVYdmVyZs
+	 * @param {string} input - URL ou código do convite
+	 * @returns {string} - Código de convite extraído
+	 */
+	extractInviteCode(input) {
+		if (!input || typeof input !== "string") return "";
+		const trimmed = input.trim();
+		const match = trimmed.match(
+			/(?:https?:\/\/)?(?:www\.)?chat\.whatsapp\.com\/(?:invite\/)?([A-Za-z0-9_-]+)/i
+		);
+		if (match) {
+			return match[1];
+		}
+		return trimmed.replace(/^\/+|\/+$/g, "").split("?")[0];
+	}
+
+	async manageGameEvent(bot, message, args) {
+		const chatId = message.group ?? message.author;
+		try {
+			if (!this.isSuperAdmin(message.author)) {
+				return new ReturnMessage({
+					chatId,
+					content: "⛔ Apenas super administradores podem usar este comando."
+				});
+			}
+
+			if (args.length < 2) {
+				return new ReturnMessage({
+					chatId,
+					content:
+						"ℹ️ *Uso do comando:*\n" +
+						"`!sa-evento <jogo> <tipo> <valor%> <duracao_em_horas>`\n\n" +
+						"📌 *Jogos e Tipos suportados:*\n" +
+						"• *pesca*: `peso` (aumenta o peso dos peixes), `lendario` (aumenta chance de lendários)\n" +
+						"• *waifu*: `raros` (aumenta chance de raros/épicos/lendários), `wish` (aumenta wishlist)\n" +
+						"• *slots*: `vitoria` (aumenta chance de vitória), `moedas` (prêmio em moedas), `iscas` (prêmio em iscas)\n\n" +
+						"📌 *Exemplos:*\n" +
+						"• `!sa-evento pesca peso 15 4` (+15% peso por 4h)\n" +
+						"• `!sa-evento pesca lendario 50 24` (+50% lendários por 24h)\n" +
+						"• `!sa-evento waifus raros 50 12` (+50% raros por 12h)\n" +
+						"• `!sa-evento waifus wish 25 6` (+25% wishlist por 6h)\n" +
+						"• `!sa-evento slots vitoria 30 8` (+30% vitória por 8h)\n" +
+						"• `!sa-evento pesca peso 0` (Cancela o evento)"
+				});
+			}
+
+			const [gameInput, typeInput, valueInput, durationInput] = args;
+			const cleanValue = valueInput ? parseFloat(String(valueInput).replace(",", ".")) : 0;
+			const cleanDuration = durationInput ? parseFloat(String(durationInput).replace(",", ".")) : 0;
+
+			const result = await GameEventService.setEvent(
+				gameInput,
+				typeInput,
+				cleanValue,
+				cleanDuration,
+				message.author
+			);
+
+			return new ReturnMessage({
+				chatId,
+				content: result.message
+			});
+		} catch (error) {
+			this.logger.error("Erro no comando manageGameEvent:", error);
+			return new ReturnMessage({
+				chatId,
+				content: "❌ Erro ao gerenciar evento temporário."
+			});
+		}
+	}
+
+	async listGameEvents(bot, message) {
+		const chatId = message.group ?? message.author;
+		try {
+			if (!this.isSuperAdmin(message.author) && !this.adminUtils.isComuAdmin(message.author, bot)) {
+				return new ReturnMessage({
+					chatId,
+					content: "⛔ Apenas administradores podem usar este comando."
+				});
+			}
+
+			const events = GameEventService.getActiveEvents();
+			if (!events || events.length === 0) {
+				return new ReturnMessage({
+					chatId,
+					content: "ℹ️ Nenhum evento temporário ativo no momento."
+				});
+			}
+
+			let reply = "🎉 *EVENTOS TEMPORÁRIOS ATIVOS:*\n\n";
+			for (const ev of events) {
+				const start = new Date(ev.startTime).toLocaleString("pt-BR", {
+					timeZone: "America/Sao_Paulo"
+				});
+				const end = new Date(ev.endTime).toLocaleString("pt-BR", { timeZone: "America/Sao_Paulo" });
+				reply += `🎮 *Jogo:* ${ev.game.toUpperCase()}\n`;
+				reply += `🏷️ *Tipo:* ${ev.type}\n`;
+				reply += `📈 *Bônus:* +${ev.value}% (multiplicador ${ev.multiplier}x)\n`;
+				reply += `⏳ *Expira em:* ${ev.remainingText} (${end})\n`;
+				reply += `📅 *Início:* ${start}\n\n`;
+			}
+			reply += `_Para cancelar: \`!sa-evento <jogo> <tipo> 0\`_`;
+
+			return new ReturnMessage({
+				chatId,
+				content: reply.trim()
+			});
+		} catch (error) {
+			this.logger.error("Erro no comando listGameEvents:", error);
+			return new ReturnMessage({
+				chatId,
+				content: "❌ Erro ao listar eventos temporários."
+			});
+		}
 	}
 
 	async wakeOnLan(bot, message, args) {
@@ -394,6 +582,7 @@ ${listGroups}\n\n${inactiveSection}`;
 			const minTimestamps = await Promise.all([
 				getMinTs("llm_stats", "usage_stats"),
 				getMinTs("media_stats", "comfy_stats"),
+				getMinTs("bonsai_stats", "bonsai_stats"),
 				getMinTs("media_stats", "speech_generation_stats"),
 				getMinTs("media_stats", "speech_transcription_stats")
 			]);
@@ -608,7 +797,15 @@ Break down the cost by category and provide a total estimated cost.`;
 			}
 
 			// Obtém código de convite
-			const inviteCode = args[0];
+			const inviteCode = this.extractInviteCode(args[0]);
+
+			if (!inviteCode) {
+				return new ReturnMessage({
+					chatId,
+					content:
+						"Por favor, forneça um código de convite válido. Exemplo: !sa-joinGrupo https://chat.whatsapp.com/abcd1234"
+				});
+			}
 
 			// Verifica se está no cache de force join (tentativa repetida em menos de 1 min)
 			const forceJoinKey = `${message.author}:${inviteCode}`;
@@ -647,17 +844,36 @@ Break down the cost by category and provide a total estimated cost.`;
 			}
 
 			try {
+				let inviteInfoData = null;
+				try {
+					inviteInfoData = await bot.client.getInviteInfo(inviteCode);
+				} catch (e) {}
+
 				// Aceita o convite
 				const joinResult = await bot.client.acceptInvite(inviteCode);
 
 				if (joinResult.accepted) {
-					// Salva os dados do autor que enviou o convite para uso posterior
-					if (authorId) {
-						await this.database.savePendingJoin(inviteCode, { authorId, authorName });
-					}
+					try {
+						const InviteSystem = require("../InviteSystem");
+						InviteSystem.removeFromQueue(inviteCode);
+					} catch (e) {}
 
-					// Remove dos convites pendentes se existir
-					await this.database.removePendingJoin(inviteCode);
+					const finalGroupJid = inviteInfoData?.JID || null;
+					await this.database.addInviteHistory({
+						code: inviteCode,
+						groupJid: finalGroupJid,
+						authorId: authorId || message.author,
+						authorName: authorName || "SuperAdmin",
+						timestamp: Date.now(),
+						reason: "SuperAdmin joinGrupo"
+					});
+
+					// Salva os dados do autor que enviou o convite para uso posterior
+					await this.database.savePendingJoin(inviteCode, {
+						authorId: authorId || message.author,
+						authorName: authorName || "SuperAdmin",
+						groupJid: finalGroupJid
+					});
 
 					return new ReturnMessage({
 						chatId,
@@ -715,7 +931,14 @@ Break down the cost by category and provide a total estimated cost.`;
 				});
 			}
 
-			const inviteCode = args[0];
+			const inviteCode = this.extractInviteCode(args[0]);
+			if (!inviteCode) {
+				return new ReturnMessage({
+					chatId,
+					content:
+						"Por favor, forneça um código de convite válido. Exemplo: !sa-joinGrupoSilencioso https://chat.whatsapp.com/abcd1234"
+				});
+			}
 
 			// Inicializa o set de joins silenciosos no bot (se ainda não existir)
 			if (!bot.silentJoinGroups) {
@@ -756,8 +979,25 @@ Break down the cost by category and provide a total estimated cost.`;
 				const joinResult = await bot.client.acceptInvite(inviteCode);
 
 				if (joinResult.accepted) {
-					// Remove dos convites pendentes se existir
-					await this.database.removePendingJoin(inviteCode);
+					try {
+						const InviteSystem = require("../InviteSystem");
+						InviteSystem.removeFromQueue(inviteCode);
+					} catch (e) {}
+
+					await this.database.addInviteHistory({
+						code: inviteCode,
+						groupJid,
+						authorId: message.author,
+						authorName: "SuperAdmin",
+						timestamp: Date.now(),
+						reason: "SuperAdmin joinGrupoSilencioso"
+					});
+
+					await this.database.savePendingJoin(inviteCode, {
+						authorId: message.author,
+						authorName: "SuperAdmin",
+						groupJid
+					});
 
 					return new ReturnMessage({
 						chatId,
@@ -790,6 +1030,75 @@ Break down the cost by category and provide a total estimated cost.`;
 				content: "❌ Erro ao processar comando."
 			});
 		}
+	}
+
+	/**
+	 * Mostra a lista dos últimos 10 aceitos e toda a fila de invites pendentes com ETA
+	 * @param {WhatsAppBot} bot - Instância do bot
+	 * @param {Object} message - Dados da mensagem
+	 * @param {Array} args - Argumentos do comando
+	 * @returns {Promise<ReturnMessage>}
+	 */
+	async filaInvites(bot, message, args) {
+		const chatId = message.group ?? message.author;
+
+		if (!this.isSuperAdmin(message.author) && !this.isComuAdmin(bot, message.author)) {
+			return new ReturnMessage({
+				chatId,
+				content: "⛔ Apenas super administradores podem usar este comando."
+			});
+		}
+
+		const InviteSystem = require("../InviteSystem");
+		const accepted = InviteSystem.recentlyAccepted || [];
+		const queue = InviteSystem.inviteQueue || [];
+
+		let reply = "📋 *Status da Fila de Invites*\n\n";
+
+		// Últimos 10 aceitos
+		const lastAccepted = [...accepted].reverse().slice(0, 10);
+		reply += `✅ *Últimos ${lastAccepted.length} Aceitos:*\n`;
+		if (lastAccepted.length === 0) {
+			reply += "_(nenhum convite aceito recentemente)_\n";
+		} else {
+			lastAccepted.forEach((a, i) => {
+				const dt = new Date(a.acceptedAt).toLocaleString("pt-BR", {
+					timeZone: "America/Sao_Paulo"
+				});
+				const botTag = a.botId ? `🤖 *${a.botId}*` : "";
+				const authorTag = (a.authorId || "").split("@")[0];
+				reply += `${i + 1}. *${a.authorName || "Desconhecido"}* (${authorTag}) → ${botTag}\n`;
+				reply += `   🏷️ ${a.groupName || "Grupo"} • 🔗 \`${a.inviteCode}\` • ⏰ ${dt}\n`;
+			});
+		}
+
+		reply += "\n";
+
+		// Fila pendente
+		reply += `⏳ *Fila Pendente (${queue.length}):*\n`;
+		if (queue.length === 0) {
+			reply += "_(fila vazia no momento)_\n";
+		} else {
+			queue.forEach((q, i) => {
+				const eta = InviteSystem.getETA(i + 1);
+				const enqStr = new Date(q.enqueuedAt).toLocaleString("pt-BR", {
+					timeZone: "America/Sao_Paulo"
+				});
+				const authorTag = (q.authorId || "").split("@")[0];
+				reply += `${i + 1}. *${q.authorName || "Desconhecido"}* (${authorTag})\n`;
+				reply += `   🏷️ ${q.groupName || "Desconhecido"} • 🔗 \`${q.inviteCode}\`\n`;
+				reply += `   ⏰ Previsão (ETA): *${eta.tempo}* (às *${eta.horaPrevista}*)\n`;
+				reply += `   📥 Enfileirado: ${enqStr}\n`;
+				if ((q.attempts || 0) > 0) {
+					reply += `   ⚠️ Tentativas: ${q.attempts}/3\n`;
+				}
+			});
+		}
+
+		return new ReturnMessage({
+			chatId,
+			content: reply.trim()
+		});
 	}
 
 	/**
@@ -917,12 +1226,37 @@ Break down the cost by category and provide a total estimated cost.`;
 			const success = await this.database.addDonation(donorName, 0, numero);
 
 			if (success) {
-				bot.whitelist.push(numero);
+				const variants = PhoneUtils.getPhoneVariants(numero);
+				const allBots = this.database.botInstances || [bot];
+				allBots.forEach((b) => {
+					if (Array.isArray(b.whitelist)) {
+						variants.forEach((v) => {
+							if (!b.whitelist.includes(v)) b.whitelist.push(v);
+						});
+					}
+				});
+
+				let bonusMsg = "";
+				try {
+					const donor = await this.database.getDonorByName(donorName);
+					if (donor && donor.valor > 0) {
+						const bonusRes = await DonorBonusService.awardDonorBonuses(
+							donor,
+							donor.valor,
+							donor.bonusesProcessedAmount || 0
+						);
+						if (bonusRes.success && bonusRes.delta && bonusRes.delta.deltaAmount > 0) {
+							bonusMsg = DonorBonusService.formatBonusMessage(bonusRes);
+						}
+					}
+				} catch (errBonus) {
+					this.logger.error("Erro ao conceder bônus no addNewDonate:", errBonus);
+				}
 
 				return [
 					new ReturnMessage({
 						chatId,
-						content: `✅ ${donorName}, ${numero} adicionado com sucesso à lista!`
+						content: `✅ ${donorName}, ${numero} adicionado com sucesso à lista!${bonusMsg}`
 					})
 				];
 			} else {
@@ -983,6 +1317,23 @@ Break down the cost by category and provide a total estimated cost.`;
 			const success = await this.database.updateDonorNumber(donorName, numero);
 
 			if (success) {
+				let bonusMsg = "";
+				try {
+					const donor = await this.database.getDonorByName(donorName);
+					if (donor && donor.valor > 0) {
+						const bonusRes = await DonorBonusService.awardDonorBonuses(
+							donor,
+							donor.valor,
+							donor.bonusesProcessedAmount || 0
+						);
+						if (bonusRes.success && bonusRes.delta && bonusRes.delta.deltaAmount > 0) {
+							bonusMsg = DonorBonusService.formatBonusMessage(bonusRes);
+						}
+					}
+				} catch (errBonus) {
+					this.logger.error("Erro ao conceder bônus no addDonorNumber:", errBonus);
+				}
+
 				// Pega contato do doador e envia junto pra poder add
 				let cttDonate = await bot.createContact(numero);
 
@@ -995,7 +1346,7 @@ Break down the cost by category and provide a total estimated cost.`;
 				return [
 					new ReturnMessage({
 						chatId,
-						content: `✅ Número ${numero} adicionado com sucesso ao doador ${donorName}`
+						content: `✅ Número ${numero} adicionado com sucesso ao doador ${donorName}.${bonusMsg}`
 					}),
 					new ReturnMessage({
 						chatId,
@@ -1141,13 +1492,17 @@ Break down the cost by category and provide a total estimated cost.`;
 	async removeFromSpecialGroups(bot, phoneNumber, specialGroups = [], message) {
 		if (!this.isSuperAdmin(message.author)) return;
 
+		const targetDigits = String(phoneNumber || "").replace(/\D/g, "");
+		const groupsToProcess =
+			specialGroups && specialGroups.length > 0 ? specialGroups : this.getSpecialGroups(bot);
+
 		const results = {
 			successes: 0,
 			failures: 0,
 			details: []
 		};
 
-		for (const groupId of specialGroups) {
+		for (const groupId of groupsToProcess) {
 			try {
 				const chat = await bot.client.getChatById(groupId);
 
@@ -1155,11 +1510,28 @@ Break down the cost by category and provide a total estimated cost.`;
 				if (chat) {
 					this.logger.debug(`[removeFromSpecialGroups] `, { phoneNumber, chat });
 
-					const isInGroup = chat.participants?.some((p) => p.id._serialized === phoneNumber);
+					const participantToRemove = chat.participants?.find((p) => {
+						const pId = p.id?._serialized || p.id || "";
+						const pPn = p.PhoneNumber || p.phoneNumber || "";
+						const pLid = p.LID || p.lid || "";
+						return (
+							pId === phoneNumber ||
+							pPn === phoneNumber ||
+							(targetDigits &&
+								((pId && pId.replace(/\D/g, "") === targetDigits) ||
+									(pPn && pPn.replace(/\D/g, "") === targetDigits) ||
+									(pLid && pLid.replace(/\D/g, "") === targetDigits)))
+						);
+					});
 
-					if (isInGroup) {
+					if (participantToRemove) {
+						const toRemoveId =
+							participantToRemove.id?._serialized ||
+							participantToRemove.JID ||
+							participantToRemove.id ||
+							phoneNumber;
 						// Remove a pessoa do grupo
-						await chat.removeParticipants([phoneNumber]);
+						await chat.removeParticipants([toRemoveId]);
 						results.successes++;
 						results.details.push({
 							groupId,
@@ -1189,6 +1561,154 @@ Break down the cost by category and provide a total estimated cost.`;
 	}
 
 	/**
+	 * Retorna a lista de JIDs de grupos especiais/protegidos (skip ban).
+	 * Inclui os grupos definidos em GRUPOS_SKIP_BAN e grupos oficiais do .env / bot.
+	 */
+	getSpecialGroups(bot) {
+		const groups = new Set();
+
+		// 1. Variável de ambiente dedicada GRUPOS_SKIP_BAN / gruposSkipBan
+		const envSkipBan = process.env.GRUPOS_SKIP_BAN || process.env.gruposSkipBan;
+		if (envSkipBan) {
+			envSkipBan
+				.split(",")
+				.map((g) => g.trim())
+				.filter(Boolean)
+				.forEach((g) => groups.add(g));
+		}
+
+		// 2. Grupos oficiais conhecidos do .env
+		if (process.env.GRUPO_LOGS) groups.add(process.env.GRUPO_LOGS.trim());
+		if (process.env.GRUPO_PESCA) groups.add(process.env.GRUPO_PESCA.trim());
+		if (process.env.GRUPO_INTERACAO) groups.add(process.env.GRUPO_INTERACAO.trim());
+		if (process.env.GRUPO_DOWNLOADS) groups.add(process.env.GRUPO_DOWNLOADS.trim());
+		if (process.env.GRUPO_STICKERS) groups.add(process.env.GRUPO_STICKERS.trim());
+		if (process.env.GRUPO_AVISOS) groups.add(process.env.GRUPO_AVISOS.trim());
+		if (process.env.GRUPO_ANUNCIOS) groups.add(process.env.GRUPO_ANUNCIOS.trim());
+
+		// 3. Grupos especiais do próprio bot
+		if (bot) {
+			if (bot.grupoLogs) groups.add(bot.grupoLogs);
+			if (bot.grupoInteracao) groups.add(bot.grupoInteracao);
+			if (bot.grupoAvisos) groups.add(bot.grupoAvisos);
+			if (bot.grupoAnuncios) groups.add(bot.grupoAnuncios);
+		}
+
+		return Array.from(groups);
+	}
+
+	/**
+	 * Verifica se um grupo é especial/protegido (não deve ser deixado)
+	 */
+	isSpecialGroup(groupId, groupName, specialGroupsList = []) {
+		if (!groupId) return false;
+		const cleanGroupId = groupId.split("@")[0] + "@g.us";
+		if (
+			specialGroupsList &&
+			specialGroupsList.some((sg) => sg === groupId || sg === cleanGroupId)
+		) {
+			return true;
+		}
+
+		const nameLower = groupName ? groupName.toLowerCase() : "";
+		return (
+			nameLower.includes("gpzuera") ||
+			nameLower.includes("rapescas") ||
+			nameLower.includes("ravdownloads") ||
+			nameLower.includes("legionlog") ||
+			nameLower.includes("rav-stickers") ||
+			nameLower.includes("stickers")
+		);
+	}
+
+	/**
+	 * Coleta todos os identificadores (telefones e LIDs) de membros de grupos oficiais
+	 * para que NUNCA sejam bloqueados por engano.
+	 */
+	async getOfficialGroupMembers(bot, specialGroupsList = []) {
+		const protectedMembers = new Set();
+		if (!specialGroupsList || specialGroupsList.length === 0) return protectedMembers;
+
+		let enabledBots = [];
+		try {
+			const fs = require("fs");
+			const bots = JSON.parse(fs.readFileSync("bots.json", "utf8")) || [];
+			enabledBots = bots.filter((b) => b.enabled && !b.useTelegram && !b.useDiscord);
+		} catch (_) {}
+
+		const axios = require("axios");
+		const apiUrl = (process.env.WHATS_GO_API_URL || "http://whatsgoapi:8080").replace(/\/$/, "");
+		const apiKey = process.env.WHATS_GO_API_KEY;
+
+		for (const groupJid of specialGroupsList) {
+			let participants = null;
+
+			// Tenta com o próprio bot primeiro
+			try {
+				const chat = await bot.client.getChatById(groupJid);
+				if (
+					chat &&
+					Array.isArray(chat.participants) &&
+					chat.participants.length > 0 &&
+					!chat.notInGroup
+				) {
+					participants = chat.participants;
+				}
+			} catch (_) {}
+
+			// Se o bot não estiver no grupo, consulta as outras instâncias habilitadas via WhatsGo
+			if (!participants && apiKey && enabledBots.length > 0) {
+				for (const b of enabledBots) {
+					const instanceName = b.goID ?? b.nome;
+					try {
+						const res = await axios.post(
+							`${apiUrl}/group/info`,
+							{ groupJid },
+							{
+								headers: {
+									apikey: apiKey,
+									instance: instanceName,
+									"Content-Type": "application/json"
+								},
+								timeout: 3000
+							}
+						);
+						const data = res.data?.data || res.data;
+						if (Array.isArray(data?.Participants) && data.Participants.length > 0) {
+							participants = data.Participants;
+							break;
+						}
+					} catch (_) {}
+				}
+			}
+
+			if (participants) {
+				for (const p of participants) {
+					const fields = [
+						p.PhoneNumber,
+						p.phoneNumber,
+						p.LID,
+						p.lid,
+						p.JID,
+						p.jid,
+						p.id?._serialized,
+						p.id
+					];
+					for (const f of fields) {
+						if (f && typeof f === "string") {
+							const cleanDigits = f.replace(/@.*/, "").replace(/\D/g, "");
+							if (cleanDigits) protectedMembers.add(cleanDigits);
+							protectedMembers.add(f);
+						}
+					}
+				}
+			}
+		}
+
+		return protectedMembers;
+	}
+
+	/**
 	 * Bloqueia convites de um usuário
 	 * @param {WhatsAppBot} bot - Instância do bot
 	 * @param {Object} message - Dados da mensagem
@@ -1199,7 +1719,11 @@ Break down the cost by category and provide a total estimated cost.`;
 		const chatId = message.group ?? message.author;
 
 		// Verifica se o usuário é um super admin
-		if (!this.isSuperAdmin(message.author) && !this.isComuAdmin(bot, message.author)) {
+		if (
+			!message.isSystem &&
+			!this.isSuperAdmin(message.author) &&
+			!this.isComuAdmin(bot, message.author)
+		) {
 			return new ReturnMessage({
 				chatId,
 				content: "⛔ Apenas super administradores podem usar este comando."
@@ -1214,14 +1738,28 @@ Break down the cost by category and provide a total estimated cost.`;
 			});
 		}
 
-		// Processa o número para formato padrão (apenas dígitos)
-		let phoneNumber = args[0].replace(/\D/g, "");
-		phoneNumber = phoneNumber.split("@")[0];
+		let phoneNumber = "";
+		let inviteCode = null;
+
+		if (args.length === 1) {
+			if (args[0].includes("chat.whatsapp.com")) {
+				inviteCode = this.extractInviteCode(args[0]);
+			} else {
+				const cleanArg = args[0].replace(/\D/g, "");
+				// Se o argumento for um invite code (20+ chars e poucos dígitos)
+				if (args[0].length >= 20 && cleanArg.length < 8) {
+					inviteCode = this.extractInviteCode(args[0]);
+				} else {
+					phoneNumber = cleanArg.split("@")[0];
+				}
+			}
+		} else {
+			phoneNumber = args[0].replace(/\D/g, "").split("@")[0];
+			inviteCode = this.extractInviteCode(args[1]);
+		}
 
 		const blockedList = new Set();
 		if (phoneNumber) blockedList.add(phoneNumber);
-
-		const inviteCode = args[1];
 		let inviteInfoData = null;
 
 		if (inviteCode) {
@@ -1260,8 +1798,8 @@ Break down the cost by category and provide a total estimated cost.`;
 		}
 
 		// Adicionalmente bloqueia o invite code e o JID do grupo se disponíveis
-		if (inviteCode && inviteInfoData?.JID) {
-			await this.database.saveBlockedInvite(inviteCode, inviteInfoData.JID);
+		if (inviteCode) {
+			await this.database.saveBlockedInvite(inviteCode, inviteInfoData?.JID || null);
 		}
 
 		let response = `✅ Bloqueio de convites realizado para ${results.length} identificadores:\n- ${results.join("\n- ")}`;
@@ -1358,13 +1896,16 @@ Break down the cost by category and provide a total estimated cost.`;
 				phoneNumber = `${phoneNumber}@c.us`;
 			}
 
-			// Grupos especiais que não devem ser deixados, apenas remover a pessoa
-			const specialGroups = [];
+			const pnDigits = phoneNumber.replace(/\D/g, "");
+			if (this.isSuperAdmin(phoneNumber) || this.isSuperAdmin(pnDigits)) {
+				return new ReturnMessage({
+					chatId,
+					content: `⛔ Operação cancelada: ${phoneNumber} é um SuperAdministrador e não pode ser bloqueado.`
+				});
+			}
 
-			// Adicionar grupos especiais se estiverem definidos
-			if (bot.grupoInteracao) specialGroups.push(bot.grupoInteracao);
-			if (bot.grupoAvisos) specialGroups.push(bot.grupoAvisos);
-			if (bot.grupoAnuncios) specialGroups.push(bot.grupoAnuncios);
+			// Grupos especiais que não devem ser deixados, apenas remover a pessoa
+			const specialGroups = this.getSpecialGroups(bot);
 
 			try {
 				// Tenta remover o contato de grupos especiais primeiro
@@ -1657,6 +2198,16 @@ Break down the cost by category and provide a total estimated cost.`;
 				// Tenta sair do grupo
 				await bot.client.leaveGroup(groupId);
 
+				// Registra saída manual do grupo para alertas futuros de convite
+				let groupDbName = chat?.name || "Desconhecido";
+				try {
+					const groupData = await this.database.getGroup(groupId);
+					if (groupData?.name) groupDbName = groupData.name;
+					await this.database.recordManualGroupLeave(groupId, groupDbName, bot.id);
+				} catch (recErr) {
+					this.logger.error("Erro ao registrar saída manual no banco:", recErr);
+				}
+
 				// Prepara mensagem de retorno com comandos de bloqueio
 				let responseMessage = `✅ Bot saiu do grupo ${chat.name} (${groupId}) com sucesso.\n\n`;
 				responseMessage += `*Para bloquear administradores:*\n${blockAdminsCmd}\n\n`;
@@ -1759,31 +2310,98 @@ Break down the cost by category and provide a total estimated cost.`;
 				});
 			}
 
-			// Verifica se a mensagem contém uma imagem
-			if (message.type !== "image") {
+			let targetBot = bot;
+			const cmdArgs = [...(args || [])];
+
+			// Verifica se o primeiro argumento é o ID ou nome de outro bot
+			if (cmdArgs.length > 0) {
+				const candidateId = cmdArgs[0];
+				if (candidateId === bot.id || candidateId === bot.name) {
+					targetBot = bot;
+					cmdArgs.shift();
+				} else if (bot.otherBots && Array.isArray(bot.otherBots)) {
+					const found = bot.otherBots.find(
+						(b) => b.id === candidateId || b.name === candidateId || b.instanceName === candidateId
+					);
+					if (found) {
+						targetBot = found;
+						cmdArgs.shift();
+					}
+				}
+			}
+
+			let media = null;
+
+			// 1. Mensagem enviada diretamente como imagem
+			if (message.type === "image") {
+				if (typeof message.downloadMedia === "function") {
+					media = await message.downloadMedia();
+				} else if (message.content && (message.content.data || message.content.url)) {
+					media = message.content;
+				}
+			}
+
+			// 2. Mensagem respondendo/citando uma imagem
+			if (
+				!media &&
+				(message.hasQuotedMsg || typeof message.origin?.getQuotedMessage === "function")
+			) {
+				try {
+					const quotedMsg = await message.origin.getQuotedMessage().catch(() => null);
+					if (quotedMsg && (quotedMsg.type === "image" || quotedMsg.hasMedia)) {
+						if (typeof quotedMsg.downloadMedia === "function") {
+							media = await quotedMsg.downloadMedia();
+						} else if (quotedMsg.content && (quotedMsg.content.data || quotedMsg.content.url)) {
+							media = quotedMsg.content;
+						}
+					}
+				} catch (err) {
+					this.logger.warn("Erro ao buscar mídia de mensagem citada:", err);
+				}
+			}
+
+			// 3. Argumento contendo URL de imagem ou arquivo local
+			if (!media && cmdArgs.length > 0) {
+				const urlCandidate = cmdArgs[0].trim();
+				if (
+					urlCandidate.startsWith("http://") ||
+					urlCandidate.startsWith("https://") ||
+					urlCandidate.startsWith("data:image/") ||
+					(urlCandidate.length < 300 && require("fs").existsSync(urlCandidate))
+				) {
+					media = urlCandidate;
+				}
+			}
+
+			if (!media) {
 				return new ReturnMessage({
 					chatId,
-					content: "❌ Este comando deve ser usado como legenda de uma imagem."
+					content:
+						"❌ Envie este comando como legenda de uma imagem, respondendo a uma imagem ou passando uma URL. Exemplo:\n• `!sa-foto https://exemplo.com/foto.jpg`\n• `!sa-foto [botNome] https://exemplo.com/foto.jpg`"
 				});
 			}
 
 			try {
-				// Obtém a mídia da mensagem
-				const media = message.content;
-
-				// Altera a foto de perfil
-				await bot.client.setProfilePicture(media);
+				if (typeof targetBot.updateProfilePicture === "function") {
+					await targetBot.updateProfilePicture(media);
+				} else if (typeof targetBot.setProfilePicture === "function") {
+					await targetBot.setProfilePicture(media);
+				} else if (targetBot.client && typeof targetBot.client.setProfilePicture === "function") {
+					await targetBot.client.setProfilePicture(media);
+				} else {
+					throw new Error("Bot não suporta alteração de foto de perfil");
+				}
 
 				return new ReturnMessage({
 					chatId,
-					content: "✅ Foto de perfil alterada com sucesso!"
+					content: `✅ Foto de perfil do bot *${targetBot.id || targetBot.name || "bot"}* alterada com sucesso!`
 				});
 			} catch (pictureError) {
 				this.logger.error("Erro ao alterar foto de perfil:", pictureError);
 
 				return new ReturnMessage({
 					chatId,
-					content: `❌ Erro ao alterar foto de perfil: ${pictureError.message}`
+					content: `❌ Erro ao alterar foto de perfil: ${pictureError.message || pictureError}`
 				});
 			}
 		} catch (error) {
@@ -1896,6 +2514,15 @@ Break down the cost by category and provide a total estimated cost.`;
 			}
 
 			// Verifica se o StreamMonitor está disponível
+			if (!bot.streamMonitor) {
+				const StreamSystem = require("../StreamSystem");
+				const streamSystem = StreamSystem.getInstance();
+				if (!streamSystem.initialized) {
+					await streamSystem.initialize(true);
+				}
+				bot.streamMonitor = streamSystem.streamMonitor;
+			}
+
 			if (!bot.streamMonitor) {
 				return new ReturnMessage({
 					chatId,
@@ -2232,12 +2859,7 @@ Break down the cost by category and provide a total estimated cost.`;
 			}
 
 			// Grupos especiais que não devem ser deixados, apenas remover a pessoa
-			const specialGroups = [];
-
-			// Adicionar grupos especiais se estiverem definidos
-			if (bot.grupoInteracao) specialGroups.push(bot.grupoInteracao);
-			if (bot.grupoAvisos) specialGroups.push(bot.grupoAvisos);
-			if (bot.grupoAnuncios) specialGroups.push(bot.grupoAnuncios);
+			const specialGroups = this.getSpecialGroups(bot);
 
 			// Resultados do bloqueio
 			const results = [];
@@ -2251,6 +2873,13 @@ Break down the cost by category and provide a total estimated cost.`;
 				// Se o número estiver vazio, pula para o próximo
 				if (!phoneNumber) {
 					results.push({ id: contactItem, status: "Erro", message: "Número inválido" });
+					continue;
+				}
+
+				const pnClean = phoneNumber;
+				if (this.isSuperAdmin(contactItem) || this.isSuperAdmin(pnClean)) {
+					this.logger.info(`Ignorando bloqueio de ${contactItem}: usuário é SuperAdmin.`);
+					results.push({ id: contactItem, status: "Ignorado", message: "SuperAdmin protegido" });
 					continue;
 				}
 
@@ -2414,14 +3043,12 @@ Break down the cost by category and provide a total estimated cost.`;
 			}
 
 			// Grupos especiais que não devem ser deixados, apenas remover a pessoa
-			const specialGroups = [];
-
-			// Adicionar grupos especiais se estiverem definidos
-			if (bot.grupoInteracao) specialGroups.push(bot.grupoInteracao);
-			if (bot.grupoAvisos) specialGroups.push(bot.grupoAvisos);
-			if (bot.grupoAnuncios) specialGroups.push(bot.grupoAnuncios);
-
+			const specialGroups = this.getSpecialGroups(bot);
 			this.logger.info(`Grupos especiais configurados: ${specialGroups.join(", ")}`);
+
+			// Coleta participantes de grupos oficiais para NUNCA bloqueá-los
+			const officialGroupMembers = await this.getOfficialGroupMembers(bot, specialGroups);
+			this.logger.info(`Membros oficiais protegidos coletados: ${officialGroupMembers.size}`);
 
 			// Resultados da operação para cada contato
 			const contactResults = [];
@@ -2443,6 +3070,20 @@ Break down the cost by category and provide a total estimated cost.`;
 						phoneNumber: contactItem,
 						status: "Erro",
 						message: "Número inválido",
+						groups: [],
+						totalGroups: 0
+					});
+					continue;
+				}
+
+				const targetDigits = phoneNumber;
+				if (this.isSuperAdmin(contactItem) || this.isSuperAdmin(targetDigits)) {
+					this.logger.info(`Ignorando contato alvo ${contactItem}: é SuperAdmin.`);
+					contactResults.push({
+						phoneNumber: contactItem,
+						contactName: "SuperAdmin Protegido",
+						status: "Ignorado",
+						message: "SuperAdmin protegido",
 						groups: [],
 						totalGroups: 0
 					});
@@ -2507,13 +3148,7 @@ Break down the cost by category and provide a total estimated cost.`;
 							const groupName = chat.name ?? groupId;
 
 							// Verifica se é um grupo especial
-							const nameLower = groupName ? groupName.toLowerCase() : "";
-							const isSpecialGroup =
-								specialGroups.includes(groupId) ||
-								(groupName &&
-									(nameLower.includes("gpzuera") ||
-										nameLower.includes("rapescas") ||
-										nameLower.includes("ravdownloads")));
+							const isSpecialGroup = this.isSpecialGroup(groupId, groupName, specialGroups);
 
 							if (isSpecialGroup) {
 								this.logger.info(
@@ -2522,12 +3157,28 @@ Break down the cost by category and provide a total estimated cost.`;
 								results.specialGroups++;
 
 								try {
-									// Verifica se o contato está no grupo
-									const isInGroup = chat.participants.some((p) => p.id._serialized === phoneNumber);
+									const participantToRemove = chat.participants?.find((p) => {
+										const pId = p.id?._serialized || p.id || "";
+										const pPn = p.PhoneNumber || p.phoneNumber || "";
+										const pLid = p.LID || p.lid || "";
+										return (
+											pId === phoneNumber ||
+											pPn === phoneNumber ||
+											(targetDigits &&
+												((pId && pId.replace(/\D/g, "") === targetDigits) ||
+													(pPn && pPn.replace(/\D/g, "") === targetDigits) ||
+													(pLid && pLid.replace(/\D/g, "") === targetDigits)))
+										);
+									});
 
-									if (isInGroup) {
+									if (participantToRemove) {
+										const toRemoveId =
+											participantToRemove.id?._serialized ||
+											participantToRemove.JID ||
+											participantToRemove.id ||
+											phoneNumber;
 										// Remove apenas a pessoa do grupo
-										await chat.removeParticipants([phoneNumber]);
+										await chat.removeParticipants([toRemoveId]);
 
 										results.groups.push({
 											id: groupId,
@@ -2562,24 +3213,38 @@ Break down the cost by category and provide a total estimated cost.`;
 								// Para grupos normais, obtém participantes e sai do grupo
 								const participants = chat.participants ?? [];
 
-								// Adiciona ID de cada participante ao conjunto global e marca o grupo como processado
+								// Adiciona cada participante ao conjunto global e marca o grupo como processado
 								if (!processedGroups.has(groupId)) {
 									participants.forEach((participant) => {
-										// Não adicione os contatos da lista sendo processada
-										const participantId = participant.id._serialized;
+										const pId =
+											participant.id?._serialized ||
+											participant.JID ||
+											participant.id ||
+											participant;
+										const pPn = participant.PhoneNumber || participant.phoneNumber || "";
+										const pLid = participant.LID || participant.lid || "";
+										const pDigits = typeof pId === "string" ? pId.replace(/\D/g, "") : "";
+										const pnDigits = typeof pPn === "string" ? pPn.replace(/\D/g, "") : "";
+
 										if (
-											!contactsList.includes(participantId) &&
-											!contactsList.includes(participantId.replace("@c.us", ""))
+											pId !== phoneNumber &&
+											pDigits !== targetDigits &&
+											pnDigits !== targetDigits &&
+											!contactsList.includes(pId) &&
+											!contactsList.includes(pDigits)
 										) {
-											allContactsSet.add(participantId);
+											allContactsSet.add(
+												JSON.stringify({
+													id: pId,
+													phoneNumber: pPn,
+													lid: pLid
+												})
+											);
 										}
 									});
 
 									// Marca o grupo como processado
 									processedGroups.add(groupId);
-
-									// Envia mensagem de despedida (opcional)
-									//await bot.sendMessage(groupId, '👋 Saindo deste grupo por comando administrativo. Até mais!');
 
 									// Sai do grupo
 									await bot.client.leaveGroup(groupId);
@@ -2615,27 +3280,34 @@ Break down the cost by category and provide a total estimated cost.`;
 					// Adiciona os resultados deste contato
 					contactResults.push(results);
 
-					// Tenta bloquear este contato (API e Local)
-					try {
-						// API
+					// Tenta bloquear este contato alvo (API e Local) se não for SuperAdmin
+					if (this.isSuperAdmin(phoneNumber) || this.isSuperAdmin(targetDigits)) {
+						this.logger.info(`Ignorando bloqueio do contato alvo ${phoneNumber}: é SuperAdmin.`);
+					} else {
 						try {
-							await contact.block();
-						} catch (apiError) {
-							this.logger.error(`Erro ao bloquear contato ${phoneNumber} na API:`, apiError);
-						}
-						// Local
-						try {
-							const pnClean = phoneNumber.split("@")[0];
-							await this.database.addLocalBlock(pnClean);
-						} catch (localError) {
-							this.logger.error(`Erro ao bloquear contato ${phoneNumber} localmente:`, localError);
-						}
+							// API
+							try {
+								await contact.block();
+							} catch (apiError) {
+								this.logger.error(`Erro ao bloquear contato ${phoneNumber} na API:`, apiError);
+							}
+							// Local
+							try {
+								const pnClean = phoneNumber.split("@")[0];
+								await this.database.addLocalBlock(pnClean);
+							} catch (localError) {
+								this.logger.error(
+									`Erro ao bloquear contato ${phoneNumber} localmente:`,
+									localError
+								);
+							}
 
-						this.logger.info(`Contato ${phoneNumber} bloqueado (API/Local).`);
-					} catch (blockError) {
-						this.logger.error(`Erro ao processar bloqueio de ${phoneNumber}:`, blockError);
-						results.status = "Erro ao bloquear";
-						results.error = blockError.message;
+							this.logger.info(`Contato ${phoneNumber} bloqueado (API/Local).`);
+						} catch (blockError) {
+							this.logger.error(`Erro ao processar bloqueio de ${phoneNumber}:`, blockError);
+							results.status = "Erro ao bloquear";
+							results.error = blockError.message;
+						}
 					}
 				} catch (contactError) {
 					this.logger.error(`Erro ao processar contato ${phoneNumber}:`, contactError);
@@ -2649,23 +3321,94 @@ Break down the cost by category and provide a total estimated cost.`;
 				}
 			}
 
-			// Converte o conjunto para array para facilitar o processamento
-			const allContacts = Array.from(allContactsSet);
+			// Converte o conjunto para objetos
+			const allContacts = Array.from(allContactsSet).map((c) => {
+				try {
+					return JSON.parse(c);
+				} catch (_) {
+					return { id: c, phoneNumber: "", lid: "" };
+				}
+			});
 
-			// Bloqueia todos os contatos coletados dos grupos (API e Local)
+			// Bloqueia todos os contatos coletados dos grupos normais (API e Local) com filtros de segurança
 			let blockedCount = 0;
 			let blockErrors = 0;
+			let skippedSuperAdmin = 0;
+			let skippedOfficial = 0;
+			const targetNumbersClean = contactsList.map((c) => c.replace(/\D/g, "")).filter(Boolean);
 
-			for (const contactId of allContacts) {
+			for (const contactObj of allContacts) {
+				const contactId = contactObj.id;
+				const contactPn = contactObj.phoneNumber;
+				const contactLid = contactObj.lid;
+
+				const idDigits = contactId ? contactId.replace(/\D/g, "") : "";
+				const pnDigits = contactPn ? contactPn.replace(/\D/g, "") : "";
+				const lidDigits = contactLid ? contactLid.replace(/\D/g, "") : "";
+
 				try {
-					// Verifica se não é o próprio usuário ou um dos contatos da lista
+					// 1. Verifica se não é o próprio usuário ou um dos contatos da lista
 					if (
 						contactId === message.author ||
 						contactsList.includes(contactId) ||
-						contactsList.includes(contactId.replace("@c.us", ""))
+						contactsList.includes(contactId.replace("@c.us", "")) ||
+						(idDigits && targetNumbersClean.includes(idDigits)) ||
+						(pnDigits && targetNumbersClean.includes(pnDigits))
 					) {
 						continue;
 					}
+
+					// 2. NUNCA bloquear SuperAdmins
+					if (
+						this.isSuperAdmin(contactId) ||
+						(idDigits && this.isSuperAdmin(idDigits)) ||
+						(pnDigits && this.isSuperAdmin(pnDigits)) ||
+						(contactPn && this.isSuperAdmin(contactPn))
+					) {
+						this.logger.info(
+							`Ignorando bloqueio de ${contactId} (${contactPn || idDigits}): usuário é SuperAdmin.`
+						);
+						skippedSuperAdmin++;
+						continue;
+					}
+
+					// 3. NUNCA bloquear membros de grupos oficiais
+					if (
+						officialGroupMembers.has(contactId) ||
+						(idDigits && officialGroupMembers.has(idDigits)) ||
+						(pnDigits && officialGroupMembers.has(pnDigits)) ||
+						(lidDigits && officialGroupMembers.has(lidDigits)) ||
+						(contactPn && officialGroupMembers.has(contactPn))
+					) {
+						this.logger.info(
+							`Ignorando bloqueio de ${contactId} (${contactPn || idDigits}): membro de grupo oficial protegido.`
+						);
+						skippedOfficial++;
+						continue;
+					}
+
+					// Se for LID e não temos o telefone real, tenta consultar detalhes do contato
+					let resolvedNumber = null;
+					try {
+						const contactDetails = await bot.client.getContactById(contactId);
+						if (contactDetails?.number) {
+							resolvedNumber = contactDetails.number.replace(/\D/g, "");
+							if (this.isSuperAdmin(resolvedNumber)) {
+								this.logger.info(
+									`Ignorando bloqueio de ${contactId} (${resolvedNumber}): usuário é SuperAdmin.`
+								);
+								skippedSuperAdmin++;
+								continue;
+							}
+							if (officialGroupMembers.has(resolvedNumber)) {
+								this.logger.info(
+									`Ignorando bloqueio de ${contactId} (${resolvedNumber}): membro de grupo oficial protegido.`
+								);
+								skippedOfficial++;
+								continue;
+							}
+						}
+					} catch (_) {}
 
 					// API
 					try {
@@ -2697,6 +3440,12 @@ Break down the cost by category and provide a total estimated cost.`;
 			responseMessage += `• Grupos únicos processados: ${processedGroups.size}\n`;
 			responseMessage += `• Contatos únicos encontrados: ${allContacts.length}\n`;
 			responseMessage += `• Contatos bloqueados: ${blockedCount}\n`;
+			if (skippedSuperAdmin > 0) {
+				responseMessage += `• SuperAdmins ignorados: ${skippedSuperAdmin}\n`;
+			}
+			if (skippedOfficial > 0) {
+				responseMessage += `• Membros de grupos oficiais ignorados: ${skippedOfficial}\n`;
+			}
 			responseMessage += `• Erros de bloqueio: ${blockErrors}\n\n`;
 
 			// Adiciona detalhes para cada contato processado
@@ -3035,23 +3784,29 @@ Break down the cost by category and provide a total estimated cost.`;
 				});
 			}
 
-			// Grupos especiais que não devem ser deixados, apenas remover a pessoa
-			const specialGroups = [];
-
-			// Adicionar grupos especiais se estiverem definidos
-			if (bot.grupoInteracao) specialGroups.push(bot.grupoInteracao);
-			if (bot.grupoAvisos) specialGroups.push(bot.grupoAvisos);
-			if (bot.grupoAnuncios) specialGroups.push(bot.grupoAnuncios);
-
-			this.logger.info(`Grupos especiais configurados: ${specialGroups.join(", ")}`);
-
 			// Processa o número para formato padrão
 			let phoneNumber = args[0].replace(/\D/g, "");
+			const targetDigits = phoneNumber;
+
+			if (this.isSuperAdmin(args[0]) || this.isSuperAdmin(targetDigits)) {
+				return new ReturnMessage({
+					chatId,
+					content: `⛔ Operação cancelada: ${args[0]} é um SuperAdministrador e não pode ser bloqueado.`
+				});
+			}
 
 			// Se o número não tiver o formato @c.us, adicione
 			if (!phoneNumber.includes("@")) {
 				phoneNumber = `${phoneNumber}@c.us`;
 			}
+
+			// Grupos especiais que não devem ser deixados, apenas remover a pessoa
+			const specialGroups = this.getSpecialGroups(bot);
+			this.logger.info(`Grupos especiais configurados: ${specialGroups.join(", ")}`);
+
+			// Coleta participantes de grupos oficiais para NUNCA bloqueá-los
+			const officialGroupMembers = await this.getOfficialGroupMembers(bot, specialGroups);
+			this.logger.info(`Membros oficiais protegidos coletados: ${officialGroupMembers.size}`);
 
 			try {
 				// Obtém o contato
@@ -3091,13 +3846,7 @@ Break down the cost by category and provide a total estimated cost.`;
 						const groupName = chat.name ?? groupId;
 
 						// Verifica se é um grupo especial
-						const nameLower = groupName ? groupName.toLowerCase() : "";
-						const isSpecialGroup =
-							specialGroups.includes(groupId) ||
-							(groupName &&
-								(nameLower.includes("gpzuera") ||
-									nameLower.includes("rapescas") ||
-									nameLower.includes("ravdownloads")));
+						const isSpecialGroup = this.isSpecialGroup(groupId, groupName, specialGroups);
 
 						if (isSpecialGroup) {
 							this.logger.info(
@@ -3106,12 +3855,28 @@ Break down the cost by category and provide a total estimated cost.`;
 							results.specialGroups++;
 
 							try {
-								// Verifica se o contato está no grupo
-								const isInGroup = chat.participants.some((p) => p.id._serialized === phoneNumber);
+								const participantToRemove = chat.participants?.find((p) => {
+									const pId = p.id?._serialized || p.id || "";
+									const pPn = p.PhoneNumber || p.phoneNumber || "";
+									const pLid = p.LID || p.lid || "";
+									return (
+										pId === phoneNumber ||
+										pPn === phoneNumber ||
+										(targetDigits &&
+											((pId && pId.replace(/\D/g, "") === targetDigits) ||
+												(pPn && pPn.replace(/\D/g, "") === targetDigits) ||
+												(pLid && pLid.replace(/\D/g, "") === targetDigits)))
+									);
+								});
 
-								if (isInGroup) {
+								if (participantToRemove) {
+									const toRemoveId =
+										participantToRemove.id?._serialized ||
+										participantToRemove.JID ||
+										participantToRemove.id ||
+										phoneNumber;
 									// Remove apenas a pessoa do grupo
-									await chat.removeParticipants([phoneNumber]);
+									await chat.removeParticipants([toRemoveId]);
 
 									results.groupsInfo.push({
 										id: groupId,
@@ -3150,16 +3915,26 @@ Break down the cost by category and provide a total estimated cost.`;
 							// Para grupos normais, obtém participantes e sai do grupo
 							const participants = chat.participants ?? [];
 
-							// Adiciona ID de cada participante ao conjunto
+							// Adiciona cada participante ao conjunto (com dados de telefone/lid se disponíveis)
 							participants.forEach((participant) => {
-								// Não adicione o próprio contato sendo bloqueado
-								if (participant.id._serialized !== phoneNumber) {
-									allContacts.add(participant.id._serialized);
+								const pId =
+									participant.id?._serialized || participant.JID || participant.id || participant;
+								const pPn = participant.PhoneNumber || participant.phoneNumber || "";
+								const pLid = participant.LID || participant.lid || "";
+								const pDigits = typeof pId === "string" ? pId.replace(/\D/g, "") : "";
+								const pnDigits = typeof pPn === "string" ? pPn.replace(/\D/g, "") : "";
+
+								// Não adiciona o próprio contato sendo bloqueado
+								if (pId !== phoneNumber && pDigits !== targetDigits && pnDigits !== targetDigits) {
+									allContacts.add(
+										JSON.stringify({
+											id: pId,
+											phoneNumber: pPn,
+											lid: pLid
+										})
+									);
 								}
 							});
-
-							// Envia mensagem de despedida
-							//await bot.sendMessage(groupId, '👋 Saindo deste grupo por comando administrativo. Até mais!');
 
 							// Sai do grupo
 							await bot.client.leaveGroup(groupId);
@@ -3186,12 +3961,88 @@ Break down the cost by category and provide a total estimated cost.`;
 				}
 
 				results.totalContacts = allContacts.size;
+				let skippedSuperAdmin = 0;
+				let skippedOfficial = 0;
 
 				// Bloqueia todos os contatos coletados dos grupos não-especiais (API e Local)
-				for (const contactId of allContacts) {
+				for (const contactRaw of allContacts) {
+					let contactObj;
 					try {
-						// Verifica se não é o próprio usuário ou o contato alvo
-						if (contactId === message.author || contactId === phoneNumber) continue;
+						contactObj = JSON.parse(contactRaw);
+					} catch (_) {
+						contactObj = { id: contactRaw, phoneNumber: "", lid: "" };
+					}
+
+					const contactId = contactObj.id;
+					const contactPn = contactObj.phoneNumber;
+					const contactLid = contactObj.lid;
+
+					const idDigits = contactId ? contactId.replace(/\D/g, "") : "";
+					const pnDigits = contactPn ? contactPn.replace(/\D/g, "") : "";
+					const lidDigits = contactLid ? contactLid.replace(/\D/g, "") : "";
+
+					try {
+						// 1. Verifica se não é o próprio usuário ou o contato alvo
+						if (
+							contactId === message.author ||
+							contactId === phoneNumber ||
+							(idDigits && idDigits === targetDigits) ||
+							(pnDigits && pnDigits === targetDigits)
+						) {
+							continue;
+						}
+
+						// 2. NUNCA bloquear SuperAdmins
+						if (
+							this.isSuperAdmin(contactId) ||
+							(idDigits && this.isSuperAdmin(idDigits)) ||
+							(pnDigits && this.isSuperAdmin(pnDigits)) ||
+							(contactPn && this.isSuperAdmin(contactPn))
+						) {
+							this.logger.info(
+								`Ignorando bloqueio de ${contactId} (${contactPn || idDigits}): usuário é SuperAdmin.`
+							);
+							skippedSuperAdmin++;
+							continue;
+						}
+
+						// 3. NUNCA bloquear membros de grupos oficiais (gpzuera, rapescas, ravdownloads, legionlog, etc.)
+						if (
+							officialGroupMembers.has(contactId) ||
+							(idDigits && officialGroupMembers.has(idDigits)) ||
+							(pnDigits && officialGroupMembers.has(pnDigits)) ||
+							(lidDigits && officialGroupMembers.has(lidDigits)) ||
+							(contactPn && officialGroupMembers.has(contactPn))
+						) {
+							this.logger.info(
+								`Ignorando bloqueio de ${contactId} (${contactPn || idDigits}): membro de grupo oficial protegido.`
+							);
+							skippedOfficial++;
+							continue;
+						}
+
+						// Se for LID e não temos o telefone real, tenta consultar detalhes do contato
+						let resolvedNumber = null;
+						try {
+							const contactDetails = await bot.client.getContactById(contactId);
+							if (contactDetails?.number) {
+								resolvedNumber = contactDetails.number.replace(/\D/g, "");
+								if (this.isSuperAdmin(resolvedNumber)) {
+									this.logger.info(
+										`Ignorando bloqueio de ${contactId} (${resolvedNumber}): usuário é SuperAdmin.`
+									);
+									skippedSuperAdmin++;
+									continue;
+								}
+								if (officialGroupMembers.has(resolvedNumber)) {
+									this.logger.info(
+										`Ignorando bloqueio de ${contactId} (${resolvedNumber}): membro de grupo oficial protegido.`
+									);
+									skippedOfficial++;
+									continue;
+								}
+							}
+						} catch (_) {}
 
 						// API
 						try {
@@ -3216,27 +4067,36 @@ Break down the cost by category and provide a total estimated cost.`;
 					}
 				}
 
-				// Bloqueia o contato alvo por último (API e Local)
-				try {
-					// API
+				// Bloqueia o contato alvo por último (API e Local) se não for SuperAdmin
+				if (this.isSuperAdmin(phoneNumber) || this.isSuperAdmin(targetDigits)) {
+					this.logger.warn(
+						`Tentativa de bloquear contato alvo ${phoneNumber} que é SuperAdmin cancelada.`
+					);
+				} else {
 					try {
-						await contact.block();
-					} catch (apiErr) {
-						this.logger.error(`Erro ao bloquear contato alvo ${phoneNumber} na API:`, apiErr);
-					}
+						// API
+						try {
+							await contact.block();
+						} catch (apiErr) {
+							this.logger.error(`Erro ao bloquear contato alvo ${phoneNumber} na API:`, apiErr);
+						}
 
-					// Local
-					try {
-						const pnClean = phoneNumber.split("@")[0];
-						await this.database.addLocalBlock(pnClean);
-					} catch (localErr) {
-						this.logger.error(`Erro ao bloquear contato alvo ${phoneNumber} localmente:`, localErr);
-					}
+						// Local
+						try {
+							const pnClean = phoneNumber.split("@")[0];
+							await this.database.addLocalBlock(pnClean);
+						} catch (localErr) {
+							this.logger.error(
+								`Erro ao bloquear contato alvo ${phoneNumber} localmente:`,
+								localErr
+							);
+						}
 
-					this.logger.info(`Contato alvo ${phoneNumber} bloqueado (API/Local).`);
-				} catch (blockTargetError) {
-					this.logger.error(`Erro ao bloquear contato alvo ${phoneNumber}:`, blockTargetError);
-					results.errors++;
+						this.logger.info(`Contato alvo ${phoneNumber} bloqueado (API/Local).`);
+					} catch (blockTargetError) {
+						this.logger.error(`Erro ao bloquear contato alvo ${phoneNumber}:`, blockTargetError);
+						results.errors++;
+					}
 				}
 
 				// Constrói a mensagem de resposta
@@ -3247,6 +4107,12 @@ Break down the cost by category and provide a total estimated cost.`;
 				responseMessage += `• Grupos deixados: ${results.leftGroups}\n`;
 				responseMessage += `• Contatos únicos: ${results.totalContacts}\n`;
 				responseMessage += `• Contatos bloqueados: ${results.blockedContacts}\n`;
+				if (skippedSuperAdmin > 0) {
+					responseMessage += `• SuperAdmins ignorados: ${skippedSuperAdmin}\n`;
+				}
+				if (skippedOfficial > 0) {
+					responseMessage += `• Membros de grupos oficiais ignorados: ${skippedOfficial}\n`;
+				}
 				responseMessage += `• Erros: ${results.errors}\n\n`;
 
 				responseMessage += `*Detalhes dos grupos:*\n`;
@@ -3596,9 +4462,18 @@ Retorne no formato JSON rigoroso:
 				responseMessage += `\n*Filtros:*\n`;
 				responseMessage += `- *NSFW:* ${group.filters.nsfw ? "Ativado" : "Desativado"}\n`;
 				responseMessage += `- *Links:* ${group.filters.links ? "Ativado" : "Desativado"}\n`;
+				responseMessage += `- *Permitir Admins:* ${group.filters.allowAdmins ? "Ativado" : "Desativado"}\n`;
+
+				if (group.filters.allowedLinks && group.filters.allowedLinks.length > 0) {
+					responseMessage += `- *Links Permitidos:* ${group.filters.allowedLinks.join(", ")}\n`;
+				}
 
 				if (group.filters.words && group.filters.words.length > 0) {
 					responseMessage += `- *Palavras:* ${group.filters.words.join(", ")}\n`;
+				}
+
+				if (group.filters.regexes && group.filters.regexes.length > 0) {
+					responseMessage += `- *Regexes:* ${group.filters.regexes.length} expressões filtradas\n`;
 				}
 
 				if (group.filters.people && group.filters.people.length > 0) {
@@ -3991,6 +4866,841 @@ Retorne no formato JSON rigoroso:
 			return new ReturnMessage({
 				chatId,
 				content: `❌ Erro ao adicionar usuário: ${error.message || JSON.stringify(error)}`
+			});
+		}
+	}
+
+	/**
+	 * Mapeia todos os IDs de grupos nos quais pelo menos uma instância de bot está presente.
+	 * Consulta as APIs nativas das instâncias whatsgo e bots em execução (WhatsApp, Discord, Telegram).
+	 * @param {Object} currentBot - Instância atual do bot que recebeu o comando
+	 * @returns {Promise<{activeGroupIds: Set<string>, botSummary: string[]}>}
+	 */
+	async getAllActiveBotGroupIds(currentBot) {
+		const activeGroupIds = new Set();
+		const botSummary = [];
+
+		// 1. Consulta WhatsGo API diretamente para todas as instâncias ativas
+		const whatsGoUrl = (process.env.WHATS_GO_API_URL || "http://localhost:9800").replace(/\/$/, "");
+		const globalKey = process.env.GLOBAL_API_KEY || "admin";
+
+		try {
+			const instRes = await axios.get(`${whatsGoUrl}/instance/all`, {
+				headers: { apikey: globalKey },
+				timeout: 5000
+			});
+			const instances = (instRes.data?.data || []).filter((i) => i.connected);
+			for (const inst of instances) {
+				try {
+					const res = await axios.get(`${whatsGoUrl}/group/list`, {
+						headers: { apikey: globalKey, instance: inst.name },
+						timeout: 10000
+					});
+					const list = res.data?.data || res.data || [];
+					let count = 0;
+					list.forEach((g) => {
+						if (g.JID) {
+							activeGroupIds.add(g.JID);
+							count++;
+						}
+					});
+					botSummary.push(`WhatsGo:${inst.name} (${count} grupos)`);
+				} catch (err) {
+					this.logger.warn(
+						`[streamsCleanup] Erro ao listar grupos WhatsGo para ${inst.name}: ${err.message}`
+					);
+				}
+			}
+		} catch (err) {
+			this.logger.warn(
+				`[streamsCleanup] Não foi possível consultar WhatsGo API (/instance/all): ${err.message}`
+			);
+		}
+
+		// 2. Complementa com bots registrados em memória (WhatsApp, Discord, Telegram)
+		const StreamSystem = require("../StreamSystem");
+		const streamSystem = StreamSystem.getInstance();
+		const allBots =
+			streamSystem.bots && streamSystem.bots.length > 0
+				? streamSystem.bots
+				: this.database.botInstances || [currentBot];
+
+		for (const b of allBots) {
+			try {
+				if (b.useDiscord && b.discordClient) {
+					let dcCount = 0;
+					if (b.discordClient.channels?.cache) {
+						for (const chId of b.discordClient.channels.cache.keys()) {
+							activeGroupIds.add(chId.toString());
+							dcCount++;
+						}
+					}
+					if (b.discordClient.guilds?.cache) {
+						for (const gId of b.discordClient.guilds.cache.keys()) {
+							activeGroupIds.add(gId.toString());
+							dcCount++;
+						}
+					}
+					botSummary.push(`Discord:${b.id} (${dcCount} canais/guilds)`);
+				} else if (b.useTelegram) {
+					botSummary.push(`Telegram:${b.id}`);
+				} else if (
+					typeof b.listGroups === "function" &&
+					!botSummary.some((s) => s.startsWith(`WhatsGo:${b.id}`))
+				) {
+					const grupos = await b.listGroups();
+					if (Array.isArray(grupos)) {
+						let count = 0;
+						grupos.forEach((g) => {
+							if (g.JID) {
+								activeGroupIds.add(g.JID);
+								count++;
+							}
+						});
+						botSummary.push(`WhatsApp:${b.id} (${count} grupos)`);
+					}
+				}
+			} catch (err) {
+				this.logger.warn(
+					`[streamsCleanup] Erro ao consultar grupos do bot ${b.id}: ${err.message}`
+				);
+			}
+		}
+
+		return { activeGroupIds, botSummary };
+	}
+
+	/**
+	 * Comando SuperAdmin: streams-cleanup
+	 * 1. Itera todos os grupos que possuem um canal da Twitch/Kick definido
+	 * 2. Verifica se o canal existe na plataforma
+	 * 3. Verifica se algum dos bots (todas as instâncias, não importa o tipo) está no grupo
+	 *
+	 * Canal não existe ou nenhum bot no grupo: remove a entrada de stream do grupo.
+	 * Verbose no terminal e resposta com relatório completo.
+	 *
+	 * @param {Object} bot - Instância do bot que recebeu o comando
+	 * @param {Object} message - Mensagem recebida
+	 * @param {Array} args - Argumentos do comando
+	 */
+	async streamsCleanup(bot, message, args) {
+		const chatId = message.group ?? message.author;
+		try {
+			if (!this.isSuperAdmin(message.author)) {
+				return new ReturnMessage({
+					chatId,
+					content: "❌ Este comando é exclusivo para SuperAdministradores do sistema."
+				});
+			}
+
+			const startTime = Date.now();
+			this.logger.info("=== [streamsCleanup] INICIANDO LIMPEZA DE STREAMS ===");
+			console.log("[streamsCleanup] Iniciando varredura e limpeza de streams...");
+
+			// Avisa no chat que o processo começou
+			if (typeof bot.sendMessage === "function") {
+				await bot.sendMessage(
+					chatId,
+					"⏳ *Iniciando streams-cleanup...*\nMapeando bots, grupos e checando integridade dos canais na Twitch e Kick. Isso pode levar alguns instantes."
+				);
+			}
+
+			// 1. Obter StreamMonitor e StreamSystem
+			const StreamSystem = require("../StreamSystem");
+			const streamSystem = StreamSystem.getInstance();
+
+			if (!streamSystem.initialized) {
+				console.log(
+					"[streamsCleanup] StreamSystem ainda não inicializado (aguardando timer de 3min pós-boot). Inicializando agora..."
+				);
+				await streamSystem.initialize(true);
+			}
+
+			let streamMonitor = bot.streamMonitor || streamSystem.streamMonitor;
+			if (!streamMonitor) {
+				const StreamMonitor = require("../services/StreamMonitor");
+				streamMonitor = StreamMonitor.getInstance();
+			}
+
+			if (!streamMonitor) {
+				return new ReturnMessage({
+					chatId,
+					content: "❌ StreamMonitor não pôde ser inicializado no bot."
+				});
+			}
+
+			// 2. Mapear grupos ativos com bots
+			console.log("[streamsCleanup] Mapeando instâncias de bots e seus grupos ativos...");
+			const { activeGroupIds, botSummary } = await this.getAllActiveBotGroupIds(bot);
+			console.log(
+				`[streamsCleanup] Total de grupos únicos com pelo menos 1 bot: ${activeGroupIds.size}`
+			);
+			console.log(`[streamsCleanup] Bots mapeados: ${botSummary.join(", ")}`);
+
+			// 3. Obter todos os grupos do banco
+			const allGroups = await this.database.getGroups();
+			const streamGroups = allGroups.filter(
+				(g) =>
+					(Array.isArray(g.twitch) && g.twitch.length > 0) ||
+					(Array.isArray(g.kick) && g.kick.length > 0)
+			);
+
+			console.log(
+				`[streamsCleanup] Encontrados ${streamGroups.length} grupos com streams configuradas.`
+			);
+			this.logger.info(
+				`[streamsCleanup] ${streamGroups.length} grupos com streams a serem avaliados.`
+			);
+
+			const removedChannels = [];
+			const keptChannels = [];
+			let groupsModifiedCount = 0;
+			let groupsWithBotCount = 0;
+			let groupsWithoutBotCount = 0;
+
+			// Cache em memória para não consultar o mesmo canal repetidas vezes nas APIs
+			const twitchExistenceCache = new Map();
+			const kickExistenceCache = new Map();
+
+			for (let i = 0; i < streamGroups.length; i++) {
+				const group = streamGroups[i];
+				const groupName = group.name || "Sem nome";
+				const groupId = group.id;
+
+				// Verifica se algum bot está no grupo
+				let hasBot = false;
+				if (groupId.includes("@g.us")) {
+					hasBot = activeGroupIds.has(groupId);
+				} else if (groupId.startsWith("-")) {
+					// Telegram: verifica se algum bot é Telegram ou se está mapeado
+					hasBot = streamSystem.bots.some((b) => b.useTelegram) || activeGroupIds.has(groupId);
+				} else {
+					// Discord ou outros IDs numéricos
+					hasBot = activeGroupIds.has(groupId.toString());
+				}
+
+				if (hasBot) {
+					groupsWithBotCount++;
+				} else {
+					groupsWithoutBotCount++;
+				}
+
+				let groupModified = false;
+
+				// ─── CENÁRIO A: NENHUM BOT NO GRUPO ───────────────────────────────
+				if (!hasBot) {
+					console.log(
+						`[streamsCleanup] [${i + 1}/${streamGroups.length}] GRUPO ÓRFÃO: "${groupName}" (${groupId}) - Nenhum bot presente. Removendo todas as streams.`
+					);
+
+					if (Array.isArray(group.twitch) && group.twitch.length > 0) {
+						for (const ch of group.twitch) {
+							removedChannels.push({
+								platform: "Twitch",
+								channel: ch.channel,
+								groupName,
+								groupId,
+								reason: "Nenhum bot no grupo"
+							});
+						}
+						group.twitch = [];
+						groupModified = true;
+					}
+
+					if (Array.isArray(group.kick) && group.kick.length > 0) {
+						for (const ch of group.kick) {
+							removedChannels.push({
+								platform: "Kick",
+								channel: ch.channel,
+								groupName,
+								groupId,
+								reason: "Nenhum bot no grupo"
+							});
+						}
+						group.kick = [];
+						groupModified = true;
+					}
+				} else {
+					// ─── CENÁRIO B: BOT PRESENTE NO GRUPO ─────────────────────────────
+					console.log(
+						`[streamsCleanup] [${i + 1}/${streamGroups.length}] GRUPO COM BOT: "${groupName}" (${groupId}) - Validando canais...`
+					);
+
+					// 1. Checagem de Canais da Twitch
+					if (Array.isArray(group.twitch) && group.twitch.length > 0) {
+						const originalTwitch = [...group.twitch];
+						const newTwitch = [];
+
+						for (const ch of originalTwitch) {
+							const cleanName = streamMonitor.sanitizePlatformChannelName(ch.channel, "twitch");
+							if (!cleanName) {
+								console.log(`  -> [Twitch] Canal '${ch.channel}' inválido! Removendo.`);
+								removedChannels.push({
+									platform: "Twitch",
+									channel: ch.channel,
+									groupName,
+									groupId,
+									reason: "Nome de canal inválido na Twitch"
+								});
+								groupModified = true;
+								continue;
+							}
+
+							let exists = twitchExistenceCache.get(cleanName);
+							if (exists === undefined) {
+								exists = await streamMonitor.twitchChannelExists(cleanName);
+								twitchExistenceCache.set(cleanName, exists);
+								await sleep(200); // Respeita rate limit da Twitch
+							}
+
+							if (!exists) {
+								console.log(`  -> [Twitch] Canal '${ch.channel}' NÃO EXISTE na Twitch! Removendo.`);
+								removedChannels.push({
+									platform: "Twitch",
+									channel: ch.channel,
+									groupName,
+									groupId,
+									reason: "Canal inexistente na Twitch"
+								});
+								groupModified = true;
+							} else {
+								console.log(`  -> [Twitch] Canal '${ch.channel}' existe (OK).`);
+								newTwitch.push(ch);
+								keptChannels.push({
+									platform: "Twitch",
+									channel: ch.channel,
+									groupName,
+									groupId
+								});
+							}
+						}
+						group.twitch = newTwitch;
+					}
+
+					// 2. Checagem de Canais da Kick
+					if (Array.isArray(group.kick) && group.kick.length > 0) {
+						const originalKick = [...group.kick];
+						const newKick = [];
+
+						for (const ch of originalKick) {
+							const cleanName = streamMonitor.sanitizePlatformChannelName(ch.channel, "kick");
+							if (!cleanName) {
+								console.log(`  -> [Kick] Canal '${ch.channel}' inválido! Removendo.`);
+								removedChannels.push({
+									platform: "Kick",
+									channel: ch.channel,
+									groupName,
+									groupId,
+									reason: "Nome de canal inválido na Kick"
+								});
+								groupModified = true;
+								continue;
+							}
+
+							let exists = kickExistenceCache.get(cleanName);
+							if (exists === undefined) {
+								exists = await streamMonitor.kickChannelExists(cleanName);
+								kickExistenceCache.set(cleanName, exists);
+								await sleep(200);
+							}
+
+							if (!exists) {
+								console.log(`  -> [Kick] Canal '${ch.channel}' NÃO EXISTE na Kick! Removendo.`);
+								removedChannels.push({
+									platform: "Kick",
+									channel: ch.channel,
+									groupName,
+									groupId,
+									reason: "Canal inexistente na Kick"
+								});
+								groupModified = true;
+							} else {
+								console.log(`  -> [Kick] Canal '${ch.channel}' existe (OK).`);
+								newKick.push(ch);
+								keptChannels.push({
+									platform: "Kick",
+									channel: ch.channel,
+									groupName,
+									groupId
+								});
+							}
+						}
+						group.kick = newKick;
+					}
+				}
+
+				if (groupModified) {
+					groupsModifiedCount++;
+					await this.database.saveGroup(group);
+				}
+			}
+
+			// 4. Limpeza no StreamMonitor de canais que não estão mais em nenhum grupo
+			console.log("[streamsCleanup] Verificando canais no StreamMonitor para desinscrição...");
+			const allGroupsAfter = await this.database.getGroups();
+			const activeTwitchChannels = new Set();
+			const activeKickChannels = new Set();
+
+			for (const g of allGroupsAfter) {
+				if (Array.isArray(g.twitch)) {
+					g.twitch.forEach((c) => activeTwitchChannels.add(c.channel.toLowerCase()));
+				}
+				if (Array.isArray(g.kick)) {
+					g.kick.forEach((c) => activeKickChannels.add(c.channel.toLowerCase()));
+				}
+			}
+
+			let unmonitoredCount = 0;
+			for (const rem of removedChannels) {
+				const chLower = rem.channel.toLowerCase();
+				if (rem.platform === "Twitch" && !activeTwitchChannels.has(chLower)) {
+					streamMonitor.unsubscribe(rem.channel, "twitch");
+					unmonitoredCount++;
+				} else if (rem.platform === "Kick" && !activeKickChannels.has(chLower)) {
+					streamMonitor.unsubscribe(rem.channel, "kick");
+					unmonitoredCount++;
+				}
+			}
+
+			const durationSeconds = ((Date.now() - startTime) / 1000).toFixed(1);
+			console.log(
+				`[streamsCleanup] CONCLUÍDO em ${durationSeconds}s! Modificados: ${groupsModifiedCount} grupos, Removidos: ${removedChannels.length} canais, Mantidos: ${keptChannels.length} canais.`
+			);
+			this.logger.info(
+				`[streamsCleanup] Concluído em ${durationSeconds}s. Modificados: ${groupsModifiedCount}, Removidos: ${removedChannels.length}, Mantidos: ${keptChannels.length}, Desinscritos: ${unmonitoredCount}.`
+			);
+
+			// 5. Montagem do Relatório
+			const twitchRemCount = removedChannels.filter((c) => c.platform === "Twitch").length;
+			const kickRemCount = removedChannels.filter((c) => c.platform === "Kick").length;
+			const twitchKeptCount = keptChannels.filter((c) => c.platform === "Twitch").length;
+			const kickKeptCount = keptChannels.filter((c) => c.platform === "Kick").length;
+
+			const noBotCount = removedChannels.filter((c) => c.reason === "Nenhum bot no grupo").length;
+			const notFoundCount = removedChannels.length - noBotCount;
+
+			const summaryMsg =
+				`🧹 *RELATÓRIO: STREAMS CLEANUP*\n\n` +
+				`⏱️ Duração: *${durationSeconds}s*\n` +
+				`📊 *Estatísticas Gerais:*\n` +
+				`• Grupos analisados: *${streamGroups.length}*\n` +
+				`• Grupos com bots presentes: *${groupsWithBotCount}*\n` +
+				`• Grupos órfãos (sem bots): *${groupsWithoutBotCount}*\n` +
+				`• Grupos modificados/limpos: *${groupsModifiedCount}*\n\n` +
+				`📈 *Canais Mantidos (${keptChannels.length}):*\n` +
+				`• Twitch: *${twitchKeptCount}* | Kick: *${kickKeptCount}*\n\n` +
+				`📉 *Canais Removidos (${removedChannels.length}):*\n` +
+				`• Twitch: *${twitchRemCount}* | Kick: *${kickRemCount}*\n` +
+				`  - Sem bots no grupo: *${noBotCount}*\n` +
+				`  - Canal inexistente: *${notFoundCount}*\n` +
+				`• Canais desinscritos do monitor: *${unmonitoredCount}*`;
+
+			const returnMessages = [
+				new ReturnMessage({
+					chatId,
+					content: summaryMsg
+				})
+			];
+
+			// Detalhamento dos canais removidos em blocos (máx ~3500 chars por mensagem)
+			if (removedChannels.length > 0) {
+				let currentChunk = `❌ *DETALHE DOS CANAIS REMOVIDOS (${removedChannels.length}):*\n`;
+				for (const item of removedChannels) {
+					const line = `• [${item.platform}] *${item.channel}* em "${item.groupName}" (${item.groupId})\n  ↳ Motivo: ${item.reason}\n`;
+					if ((currentChunk + line).length > 3500) {
+						returnMessages.push(new ReturnMessage({ chatId, content: currentChunk }));
+						currentChunk = `❌ *CANAIS REMOVIDOS (cont.):*\n` + line;
+					} else {
+						currentChunk += line;
+					}
+				}
+				if (currentChunk.trim().length > 0) {
+					returnMessages.push(new ReturnMessage({ chatId, content: currentChunk }));
+				}
+			}
+
+			// Detalhamento dos canais mantidos em blocos
+			if (keptChannels.length > 0) {
+				let currentChunk = `✅ *DETALHE DOS CANAIS MANTIDOS (${keptChannels.length}):*\n`;
+				for (const item of keptChannels) {
+					const line = `• [${item.platform}] *${item.channel}* em "${item.groupName}" (${item.groupId})\n`;
+					if ((currentChunk + line).length > 3500) {
+						returnMessages.push(new ReturnMessage({ chatId, content: currentChunk }));
+						currentChunk = `✅ *CANAIS MANTIDOS (cont.):*\n` + line;
+					} else {
+						currentChunk += line;
+					}
+				}
+				if (currentChunk.trim().length > 0) {
+					returnMessages.push(new ReturnMessage({ chatId, content: currentChunk }));
+				}
+			}
+
+			return returnMessages;
+		} catch (error) {
+			this.logger.error("[streamsCleanup] Erro fatal:", error);
+			console.error("[streamsCleanup] Erro fatal:", error);
+			return new ReturnMessage({
+				chatId,
+				content: `❌ Erro ao executar streams-cleanup: ${error.message}`
+			});
+		}
+	}
+
+	/**
+	 * Exibe métricas detalhadas dos intervalos de polling e status de rate limit das plataformas de streaming
+	 * Comando: !sa-streams-rate ou !sa-streamsRate
+	 */
+	async streamsRate(bot, message, args) {
+		const chatId = message.group || message.author;
+
+		const StreamSystem = require("../StreamSystem");
+		const streamSystem = StreamSystem.getInstance();
+
+		if (!streamSystem.initialized) {
+			await streamSystem.initialize(true);
+		}
+
+		let streamMonitor = bot.streamMonitor || streamSystem.streamMonitor;
+		if (!streamMonitor) {
+			const StreamMonitor = require("../services/StreamMonitor");
+			streamMonitor = StreamMonitor.getInstance();
+		}
+
+		if (!streamMonitor || typeof streamMonitor.getPollingMetrics !== "function") {
+			return new ReturnMessage({
+				chatId,
+				content: "❌ StreamMonitor não está disponível ou atualizado."
+			});
+		}
+
+		const m = streamMonitor.getPollingMetrics();
+
+		let statusText = `⚡ *MÉTRICAS DE POLLING & RATE LIMIT (STREAMS)*\n\n`;
+
+		statusText += `🟣 *Twitch (Helix API):*\n`;
+		statusText += `• Status: ${m.twitch.isRateLimited ? "🔴 *Em pausa (429)*" : "🟢 *Ativo / Saudável*"}\n`;
+		statusText += `• Canais monitorados: *${m.twitch.channelCount}*\n`;
+		statusText += `• Lotes por ciclo: *${m.twitch.batches}* (${m.twitch.batchSize} canais/lote)\n`;
+		statusText += `• Intervalo calculado: *${m.twitch.intervalSec}s* (antes: 180s - ⚡ *${Math.round(180 / m.twitch.intervalSec)}x mais rápido!*)\n`;
+		statusText += `• Requisições estimadas: *~${m.twitch.estimatedReqsPerMinute} req/min* (Meta: máx 480 / Limite: 800 req/min)\n`;
+		statusText += `• Utilização da cota: *${m.twitch.targetUtilization}*\n`;
+		if (m.twitch.liveRateLimit && m.twitch.liveRateLimit.remaining !== undefined) {
+			const resetInfo =
+				m.twitch.liveRateLimit.resetInSec !== null
+					? ` (reset em ${m.twitch.liveRateLimit.resetInSec}s)`
+					: "";
+			statusText += `• RateLimit ao vivo: *${m.twitch.liveRateLimit.remaining}/${m.twitch.liveRateLimit.limit}* restantes${resetInfo}\n`;
+		}
+
+		statusText += `\n🟢 *Kick API:*\n`;
+		statusText += `• Status: ${m.kick.isRateLimited ? "🔴 *Em pausa (429)*" : "🟢 *Ativo / Saudável*"}\n`;
+		statusText += `• Canais monitorados: *${m.kick.channelCount}*\n`;
+		statusText += `• Lotes por ciclo: *${m.kick.batches}* (${m.kick.batchSize} canais/lote)\n`;
+		statusText += `• Intervalo calculado: *${m.kick.intervalSec}s* (antes: 180s - ⚡ *${Math.round(180 / m.kick.intervalSec)}x mais rápido!*)\n`;
+		statusText += `• Requisições estimadas: *~${m.kick.estimatedReqsPerMinute} req/min* (Limite seguro: 60 req/min)\n`;
+		statusText += `• Utilização da cota: *${m.kick.targetUtilization}*\n`;
+
+		statusText += `\n🔴 *YouTube (RSS XML):*\n`;
+		statusText += `• Canais monitorados: *${m.youtube.channelCount}*\n`;
+		statusText += `• Intervalo de busca: *${m.youtube.intervalSec}s*\n`;
+
+		statusText += `\n⚙️ *Monitoramento Global:* ${m.isMonitoring ? "🟢 Rodando" : "🟡 Pausado"}`;
+
+		return new ReturnMessage({
+			chatId,
+			content: statusText
+		});
+	}
+
+	/**
+	 * Remove figurinha(s) do Lovecell do cache, adiciona à blacklist e limpa estatísticas.
+	 * Suporta múltiplos IDs separados por espaço ou vírgula, ou extração por mensagem citada.
+	 * Ex: !sa-removerFig 12345 67890 112233
+	 *
+	 * @param {WhatsAppBot} bot
+	 * @param {Object} message
+	 * @param {Array<string>} args
+	 * @param {Object} group
+	 * @returns {Promise<ReturnMessage>}
+	 */
+	async removerFig(bot, message, args, group) {
+		const StickerScraper = require("../functions/StickerScraper");
+		return await StickerScraper.removerFigCommand(bot, message, args, group, this);
+	}
+
+	/**
+	 * Comando SuperAdmin: sa-waifuCasar
+	 * Casa administrativamente um usuário com um personagem especificado.
+	 *
+	 * Uso: !sa-waifuCasar <número do usuário> <nome/id do personagem>
+	 * Exemplo: !sa-waifuCasar 5511999999999 izumi-blue-archive
+	 *          !sa-waifuCasar 5511888888888 casar com yuuki-yoshino-shokugeki-no-souma
+	 *
+	 * @param {Object} bot
+	 * @param {Object} message
+	 * @param {Array<string>} args
+	 * @param {Object} group
+	 * @returns {Promise<ReturnMessage>}
+	 */
+	async waifuCasar(bot, message, args, group) {
+		const chatId = message.group ?? message.author;
+
+		try {
+			if (!this.isSuperAdmin(message.author) && !this.isComuAdmin(bot, message.author)) {
+				return new ReturnMessage({
+					chatId,
+					content: "❌ Este comando é exclusivo para SuperAdministradores do sistema."
+				});
+			}
+
+			if (!args || args.length < 2) {
+				return new ReturnMessage({
+					chatId,
+					content:
+						"ℹ️ *Uso correto:* `!sa-waifuCasar <número usuário> <nome/id do personagem>`\n\n*Exemplo:* `!sa-waifuCasar 5511999999999 izumi-blue-archive`"
+				});
+			}
+
+			// 1. Extrai o número do usuário (limpa caracteres não-numéricos)
+			const targetUserRaw = args[0];
+			const targetUserId = targetUserRaw.replace(/\D/g, "");
+
+			if (!targetUserId || targetUserId.length < 8) {
+				return new ReturnMessage({
+					chatId,
+					content: `❌ Número de usuário inválido: "${targetUserRaw}". Informe o número com DDI e DDD (ex: 5511999999999).`
+				});
+			}
+
+			// 2. Extrai o nome ou slug do personagem (remove conectivos se enviados, ex: "casar com")
+			let charQuery = args.slice(1).join(" ").trim();
+			charQuery = charQuery.replace(/^(casar\s+com\s+|com\s+|casar\s+)/i, "").trim();
+
+			if (!charQuery) {
+				return new ReturnMessage({
+					chatId,
+					content: "❌ Nome ou ID do personagem não informado."
+				});
+			}
+
+			const { api } = require("../functions/WaifuCommands");
+			const groupId = message.group ?? "admin";
+
+			// 3. Efetua a requisição ao endpoint administrativo da API Waifuletes
+			const { data } = await api.post("/admin/marry", {
+				userId: targetUserId,
+				characterId: charQuery,
+				groupId,
+				name: targetUserId
+			});
+
+			if (data.success) {
+				const { character, keys, user } = data.data;
+				let text = `💍 *Casamento Administrativo Realizado com Sucesso!* 💍\n\n`;
+				text += `👤 *Usuário:* ${user?.name || targetUserId} (\`${targetUserId}\`)\n`;
+				text += `✨ *Personagem:* *${character.name}* (${character.series})\n`;
+				text += `🆔 *ID:* \`${character.id}\`\n`;
+				text += `🔑 *Chaves:* ${keys}/10`;
+
+				return new ReturnMessage({
+					chatId,
+					content: text,
+					options: {
+						quotedMessageId: message.origin?.id?._serialized,
+						goReply: message.origin
+					}
+				});
+			}
+
+			return new ReturnMessage({
+				chatId,
+				content: `❌ Erro ao casar: ${data.error?.message || "Falha na requisição."}`
+			});
+		} catch (err) {
+			const apiErr = err.response?.data?.error;
+			const errorMsg =
+				apiErr?.message ||
+				err.response?.data?.message ||
+				(typeof err.response?.data?.error === "string" ? err.response?.data?.error : null) ||
+				err.message;
+
+			return new ReturnMessage({
+				chatId,
+				content: `❌ Erro ao realizar casamento administrativo: ${errorMsg}`
+			});
+		}
+	}
+
+	/**
+	 * Remove um personagem do catálogo Waifuletes, desfaz casamentos com reembolso
+	 * proporcional de Zinthos por raridade e remove vínculos.
+	 *
+	 * Uso: !sa-remudae <id/nome do personagem> [motivo]
+	 * Exemplo: !sa-remudae loli-problematica Violação das diretrizes
+	 *
+	 * @param {Object} bot
+	 * @param {Object} message
+	 * @param {Array<string>} args
+	 * @param {Object} group
+	 * @returns {Promise<ReturnMessage>}
+	 */
+	async removerMudaePersonagem(bot, message, args, group) {
+		const chatId = message.group ?? message.author;
+
+		try {
+			if (!this.isSuperAdmin(message.author) && !this.isComuAdmin(bot, message.author)) {
+				return new ReturnMessage({
+					chatId,
+					content: "❌ Este comando é exclusivo para SuperAdministradores do sistema."
+				});
+			}
+
+			if (!args || args.length === 0) {
+				return new ReturnMessage({
+					chatId,
+					content:
+						"ℹ️ *Uso correto:* `!sa-remudae <id ou nome do personagem> [motivo]`\n\n*Exemplo:* `!sa-remudae loli-problematica Violação das diretrizes`"
+				});
+			}
+
+			const { api } = require("../functions/WaifuCommands");
+
+			const characterId = args[0];
+			let reason = args.slice(1).join(" ").trim() || "Remoção administrativa por moderação";
+
+			let responseData = null;
+
+			// Tenta primeiro com args[0] como characterId e o resto como motivo
+			try {
+				const { data } = await api.post("/admin/characters/purge-character", {
+					characterId,
+					reason
+				});
+				if (data.success) {
+					responseData = data.data;
+				}
+			} catch (firstErr) {
+				// Se deu erro e havia múltiplos args, tenta considerar todo o args como nome do personagem
+				if (args.length > 1) {
+					const fullName = args.join(" ").trim();
+					try {
+						const { data } = await api.post("/admin/characters/purge-character", {
+							characterId: fullName,
+							reason: "Remoção administrativa por moderação"
+						});
+						if (data.success) {
+							responseData = data.data;
+							reason = "Remoção administrativa por moderação";
+						}
+					} catch (_) {
+						// Repassa o primeiro erro
+						throw firstErr;
+					}
+				} else {
+					throw firstErr;
+				}
+			}
+
+			if (responseData) {
+				const { character, marriagesUndone, totalKakeraRefunded } = responseData;
+				let text = `🗑️ *Personagem Removido do Waifuletes com Sucesso!* 🗑️\n\n`;
+				text += `✨ *Nome:* *${character.name}* (${character.series})\n`;
+				text += `🆔 *ID:* \`${character.id}\`\n`;
+				text += `⭐ *Raridade:* ${character.rarity}\n`;
+				text += `💔 *Casamentos desfeitos:* ${marriagesUndone}\n`;
+				text += `💜 *Total reembolsado aos donos:* ${totalKakeraRefunded} Zinthos\n`;
+				if (reason) {
+					text += `📝 *Motivo:* ${reason}`;
+				}
+
+				// Edita as mensagens de confirmação de denúncia ("⛔ *Denúncia Registrada!*...") adicionando o status de remoção
+				try {
+					const WaifuCommandsModule = require("../functions/WaifuCommands");
+					const Database = require("../utils/Database");
+					const allBots = Database.getInstance().botInstances || bot?.database?.botInstances || [];
+					const charIdsToCheck = [character.id];
+					if (characterId && !charIdsToCheck.includes(characterId)) {
+						charIdsToCheck.push(characterId);
+					}
+
+					for (const cid of charIdsToCheck) {
+						const reportMsgs = WaifuCommandsModule.getWaifuReportConfirmations(cid);
+						if (Array.isArray(reportMsgs) && reportMsgs.length > 0) {
+							for (const repMsg of reportMsgs) {
+								if (!repMsg.chatId || !repMsg.messageId) continue;
+
+								let targetBot = bot;
+								if (repMsg.botId) {
+									const foundBot = allBots.find(
+										(b) =>
+											b &&
+											(b.id === repMsg.botId ||
+												b.instanceName === repMsg.botId ||
+												b.nomeExibir === repMsg.botId)
+									);
+									if (foundBot) {
+										targetBot = foundBot;
+									} else if (bot.otherBots && Array.isArray(bot.otherBots)) {
+										const foundInOther = bot.otherBots.find(
+											(b) => b && (b.id === repMsg.botId || b.instanceName === repMsg.botId)
+										);
+										if (foundInOther) targetBot = foundInOther;
+									}
+								}
+
+								if (targetBot && typeof targetBot.editMessage === "function") {
+									try {
+										const actualId =
+											typeof targetBot.getActualMsgId === "function"
+												? targetBot.getActualMsgId(repMsg.messageId)
+												: repMsg.messageId;
+										const baseText =
+											repMsg.text ||
+											`⛔ *Denúncia Registrada!*\n\nO personagem *${character.name}* foi encaminhado para a equipe de moderação. Obrigado por ajudar a manter o catálogo seguro!`;
+										const updatedText = `${baseText}\n\nConteúdo removido com sucesso! ✅`;
+										await targetBot.editMessage(repMsg.chatId, actualId, updatedText);
+									} catch (editErr) {
+										this.logger.warn(
+											`[sa-remudae] Erro ao editar mensagem de denúncia ${repMsg.messageId} em ${repMsg.chatId}: ${editErr.message}`
+										);
+									}
+								}
+							}
+							WaifuCommandsModule.deleteWaifuReportConfirmations(cid);
+						}
+					}
+				} catch (repErr) {
+					this.logger.warn(
+						`[sa-remudae] Erro ao processar edição de mensagens de report: ${repErr.message}`
+					);
+				}
+
+				return new ReturnMessage({
+					chatId,
+					content: text,
+					options: {
+						quotedMessageId: message.origin?.id?._serialized,
+						goReply: message.origin
+					}
+				});
+			}
+
+			return new ReturnMessage({
+				chatId,
+				content: "❌ Falha ao remover personagem."
+			});
+		} catch (err) {
+			const apiErr = err.response?.data?.error;
+			const errorMsg =
+				apiErr?.message ||
+				err.response?.data?.message ||
+				(typeof err.response?.data?.error === "string" ? err.response?.data?.error : null) ||
+				err.message;
+
+			return new ReturnMessage({
+				chatId,
+				content: `❌ Erro ao remover personagem do Waifuletes: ${errorMsg}`
 			});
 		}
 	}

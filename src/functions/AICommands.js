@@ -3,10 +3,13 @@ const fs = require("fs").promises;
 const Logger = require("../utils/Logger");
 const { getRecentMessages, formatMessagesForPrompt, storeMessage } = require("./SummaryCommands");
 const LLMService = require("../services/LLMService");
+const LayaService = require("../services/LayaService");
 const ReturnMessage = require("../models/ReturnMessage");
 const Command = require("../models/Command");
 const Database = require("../utils/Database");
 const { extractFrames } = require("../utils/Conversions");
+const ProfilePictureHelper = require("../utils/ProfilePictureHelper");
+const PhoneUtils = require("../utils/PhoneUtils");
 
 const logger = new Logger("ai-commands");
 
@@ -39,9 +42,10 @@ const classifyQuestionSchema = {
 /**
  * Helper to get command lists formatted for the prompt
  */
-function getCommandLists(bot, group = null) {
-	const fixedCommands = bot.eventHandler.commandHandler.fixedCommands.getAllCommands();
-	const managementCommands = bot.eventHandler.commandHandler.management.getManagementCommands();
+async function getCommandLists(bot, group = null) {
+	const fixedCommands = bot.eventHandler?.commandHandler?.fixedCommands?.getAllCommands() || [];
+	const managementCommands =
+		bot.eventHandler?.commandHandler?.management?.getManagementCommands() || {};
 
 	let cmdSimpleList = "";
 	let cmdGerenciaSimplesList = "";
@@ -77,13 +81,124 @@ function getCommandLists(bot, group = null) {
 		cmdGerenciaSimplesList += `- ${prefix}g-${cmd}: ${desc}\n`;
 	}
 
+	// Inclui comandos personalizados se for um grupo
+	if (group && group.id && bot.eventHandler?.commandHandler) {
+		let customCommands = bot.eventHandler.commandHandler.customCommands?.[group.id];
+		if (
+			!customCommands &&
+			typeof bot.eventHandler.commandHandler.loadCustomCommandsForGroup === "function"
+		) {
+			await bot.eventHandler.commandHandler.loadCustomCommandsForGroup(group.id).catch(() => {});
+			customCommands = bot.eventHandler.commandHandler.customCommands?.[group.id];
+		}
+
+		if (Array.isArray(customCommands)) {
+			const validCustomCmds = customCommands.filter((cmd) => {
+				if (!cmd || !cmd.active || cmd.deleted || !cmd.startsWith || !cmd.startsWith.trim()) {
+					return false;
+				}
+				if (cmd.category && mutedCategories.includes(cmd.category.toLowerCase())) {
+					return false;
+				}
+				if (mutedCommands.includes(cmd.startsWith)) {
+					return false;
+				}
+				return true;
+			});
+
+			// Ordena por contagem de uso e último uso (prioriza mais relevantes)
+			validCustomCmds.sort(
+				(a, b) => (b.count || 0) - (a.count || 0) || (b.lastUsed || 0) - (a.lastUsed || 0)
+			);
+			const customToInclude = validCustomCmds.slice(0, 150);
+
+			if (customToInclude.length > 0) {
+				cmdSimpleList += `\n### Comandos Personalizados do Grupo:\n`;
+				for (const cmd of customToInclude) {
+					let desc = "";
+					if (cmd.description && typeof cmd.description === "string" && cmd.description.trim()) {
+						desc = cmd.description.trim();
+					} else if (Array.isArray(cmd.responses) && cmd.responses.length > 0) {
+						const firstResp = typeof cmd.responses[0] === "string" ? cmd.responses[0] : "";
+						const cleanResp = firstResp
+							.replace(/\{[^}]+\}/g, "")
+							.replace(/\s+/g, " ")
+							.trim();
+						desc = cleanResp
+							? cleanResp.length > 80
+								? cleanResp.substring(0, 77) + "..."
+								: cleanResp
+							: "Comando personalizado do grupo";
+					} else {
+						desc = "Comando personalizado do grupo";
+					}
+					cmdSimpleList += `- ${prefix}${cmd.startsWith}: ${desc}\n`;
+				}
+			}
+		}
+	}
+
 	return { cmdSimpleList, cmdGerenciaSimplesList };
 }
 
 /**
- * Classifies the user's request using LLM
+ * Converte o texto da lista de comandos em dicionário de critérios para o Laya
+ * @param {string} commandList
+ * @returns {Object}
+ */
+function parseCommandListToCriteria(commandList) {
+	const criteria = {};
+	if (!commandList || typeof commandList !== "string") return criteria;
+
+	const lines = commandList.split("\n");
+	for (const line of lines) {
+		const match = line.match(/^-\s*!?(?:g-)?([a-zA-Z0-9_-]+):\s*(.+)$/);
+		if (match) {
+			const cmdName = match[1].toLowerCase();
+			const cmdDesc = match[2].trim();
+			criteria[cmdName] = cmdDesc.length > 200 ? cmdDesc.substring(0, 197) + "..." : cmdDesc;
+		}
+	}
+	return criteria;
+}
+
+/**
+ * Classifies the user's request using Laya (primary) and LLM (fallback)
  */
 async function classifyRequest(question, commandList, ctxContent, hasMedia) {
+	// 1. CLASSIFICAÇÃO PRIMÁRIA VIA LAYA (System One - sub-10ms)
+	const layaService = LayaService.getInstance();
+	if (layaService.isEnabled()) {
+		try {
+			const commandsCriteria = parseCommandListToCriteria(commandList);
+			let layaInstructions =
+				"Determine se a mensagem é para executar um comando do bot ou apenas conversa geral.";
+			if (hasMedia) {
+				layaInstructions +=
+					" O usuário anexou imagem/vídeo. Se pedir para criar figurinha ou transformar a mídia, classifique o comando de figurinha correspondente (ex: fig, sticker). Se for pergunta sobre a mídia, classifique como conversa.";
+			}
+
+			const layaResult = await layaService.classifyIntent(question, commandsCriteria, {
+				instructions: layaInstructions,
+				minConfidence: 0.45
+			});
+
+			if (layaResult && layaResult.classification) {
+				logger.info(
+					`[classifyRequest][laya] "${question.substring(0, 60)}" -> ${layaResult.classification}${layaResult.command ? ` (!${layaResult.command})` : ""} (${(layaResult.confidence * 100).toFixed(1)}%)`
+				);
+				return {
+					classification: layaResult.classification,
+					command: layaResult.command || undefined,
+					args: layaResult.args || ""
+				};
+			}
+		} catch (layaErr) {
+			logger.warn(`[classifyRequest] Laya falhou, caindo para fallback LLM: ${layaErr.message}`);
+		}
+	}
+
+	// 2. FALLBACK VIA LLM (Caso Laya esteja desabilitado ou falhe)
 	let mediaContext = "";
 	if (hasMedia) {
 		mediaContext =
@@ -103,12 +218,13 @@ ${mediaContext}
    - Even if the request contains keywords found in commands (e.g., "gold", "money", "fish"), if the intent is a QUESTION, it is "general".
    - Example: "how much is gold?", "analyze this image", "who is the president?", "o fundo MM Ouro oscilou quanto?".
 
-2. **"command" (FUNCTIONAL TOOLS)**:
-   - User wants to DO something using a specific bot feature/utility.
-   - The intent must explicitly or very closely match the *action* described in "Available Commands".
-   - MUST be a functional request (e.g., "make a sticker", "remove the background", "play the game", "stickerize this").
-   - If the request is a complex sentence or a question, it is almost never a command.
-   - Be ((EXTREMELY STRICT)). If it doesn't clearly map to a tool's primary purpose, it's "general".
+2. **"command" (FUNCTIONAL TOOLS & GROUP CUSTOM COMMANDS)**:
+   - User wants to DO something using a specific bot feature/utility, OR is asking for information covered by a custom command of the group (e.g., group pix, social links, rules, custom responses).
+   - The intent must explicitly or closely match the action or information described in "Available Commands".
+   - If a custom command of the group directly answers the question (e.g., "qual o pix?", "qual o discord?", "regras do grupo", "link do insta"), classify as 'command' and identify that command.
+   - MUST be a functional request or direct match to an available command.
+   - Be ((STRICT)): don't trigger game or action tools (like !pescar) for general questions about those topics.
+   - If no specific command matches or if you aren't sure, ALWAYS classify as "general". NEVER classify as "command" with command "none" or empty.
 
 3. **"bot"**: 
    - Questions about the bot's identity, status, or how to use it (e.g., "who made you?", "what can you do?", "how to create this command", "how to configure feature", "help").
@@ -135,12 +251,38 @@ Return JSON: {"classification": "...", "command": "...", "args": "..."}
 		});
 
 		try {
-			if (response.classification == "command") {
-				this.logger.debug(
-					`[classifyRequest][command] "${question.substring(0, 100)}" -> "!${response.command} ${response.args}"`
+			const parsed = typeof response === "string" ? JSON.parse(response) : response;
+			const rawCmd = parsed?.command
+				? parsed.command
+						.replace(/^[!/.]/, "")
+						.replace(/['"]/g, "")
+						.trim()
+						.toLowerCase()
+				: "";
+			const isNoneCmd =
+				!rawCmd ||
+				rawCmd === "none" ||
+				rawCmd === "null" ||
+				rawCmd === "undefined" ||
+				rawCmd === "nenhum" ||
+				rawCmd === "nao" ||
+				rawCmd === "não" ||
+				rawCmd === "n/a";
+
+			if (parsed?.classification === "command" && isNoneCmd) {
+				parsed.classification = "general";
+				delete parsed.command;
+			}
+			if (parsed?.classification === "none") {
+				parsed.classification = "general";
+			}
+
+			if (parsed?.classification === "command") {
+				logger.debug(
+					`[classifyRequest][command] "${question.substring(0, 100)}" -> "!${parsed.command} ${parsed.args}"`
 				);
 			}
-			return JSON.parse(response);
+			return parsed;
 		} catch (e) {
 			logger.warn("[classifyRequest] Failed to parse JSON, defaulting to general", response);
 			return { classification: "general" };
@@ -155,19 +297,36 @@ Return JSON: {"classification": "...", "command": "...", "args": "..."}
  * Handles the "command" classification
  */
 async function handleCommandInvocation(classification, bot, message, group) {
-	const cmdName = classification.command?.replace(/!/g, "").trim();
+	const cmdName = classification.command
+		?.replace(/^[!/.]/, "")
+		.replace(/['"]/g, "")
+		.trim();
 	const argsStr = classification.args || "";
 	const args = argsStr.split(" ").filter((a) => a.length > 0);
 
-	// Try to find the command
-	const fixedCmd = bot.eventHandler.commandHandler.fixedCommands.getCommand(cmdName);
+	const lowerCmdName = cmdName?.toLowerCase();
+	if (
+		!lowerCmdName ||
+		lowerCmdName === "none" ||
+		lowerCmdName === "null" ||
+		lowerCmdName === "undefined" ||
+		lowerCmdName === "nenhum" ||
+		lowerCmdName === "nao" ||
+		lowerCmdName === "não" ||
+		lowerCmdName === "n/a"
+	) {
+		return null;
+	}
+
+	// Try to find the fixed command first
+	const fixedCmd = bot.eventHandler?.commandHandler?.fixedCommands?.getCommand(cmdName);
 
 	if (fixedCmd) {
 		try {
 			logger.info(`[AICommand] Auto-invoking command: ${cmdName} with args: ${args}`);
 
 			// Hijack the message object
-			const fullCommandString = `!${cmdName} ${argsStr}`;
+			const fullCommandString = `!${cmdName} ${argsStr}`.trim();
 
 			// We need to be careful not to mutate the original message permanently if it's used elsewhere,
 			// but for this flow it's likely fine.
@@ -180,7 +339,7 @@ async function handleCommandInvocation(classification, bot, message, group) {
 			}
 
 			const result = await fixedCmd.execute(bot, message, args, group);
-			const introText = `> 🤖 Usando comando !${cmdName} ${argsStr}`;
+			const introText = `> 🤖 Usando comando !${cmdName}${argsStr ? " " + argsStr : ""}`;
 			const introMessage = new ReturnMessage({
 				chatId: message.group ?? message.author,
 				content: introText,
@@ -240,6 +399,125 @@ async function handleCommandInvocation(classification, bot, message, group) {
 		}
 	}
 
+	// Try to find custom command if this is a group
+	if (group && group.id && bot.eventHandler?.commandHandler) {
+		const commandHandler = bot.eventHandler.commandHandler;
+		const customCommands = commandHandler.customCommands?.[group.id] || [];
+		const matchResult = commandHandler.findCustomCommand(cmdName, customCommands, args);
+
+		if (matchResult) {
+			const { customCommand, newArgs } = matchResult;
+			try {
+				logger.info(
+					`[AICommand] Auto-invoking custom command: ${customCommand.startsWith} with args: ${newArgs}`
+				);
+
+				// Verifica cooldown
+				const cooldownCheckCmd = {
+					name: customCommand.startsWith,
+					cooldown: customCommand.cooldown ?? 0
+				};
+				const cooldownInfo = await commandHandler.checkCooldown(
+					cooldownCheckCmd,
+					message.group,
+					bot.id
+				);
+				if (cooldownInfo.inCooldown) {
+					return new ReturnMessage({
+						chatId: message.group ?? message.author,
+						content: `O comando personalizado *!${customCommand.startsWith}* está em cooldown, aguarde ${cooldownInfo.formattedTime} para usar novamente.`,
+						options: { quotedMessageId: message.origin.id._serialized }
+					});
+				}
+
+				// Prepara mensagem para o comando customizado
+				const fullCommandString = `!${customCommand.startsWith} ${newArgs.join(" ")}`.trim();
+				if (message.type === "image" || message.type === "video" || message.hasMedia) {
+					message.caption = fullCommandString;
+				} else {
+					message.body = fullCommandString;
+					message.content = fullCommandString;
+				}
+
+				// Executa com silent: true para não disparar mensagens duplicadas no executeCustomCommand
+				const result = await commandHandler.executeCustomCommand(
+					bot,
+					message,
+					customCommand,
+					newArgs,
+					group,
+					true
+				);
+
+				// Se o comando possui reação definida, aplica à mensagem original
+				if (customCommand.react) {
+					try {
+						await message.origin.react(customCommand.react);
+					} catch (reactErr) {
+						// Ignora erro de reação
+					}
+				}
+
+				const introText = `> 🤖 Usando comando !${customCommand.startsWith}${newArgs.length > 0 ? " " + newArgs.join(" ") : ""}`;
+				const introMessage = new ReturnMessage({
+					chatId: message.group ?? message.author,
+					content: introText,
+					options: { quotedMessageId: message.origin.id._serialized }
+				});
+
+				// Case 1: Result is an Array of ReturnMessages
+				if (Array.isArray(result)) {
+					return [introMessage, ...result];
+				}
+
+				// Case 2: Result is a single ReturnMessage
+				if (result instanceof ReturnMessage) {
+					if (result.options?.sendMediaAsSticker) {
+						return [introMessage, result];
+					}
+
+					if (typeof result.options?.caption === "string") {
+						const currentCaption = result.options.caption.trim();
+						result.options.caption = currentCaption
+							? `${introText}\n\n${currentCaption}`
+							: introText;
+						return result;
+					}
+
+					if (typeof result.content === "string") {
+						const currentContent = result.content.trim();
+						result.content = currentContent ? `${introText}\n\n${currentContent}` : introText;
+						return result;
+					}
+
+					return [introMessage, result];
+				}
+
+				// Case 3: Result is a string
+				if (typeof result === "string") {
+					return new ReturnMessage({
+						chatId: message.group ?? message.author,
+						content: `${introText}\n\n${result}`,
+						options: { quotedMessageId: message.origin.id._serialized }
+					});
+				}
+
+				// Case 4: Sem resultado retornado
+				return introMessage;
+			} catch (e) {
+				logger.error(
+					`[AICommand] Error auto-invoking custom command ${customCommand.startsWith}`,
+					e
+				);
+				return new ReturnMessage({
+					chatId: message.group ?? message.author,
+					content: `Tentei executar o comando personalizado !${customCommand.startsWith}, mas ocorreu um erro: ${e.message}`,
+					options: { quotedMessageId: message.origin.id._serialized }
+				});
+			}
+		}
+	}
+
 	return new ReturnMessage({
 		chatId: message.group ?? message.author,
 		content: `Entendi que você quer usar o comando "${cmdName}", mas não consegui encontrá-lo ou executá-lo.`,
@@ -265,11 +543,11 @@ async function aiCommand(bot, message, args, group) {
 	const botCtxPath = path.join(database.databasePath, "textos", "llm_bot_context.txt");
 	const botCtxContent = (await fs.readFile(botCtxPath, "utf8")) || "";
 
-	const { cmdSimpleList, cmdGerenciaSimplesList } = getCommandLists(bot, group);
+	const { cmdSimpleList, cmdGerenciaSimplesList } = await getCommandLists(bot, group);
 
 	// 2. Prepare Question/Prompt
 	let question = args.length > 0 ? args.join(" ") : (message.caption ?? message.content);
-	const quotedMsg = await message.origin.getQuotedMessage();
+	const quotedMsg = await message.origin.getQuotedMessage().catch(() => null);
 	if (quotedMsg && !message.originReaction) {
 		const quotedText = quotedMsg.caption ?? quotedMsg.content ?? quotedMsg.body;
 		if (quotedText && quotedText.length > 10) {
@@ -277,8 +555,70 @@ async function aiCommand(bot, message, args, group) {
 		}
 	}
 
+	// 2.1. Identifica os JIDs do bot para não confundi-lo com usuário mencionado
+	const botJids = [bot.id, bot.phoneNumber, bot.client?.info?.wid?._serialized].filter(Boolean);
+	if (bot.phoneNumber) {
+		botJids.push(...PhoneUtils.getPhoneVariants(bot.phoneNumber));
+	}
+	if (bot.myLid) {
+		botJids.push(bot.myLid);
+	}
+
+	if (
+		message.group &&
+		typeof bot.getChatDetails === "function" &&
+		typeof bot.getLidFromPn === "function"
+	) {
+		try {
+			const chatInfo = await bot.getChatDetails(message.group);
+			const botLid = bot.getLidFromPn(bot.phoneNumber || "", chatInfo);
+			if (botLid) botJids.push(botLid);
+		} catch (e) {
+			// Ignora erro ao obter LID
+		}
+	}
+
+	// 2.2. Substitui IDs numéricos (@123123...) pelo nome ou apelido configurado da pessoa
+	if (question && typeof question === "string") {
+		try {
+			question = await ProfilePictureHelper.replaceMentionIdsWithNames(
+				question,
+				message,
+				group,
+				bot,
+				botJids
+			);
+		} catch (replaceErr) {
+			logger.debug(`[aiCommand] Erro ao substituir nomes das menções: ${replaceErr.message}`);
+		}
+	}
+
 	// 3. Check for Media (direct or from quoted message)
-	const { media, hadQuoted, quotedHadMedia } = await getMediaFromMessage(message);
+	const { media: extractedMedia, hadQuoted, quotedHadMedia } = await getMediaFromMessage(message);
+	let media = extractedMedia;
+
+	// 3.1. Fallback: Se não há mídia, tenta buscar foto de perfil de outro usuário mencionado
+	if (!media) {
+		try {
+			const otherMentions = ProfilePictureHelper.extractMentions(message, botJids);
+			if (otherMentions.length > 0) {
+				const profileMedia = await ProfilePictureHelper.fetchFirstValidProfilePicture(
+					bot,
+					otherMentions
+				);
+				if (profileMedia && profileMedia.data) {
+					media = profileMedia;
+					logger.debug(
+						`[aiCommand] Anexando foto de perfil de usuário mencionado como imagem de entrada para IA`
+					);
+				}
+			}
+		} catch (profileErr) {
+			logger.debug(
+				`[aiCommand] Falha silenciosa ao obter foto de perfil de menção: ${profileErr.message}`
+			);
+		}
+	}
 
 	// Validation: No media and short question
 	if (!media && question.length < 5) {
@@ -312,24 +652,60 @@ async function aiCommand(bot, message, args, group) {
 	// Now we classify FIRST, telling the LLM if there is media attached.
 	const classificationResult = await classifyRequest(question, cmdSimpleList, "", !!media);
 
+	const cleanQuestion = question
+		.replace(/[\r\n]+/g, " ")
+		.trim()
+		.substring(0, 100);
 	logger.debug(
-		`[aiCommand] Classified request: "${question.substring(0, 100)}" (from ${message.author}, has Media: ${!!media}) -> ${classificationResult.classification ?? "Erro"} ${classificationResult.command ?? ""}`
+		`[aiCommand] Classified request: "${cleanQuestion}" (from ${message.author}, has Media: ${!!media}) -> ${classificationResult.classification ?? "Erro"} ${classificationResult.command ?? ""}`
 	);
 
 	// 5. Handle Classification Results
 	const aiAliases = ["ai", "ia", "gpt", "gemini"];
+	const rawCmd = classificationResult.command
+		? classificationResult.command
+				.replace(/^[!/.]/, "")
+				.replace(/['"]/g, "")
+				.trim()
+				.toLowerCase()
+		: "";
+	const isNoneCommand =
+		!rawCmd ||
+		rawCmd === "none" ||
+		rawCmd === "null" ||
+		rawCmd === "undefined" ||
+		rawCmd === "nenhum" ||
+		rawCmd === "nao" ||
+		rawCmd === "não" ||
+		rawCmd === "n/a";
+
 	if (
 		classificationResult.classification === "command" &&
-		aiAliases.includes(classificationResult.command?.toLowerCase().replace(/!/g, ""))
+		(isNoneCommand || aiAliases.includes(rawCmd))
 	) {
-		logger.debug("[aiCommand] Self-invocation detected, reclassifying to general");
+		logger.debug(
+			`[aiCommand] No executable command or self-invocation detected (${rawCmd || "empty"}), reclassifying to general`
+		);
+		classificationResult.classification = "general";
+		delete classificationResult.command;
+	}
+
+	if (classificationResult.classification === "none") {
 		classificationResult.classification = "general";
 	}
 
 	// CASE A: Command Invocation (e.g. "make sticker", "weather in paris")
 	if (classificationResult.classification === "command" && classificationResult.command) {
 		// Even if it has media, if it classified as a command (like !sticker), we hand it off to the command handler.
-		return handleCommandInvocation(classificationResult, bot, message, group);
+		const cmdResult = await handleCommandInvocation(classificationResult, bot, message, group);
+		if (cmdResult) {
+			return cmdResult;
+		}
+		// Se não encontrou ou retornou null (ex: comando inválido ou nenhum), prossegue para o fluxo geral
+		logger.debug(
+			"[aiCommand] Command invocation produced no result, falling through to general response"
+		);
+		classificationResult.classification = "general";
 	}
 
 	// CASE B: Analysis/Bot Question WITH Media (e.g. "what is this?", "summarize this video")
@@ -411,32 +787,56 @@ async function aiCommand(bot, message, args, group) {
 	const completionOptions = {
 		prompt: question,
 		systemContext,
-		priority: 5
+		toolCalling: true,
+		priority: 5,
+		bot,
+		message,
+		group,
+		chatId
 	};
 
 	try {
-		logger.debug("[aiCommand] Requesting LLM completion");
+		// logger.debug("[aiCommand] Requesting LLM completion");
 		const response = await llmService.getCompletion(completionOptions);
 
-		// Process variables
+		// Process variables (se não for do tipo bot-related/ajuda)
 		let processedResponse;
 		try {
-			processedResponse = await bot.eventHandler.commandHandler.variableProcessor.process(
-				response,
-				{ message, group, command: false, options: {}, bot }
-			);
+			if (classificationResult.classification === "bot") {
+				// Respostas explicativas sobre comandos/variáveis não devem ter suas tags substituídas
+				processedResponse = response;
+			} else {
+				processedResponse = await bot.eventHandler.commandHandler.variableProcessor.process(
+					response,
+					{ message, group, command: false, options: {}, bot }
+				);
+			}
 		} catch (e) {
 			processedResponse = response;
 		}
 
-		return new ReturnMessage({
+		if (bot && typeof bot.truncateText === "function") {
+			processedResponse = bot.truncateText(processedResponse, 3000);
+		}
+
+		const mainReturn = new ReturnMessage({
 			chatId,
 			content: processedResponse,
 			options: {
 				quotedMessageId: message.origin.id._serialized,
-				goReply: message.origin
+				goReply: message.origin,
+				maxChars: 3000
 			}
 		});
+
+		if (
+			Array.isArray(completionOptions.pendingReturnMessages) &&
+			completionOptions.pendingReturnMessages.length > 0
+		) {
+			return [mainReturn, ...completionOptions.pendingReturnMessages];
+		}
+
+		return mainReturn;
 	} catch (error) {
 		logger.error("[aiCommand] Error in LLM completion:", error);
 		return new ReturnMessage({
@@ -563,7 +963,7 @@ async function handleMediaRequest(
 	}
 
 	try {
-		logger.debug("[aiCommand] Requesting LLM completion for media");
+		// logger.debug("[aiCommand] Requesting LLM completion for media");
 		const response = await llmService.getCompletion(completionOptions);
 
 		// Store in history
@@ -581,12 +981,17 @@ async function handleMediaRequest(
 			processedResponse = response;
 		}
 
+		if (bot && typeof bot.truncateText === "function") {
+			processedResponse = bot.truncateText(processedResponse, 3000);
+		}
+
 		return new ReturnMessage({
 			chatId,
 			content: processedResponse,
 			options: {
 				quotedMessageId: message.origin.id._serialized,
-				goReply: message.origin
+				goReply: message.origin,
+				maxChars: 3000
 			}
 		});
 	} catch (error) {
@@ -642,18 +1047,20 @@ async function getMediaFromMessage(message) {
 	// Verifica se havia uma mensagem citada (antes de tentar recuperá-la do cache)
 	const hadQuoted = !!message.hasQuotedMsg;
 
-	// Tenta obter mídia da mensagem citada
-	try {
-		const quotedMsg = await message.origin.getQuotedMessage();
-		if (quotedMsg && quotedMsg.hasMedia) {
-			const media = await quotedMsg.downloadMedia();
-			// quotedHadMedia=true: a mensagem citada existe e tem mídia (download pode ter falhado)
-			return { media, hadQuoted, quotedHadMedia: true };
+	// Tenta obter mídia da mensagem citada apenas se houver mensagem citada
+	if (hadQuoted) {
+		try {
+			const quotedMsg = await message.origin.getQuotedMessage();
+			if (quotedMsg && quotedMsg.hasMedia) {
+				const media = await quotedMsg.downloadMedia();
+				// quotedHadMedia=true: a mensagem citada existe e tem mídia (download pode ter falhado)
+				return { media, hadQuoted, quotedHadMedia: true };
+			}
+			// Quoted msg exists but has no media (or couldn't be recovered from cache)
+			return { media: null, hadQuoted, quotedHadMedia: quotedMsg ? false : null };
+		} catch (error) {
+			logger.error("Erro ao obter mídia da mensagem citada:", error);
 		}
-		// Quoted msg exists but has no media (or couldn't be recovered from cache)
-		return { media: null, hadQuoted, quotedHadMedia: quotedMsg ? false : null };
-	} catch (error) {
-		logger.error("Erro ao obter mídia da mensagem citada:", error);
 	}
 	return { media: null, hadQuoted, quotedHadMedia: null };
 }
@@ -715,4 +1122,25 @@ const commands = [
 	})
 ];
 
-module.exports = { commands, aiCommand };
+const helper = {
+	about:
+		"Integração com modelos de Inteligência Artificial para conversação e execução inteligente de comandos",
+	implementation:
+		"Utiliza LLMService para envio de prompts, contexto de conversa, classificação de intenções e auto-invocação de outros comandos do bot",
+	tags: "ia,ai,chat,conversar,inteligencia artificial,gpt,gemini",
+	cmds: [
+		{
+			cmd: "!ai",
+			desc: "Envia uma pergunta ou instrução para a IA responder ou interagir",
+			usage: ["!ai Quem foi Ada Lovelace?", "!ai Explique como funciona o motor a combustão"],
+			category: "ia"
+		}
+	]
+};
+
+module.exports = {
+	helper,
+	commands,
+	aiCommand,
+	classifyRequest
+};

@@ -10,6 +10,7 @@
 
 "use strict";
 
+const path = require("path");
 const Logger = require("../../Logger");
 const GroupMapper = require("../mappers/GroupMapper");
 const CommandMapper = require("../mappers/CommandMapper");
@@ -17,6 +18,7 @@ const DonationMapper = require("../mappers/DonationMapper");
 const PendingJoinMapper = require("../mappers/PendingJoinMapper");
 const SoftBlockMapper = require("../mappers/SoftBlockMapper");
 const LoadReportMapper = require("../mappers/LoadReportMapper");
+const PhoneUtils = require("../../PhoneUtils");
 
 class CoreRepository {
 	/**
@@ -45,6 +47,7 @@ class CoreRepository {
 				name TEXT,
 				titulo TEXT,
 				descricao TEXT,
+				regras TEXT,
 				added_by TEXT,
 				removed_by TEXT,
 				prefix TEXT,
@@ -72,6 +75,10 @@ class CoreRepository {
 				custom_ai_prompt TEXT,
 				notifica_grupo_fechado INTEGER DEFAULT 0,
 				notifica_grupo_aberto INTEGER DEFAULT 0,
+				banir_spammers INTEGER DEFAULT 0,
+				spammer_whitelist TEXT,
+				banned_users TEXT,
+				minecraft_server TEXT,
 				created_at INTEGER,
 				updated_at INTEGER,
 				json_data TEXT
@@ -126,7 +133,18 @@ class CoreRepository {
 				duration INTEGER,
 				join_responsible TEXT,
 				leave_responsible TEXT,
+				bot_id TEXT,
 				json_data TEXT
+			)`,
+			game_events: `CREATE TABLE IF NOT EXISTS game_events (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				game TEXT NOT NULL,
+				type TEXT NOT NULL,
+				value REAL NOT NULL,
+				start_time INTEGER NOT NULL,
+				end_time INTEGER NOT NULL,
+				created_by TEXT,
+				UNIQUE(game, type)
 			)`
 		};
 
@@ -134,6 +152,11 @@ class CoreRepository {
 			this.mappers.exec(this.DB, createSql);
 			this._ensureTableSchema(this.DB, tableName, createSql);
 		}
+		this._ensureUniqueGroupNames();
+		this.mappers.exec(
+			this.DB,
+			"CREATE UNIQUE INDEX IF NOT EXISTS idx_groups_name_nocase ON groups(name COLLATE NOCASE)"
+		);
 
 		// Create indexes for performance
 		this.mappers.exec(
@@ -203,6 +226,49 @@ class CoreRepository {
 			"load_reports",
 			`(id INTEGER PRIMARY KEY AUTOINCREMENT, bot_id TEXT, timestamp_start INTEGER, timestamp_end INTEGER, duration REAL, recv_private INTEGER, recv_group INTEGER, sent_private INTEGER, sent_group INTEGER, msgs_per_hour REAL, resp_avg REAL, resp_max REAL, resp_count INTEGER, json_data TEXT)`
 		);
+		this.mappers.exec(
+			this.REPORTS_DB,
+			`CREATE INDEX IF NOT EXISTS idx_load_reports_end ON load_reports(timestamp_end);
+			CREATE INDEX IF NOT EXISTS idx_load_reports_start ON load_reports(timestamp_start);
+			CREATE INDEX IF NOT EXISTS idx_load_reports_bot ON load_reports(bot_id);`
+		);
+	}
+
+	/**
+	 * Renomeia registros legados com nomes repetidos antes de criar a restrição
+	 * case-insensitive. O primeiro registro por ordem de criação mantém o nome.
+	 */
+	_ensureUniqueGroupNames() {
+		const rows = this.mappers.all(
+			this.DB,
+			"SELECT id, name FROM groups WHERE name IS NOT NULL AND TRIM(name) != '' ORDER BY rowid"
+		);
+		const used = new Set();
+
+		for (const row of rows) {
+			const original = String(row.name).trim();
+			const key = original.toLowerCase();
+			if (!used.has(key)) {
+				used.add(key);
+				continue;
+			}
+
+			const suffixBase = original.replace(/\d+$/, "");
+			let sequence = 1;
+			let candidate;
+			do {
+				const suffix = String(sequence++);
+				candidate = `${suffixBase.slice(0, 30 - suffix.length)}${suffix}`;
+			} while (used.has(candidate.toLowerCase()));
+
+			this.mappers.run(this.DB, "UPDATE groups SET name = ?, updated_at = ? WHERE id = ?", [
+				candidate,
+				Date.now(),
+				row.id
+			]);
+			used.add(candidate.toLowerCase());
+			this.logger.info(`Nome de grupo duplicado renomeado: ${original} -> ${candidate}`);
+		}
 	}
 
 	/**
@@ -212,15 +278,21 @@ class CoreRepository {
 		const columnMatches = schemaSql.match(/\(([\s\S]*)\)/);
 		if (!columnMatches) return;
 
-		const columns = columnMatches[1]
+		// Remove table-level constraints like UNIQUE(...), PRIMARY KEY(...), FOREIGN KEY(...)
+		const cleanedSql = columnMatches[1].replace(
+			/\b(UNIQUE|PRIMARY\s+KEY|FOREIGN\s+KEY|CHECK|CONSTRAINT)\s*\([^)]*\)/gi,
+			""
+		);
+
+		const columns = cleanedSql
 			.split(",")
-			.map((c) => c.trim().split(/\s+/)[0])
-			.filter(
-				(c) =>
-					c &&
-					!["PRIMARY", "FOREIGN", "CHECK", "UNIQUE", "CONSTRAINT"].includes(c.toUpperCase()) &&
-					!c.startsWith("(")
-			);
+			.map((c) =>
+				c
+					.trim()
+					.split(/\s+/)[0]
+					.replace(/[^a-zA-Z0-9_]/g, "")
+			)
+			.filter((c) => c && !/^(PRIMARY|FOREIGN|CHECK|UNIQUE|CONSTRAINT)/i.test(c));
 
 		try {
 			const rows = this.mappers.all(dbName, `PRAGMA table_info(${tableName})`);
@@ -273,7 +345,9 @@ class CoreRepository {
 
 	async getGroupByName(groupName) {
 		try {
-			const row = this.mappers.get(this.DB, "SELECT * FROM groups WHERE name = ?", [groupName]);
+			const row = this.mappers.get(this.DB, "SELECT * FROM groups WHERE LOWER(name) = LOWER(?)", [
+				groupName
+			]);
 			return row ? GroupMapper.fromRow(row) : null;
 		} catch (error) {
 			this.logger.error("Error in getGroupByName:", error);
@@ -290,24 +364,25 @@ class CoreRepository {
 			this.mappers.run(
 				this.DB,
 				`INSERT INTO groups (
-          id, name, titulo, descricao, added_by, removed_by, prefix,
+          id, name, titulo, descricao, regras, added_by, removed_by, prefix,
           custom_ignores_prefix, invite_code, paused, additional_admins,
           filters, twitch, kick, youtube, bot_not_in_group, webhooks,
           greetings, farewells, interact, auto_translate_to, auto_stt,
           ignored_numbers, ignored_users, muted_commands, muted_categories,
-          nicks, warnings, custom_ai_prompt, notifica_grupo_fechado, notifica_grupo_aberto, created_at, updated_at, json_data
+          nicks, warnings, custom_ai_prompt, notifica_grupo_fechado, notifica_grupo_aberto, banir_spammers, spammer_whitelist, banned_users, minecraft_server, created_at, updated_at, json_data
         ) VALUES (
-          @id, @name, @titulo, @descricao, @added_by, @removed_by, @prefix,
+          @id, @name, @titulo, @descricao, @regras, @added_by, @removed_by, @prefix,
           @custom_ignores_prefix, @invite_code, @paused, @additional_admins,
           @filters, @twitch, @kick, @youtube, @bot_not_in_group, @webhooks,
           @greetings, @farewells, @interact, @auto_translate_to, @auto_stt,
           @ignored_numbers, @ignored_users, @muted_commands, @muted_categories,
-          @nicks, @warnings, @custom_ai_prompt, @notifica_grupo_fechado, @notifica_grupo_aberto, @created_at, @updated_at, @json_data
+          @nicks, @warnings, @custom_ai_prompt, @notifica_grupo_fechado, @notifica_grupo_aberto, @banir_spammers, @spammer_whitelist, @banned_users, @minecraft_server, @created_at, @updated_at, @json_data
         )
         ON CONFLICT(id) DO UPDATE SET
           name                  = excluded.name,
           titulo                = excluded.titulo,
           descricao             = excluded.descricao,
+          regras                = excluded.regras,
           added_by              = excluded.added_by,
           removed_by            = excluded.removed_by,
           prefix                = excluded.prefix,
@@ -335,6 +410,10 @@ class CoreRepository {
           custom_ai_prompt      = excluded.custom_ai_prompt,
           notifica_grupo_fechado = excluded.notifica_grupo_fechado,
           notifica_grupo_aberto  = excluded.notifica_grupo_aberto,
+          banir_spammers         = excluded.banir_spammers,
+          spammer_whitelist      = excluded.spammer_whitelist,
+          banned_users           = excluded.banned_users,
+          minecraft_server       = excluded.minecraft_server,
           updated_at            = excluded.updated_at,
           json_data             = excluded.json_data`,
 				{ ...row, json_data: jsonData }
@@ -454,6 +533,53 @@ class CoreRepository {
 		}
 	}
 
+	async getDonorByName(name) {
+		try {
+			const row = this.mappers.get(
+				this.DB,
+				"SELECT * FROM donations WHERE name = ? COLLATE NOCASE",
+				[name]
+			);
+			return row ? DonationMapper.fromRow(row) : null;
+		} catch (error) {
+			this.logger.error("Error getting donor by name:", error);
+			return null;
+		}
+	}
+
+	getDonorByNumberSync(numero) {
+		try {
+			if (!numero) return null;
+			const clean = PhoneUtils.cleanPhone(numero);
+			if (!clean) return null;
+			const rows = this.mappers.all(
+				this.DB,
+				"SELECT * FROM donations WHERE numero IS NOT NULL AND numero != ''"
+			);
+			for (const r of rows) {
+				const donor = DonationMapper.fromRow(r);
+				const donorClean = PhoneUtils.cleanPhone(donor.numero);
+				if (
+					donorClean &&
+					(donorClean === clean ||
+						PhoneUtils.isSamePhone(donorClean, clean) ||
+						donorClean.includes(clean) ||
+						clean.includes(donorClean))
+				) {
+					return donor;
+				}
+			}
+			return null;
+		} catch (error) {
+			this.logger.error("Error getting donor by number:", error);
+			return null;
+		}
+	}
+
+	async getDonorByNumber(numero) {
+		return this.getDonorByNumberSync(numero);
+	}
+
 	async saveDonations(donations) {
 		try {
 			this.mappers.transaction(this.DB, () => {
@@ -474,7 +600,7 @@ class CoreRepository {
 		}
 	}
 
-	async addDonation(name, amount, numero = undefined) {
+	async addDonation(name, amount, numero = undefined, message = "") {
 		try {
 			const row = this.mappers.get(
 				this.DB,
@@ -484,7 +610,7 @@ class CoreRepository {
 
 			let donor;
 			const now = Date.now();
-			const historyEntry = { ts: now, valor: amount };
+			const historyEntry = { ts: now, valor: amount, msg: message || "" };
 			let donationTotal;
 
 			if (row) {
@@ -542,6 +668,32 @@ class CoreRepository {
 			return true;
 		} catch (error) {
 			this.logger.error("Error updating donor number:", error);
+			return false;
+		}
+	}
+
+	async updateDonorBonusProcessed(name, amount) {
+		try {
+			const row = this.mappers.get(
+				this.DB,
+				"SELECT * FROM donations WHERE name = ? COLLATE NOCASE",
+				[name]
+			);
+			if (!row) {
+				this.logger.warn(`Donor "${name}" not found to update bonus processed`);
+				return false;
+			}
+			const donor = DonationMapper.fromRow(row);
+			donor.bonusesProcessedAmount = amount;
+			const r = DonationMapper.toRow(donor);
+			this.mappers.run(
+				this.DB,
+				"INSERT OR REPLACE INTO donations (name, valor, numero, timestamp, historico, json_data) VALUES (@name, @valor, @numero, @timestamp, @historico, @json_data)",
+				{ ...r, json_data: JSON.stringify(donor) }
+			);
+			return true;
+		} catch (error) {
+			this.logger.error("Error updating donor bonus processed:", error);
 			return false;
 		}
 	}
@@ -652,6 +804,7 @@ class CoreRepository {
 				code: inviteCode,
 				authorId: data.authorId,
 				authorName: data.authorName,
+				groupJid: data.groupJid || null,
 				timestamp: Date.now()
 			};
 			const row = PendingJoinMapper.toRow(joinData);
@@ -839,6 +992,108 @@ class CoreRepository {
 		}
 	}
 
+	/**
+	 * Arquiva relatórios antigos com mais de X dias para load_reports_archive.db
+	 * Mantém o load_reports.db leve e preserva 100% dos dados históricos.
+	 */
+	async archiveOldLoadReports(retentionDays = 30) {
+		try {
+			const cutoff = Date.now() - retentionDays * 24 * 60 * 60 * 1000;
+			const archivePath = path.join(
+				this.mappers.databasePath,
+				"sqlites",
+				"load_reports_archive.db"
+			);
+			const conn = this.mappers.getConnection(this.REPORTS_DB);
+
+			conn.exec(`
+				ATTACH DATABASE '${archivePath}' AS archive;
+				CREATE TABLE IF NOT EXISTS archive.load_reports (
+					id              INTEGER PRIMARY KEY AUTOINCREMENT,
+					bot_id          TEXT,
+					timestamp_start INTEGER,
+					timestamp_end   INTEGER,
+					duration        REAL,
+					recv_private    INTEGER DEFAULT 0,
+					recv_group      INTEGER DEFAULT 0,
+					sent_private    INTEGER DEFAULT 0,
+					sent_group      INTEGER DEFAULT 0,
+					msgs_per_hour   REAL,
+					resp_avg        REAL,
+					resp_max        REAL,
+					resp_count      INTEGER,
+					json_data       TEXT
+				);
+				CREATE INDEX IF NOT EXISTS archive.idx_archive_reports_end ON load_reports(timestamp_end);
+				CREATE INDEX IF NOT EXISTS archive.idx_archive_reports_start ON load_reports(timestamp_start);
+
+				INSERT INTO archive.load_reports (
+					bot_id, timestamp_start, timestamp_end, duration,
+					recv_private, recv_group, sent_private, sent_group,
+					msgs_per_hour, resp_avg, resp_max, resp_count, json_data
+				)
+				SELECT 
+					bot_id, timestamp_start, timestamp_end, duration,
+					recv_private, recv_group, sent_private, sent_group,
+					msgs_per_hour, resp_avg, resp_max, resp_count, json_data
+				FROM main.load_reports
+				WHERE timestamp_end < ${cutoff};
+
+				DELETE FROM main.load_reports WHERE timestamp_end < ${cutoff};
+				DETACH DATABASE archive;
+			`);
+			this.logger.info(
+				`[load_reports] Arquivamento concluído com sucesso (> ${retentionDays} dias).`
+			);
+			return true;
+		} catch (error) {
+			this.logger.error("Erro ao arquivar relatórios antigos:", error);
+			return false;
+		}
+	}
+
+	/**
+	 * Obtém o total de mensagens por bot desde um timestamp (padrão: últimos 3 dias)
+	 * @param {number} [since] - Timestamp inicial em milissegundos (padrão: 3 dias atrás)
+	 * @param {Object} [options]
+	 * @param {boolean} [options.onlyGroup=false] - Se true, soma apenas mensagens de grupo
+	 * @returns {Promise<Map<string, number>>} - Mapa botId -> total de mensagens
+	 */
+	async getBotsMessageTotals(since = Date.now() - 3 * 24 * 60 * 60 * 1000, options = {}) {
+		try {
+			const sumExpr = options.onlyGroup
+				? "SUM(recv_group + sent_group)"
+				: "SUM(recv_private + recv_group + sent_private + sent_group)";
+
+			const rows = this.mappers.all(
+				this.REPORTS_DB,
+				`SELECT bot_id as botId, ${sumExpr} as totalMessages
+				 FROM load_reports
+				 WHERE timestamp_start > ?
+				 GROUP BY bot_id`,
+				[since]
+			);
+			const map = new Map();
+			for (const r of rows) {
+				map.set(r.botId, Number(r.totalMessages) || 0);
+			}
+			return map;
+		} catch (error) {
+			this.logger.error("Error getting bot message totals:", error);
+			return new Map();
+		}
+	}
+
+	/**
+	 * Obtém o total de mensagens por bot desde um timestamp (ex: últimos 7 dias)
+	 * Mantido para compatibilidade retroativa.
+	 * @param {number} since - Timestamp inicial em milissegundos
+	 * @returns {Promise<Map<string, number>>} - Mapa botId -> total de mensagens
+	 */
+	async getBotsWeeklyMessageTotals(since = Date.now() - 7 * 24 * 60 * 60 * 1000) {
+		return this.getBotsMessageTotals(since);
+	}
+
 	async addLoadReport(report) {
 		try {
 			const row = LoadReportMapper.toRow(report);
@@ -980,19 +1235,36 @@ class CoreRepository {
 			let query = "SELECT * FROM invite_history WHERE 1=0";
 			const params = [];
 			if (groupJid && inviteCode) {
-				query = "SELECT * FROM invite_history WHERE group_jid = ? OR invite_code = ?";
+				query =
+					"SELECT * FROM invite_history WHERE group_jid = ? OR invite_code = ? ORDER BY timestamp DESC, id DESC";
 				params.push(groupJid, inviteCode);
 			} else if (groupJid) {
-				query = "SELECT * FROM invite_history WHERE group_jid = ?";
+				query = "SELECT * FROM invite_history WHERE group_jid = ? ORDER BY timestamp DESC, id DESC";
 				params.push(groupJid);
 			} else if (inviteCode) {
-				query = "SELECT * FROM invite_history WHERE invite_code = ?";
+				query =
+					"SELECT * FROM invite_history WHERE invite_code = ? ORDER BY timestamp DESC, id DESC";
 				params.push(inviteCode);
 			}
 			return this.mappers.all(this.DB, query, params);
 		} catch (error) {
 			this.logger.error("Error getting invite history by group:", error);
 			return [];
+		}
+	}
+
+	async updateInviteHistoryGroupJid(inviteCode, groupJid) {
+		try {
+			if (!inviteCode || !groupJid) return false;
+			this.mappers.run(
+				this.DB,
+				"UPDATE invite_history SET group_jid = ? WHERE invite_code = ? AND (group_jid IS NULL OR group_jid = '')",
+				[groupJid, inviteCode]
+			);
+			return true;
+		} catch (error) {
+			this.logger.error("Error updating invite history group JID:", error);
+			return false;
 		}
 	}
 
@@ -1025,7 +1297,7 @@ class CoreRepository {
 
 	// --- Group Membership Periods ---
 
-	async recordGroupJoin(groupJid, groupName, timestamp, responsible) {
+	async recordGroupJoin(groupJid, groupName, timestamp, responsible, botId = null) {
 		try {
 			const ts = timestamp || Date.now();
 			const respStr = responsible
@@ -1044,13 +1316,20 @@ class CoreRepository {
 			// Insert new period
 			this.mappers.run(
 				this.DB,
-				"INSERT INTO group_membership_periods (group_jid, group_name, join_timestamp, join_responsible, json_data) VALUES (?, ?, ?, ?, ?)",
+				"INSERT INTO group_membership_periods (group_jid, group_name, join_timestamp, join_responsible, bot_id, json_data) VALUES (?, ?, ?, ?, ?, ?)",
 				[
 					groupJid,
 					groupName,
 					ts,
 					respStr,
-					JSON.stringify({ groupJid, groupName, join_timestamp: ts, join_responsible: responsible })
+					botId,
+					JSON.stringify({
+						groupJid,
+						groupName,
+						join_timestamp: ts,
+						join_responsible: responsible,
+						bot_id: botId
+					})
 				]
 			);
 			return true;
@@ -1060,7 +1339,7 @@ class CoreRepository {
 		}
 	}
 
-	async recordGroupLeave(groupJid, timestamp, responsible) {
+	async recordGroupLeave(groupJid, timestamp, responsible, botId = null) {
 		try {
 			const ts = timestamp || Date.now();
 			const respStr = responsible
@@ -1080,19 +1359,25 @@ class CoreRepository {
 				const duration = ts - openPeriod.join_timestamp;
 				this.mappers.run(
 					this.DB,
-					"UPDATE group_membership_periods SET leave_timestamp = ?, duration = ?, leave_responsible = ? WHERE id = ?",
-					[ts, duration, respStr, openPeriod.id]
+					"UPDATE group_membership_periods SET leave_timestamp = ?, duration = ?, leave_responsible = ?, bot_id = COALESCE(bot_id, ?) WHERE id = ?",
+					[ts, duration, respStr, botId, openPeriod.id]
 				);
 			} else {
 				// No open period, insert a leave-only period
 				this.mappers.run(
 					this.DB,
-					"INSERT INTO group_membership_periods (group_jid, leave_timestamp, leave_responsible, json_data) VALUES (?, ?, ?, ?)",
+					"INSERT INTO group_membership_periods (group_jid, leave_timestamp, leave_responsible, bot_id, json_data) VALUES (?, ?, ?, ?, ?)",
 					[
 						groupJid,
 						ts,
 						respStr,
-						JSON.stringify({ groupJid, leave_timestamp: ts, leave_responsible: responsible })
+						botId,
+						JSON.stringify({
+							groupJid,
+							leave_timestamp: ts,
+							leave_responsible: responsible,
+							bot_id: botId
+						})
 					]
 				);
 			}
@@ -1116,12 +1401,27 @@ class CoreRepository {
 		}
 	}
 
+	async getActiveBotIdForGroup(groupJid) {
+		try {
+			if (!groupJid) return null;
+			const row = this.mappers.get(
+				this.DB,
+				"SELECT bot_id FROM group_membership_periods WHERE group_jid = ? AND leave_timestamp IS NULL ORDER BY join_timestamp DESC LIMIT 1",
+				[groupJid]
+			);
+			return row?.bot_id || null;
+		} catch (error) {
+			this.logger.error("Error getting active bot for group:", error);
+			return null;
+		}
+	}
+
 	async saveGroupMembershipPeriods(periods) {
 		try {
 			this.mappers.transaction(this.DB, () => {
 				const conn = this.mappers.getConnection(this.DB);
 				const stmt = conn.prepare(
-					"INSERT INTO group_membership_periods (group_jid, group_name, join_timestamp, leave_timestamp, duration, join_responsible, leave_responsible, json_data) VALUES (@group_jid, @group_name, @join_timestamp, @leave_timestamp, @duration, @join_responsible, @leave_responsible, @json_data)"
+					"INSERT INTO group_membership_periods (group_jid, group_name, join_timestamp, leave_timestamp, duration, join_responsible, leave_responsible, bot_id, json_data) VALUES (@group_jid, @group_name, @join_timestamp, @leave_timestamp, @duration, @join_responsible, @leave_responsible, @bot_id, @json_data)"
 				);
 				for (const p of periods) {
 					const row = {
@@ -1140,6 +1440,7 @@ class CoreRepository {
 								? JSON.stringify(p.leaveResponsible)
 								: String(p.leaveResponsible)
 							: null,
+						bot_id: p.botId || p.bot_id || null,
 						json_data: JSON.stringify(p)
 					};
 					stmt.run(row);
@@ -1149,6 +1450,64 @@ class CoreRepository {
 		} catch (error) {
 			this.logger.error("Error saving group membership periods in bulk:", error);
 			return false;
+		}
+	}
+
+	// ===========================================================================
+	// Game Events
+	// ===========================================================================
+
+	async saveGameEvent(event) {
+		try {
+			this.mappers.run(
+				this.DB,
+				`INSERT INTO game_events (game, type, value, start_time, end_time, created_by)
+				VALUES (@game, @type, @value, @start_time, @end_time, @created_by)
+				ON CONFLICT(game, type) DO UPDATE SET
+					value = excluded.value,
+					start_time = excluded.start_time,
+					end_time = excluded.end_time,
+					created_by = excluded.created_by`,
+				{
+					game: String(event.game).toLowerCase(),
+					type: String(event.type).toLowerCase(),
+					value: Number(event.value),
+					start_time: Number(event.startTime || event.start_time || Date.now()),
+					end_time: Number(event.endTime || event.end_time),
+					created_by: event.createdBy || event.created_by || null
+				}
+			);
+			return true;
+		} catch (error) {
+			this.logger.error("Error saving game event:", error);
+			return false;
+		}
+	}
+
+	async deleteGameEvent(game, type) {
+		try {
+			this.mappers.run(this.DB, "DELETE FROM game_events WHERE game = ? AND type = ?", [
+				String(game).toLowerCase(),
+				String(type).toLowerCase()
+			]);
+			return true;
+		} catch (error) {
+			this.logger.error("Error deleting game event:", error);
+			return false;
+		}
+	}
+
+	async getActiveGameEvents() {
+		try {
+			const now = Date.now();
+			return this.mappers.all(
+				this.DB,
+				"SELECT * FROM game_events WHERE end_time > ? ORDER BY end_time ASC",
+				[now]
+			);
+		} catch (error) {
+			this.logger.error("Error getting active game events:", error);
+			return [];
 		}
 	}
 }

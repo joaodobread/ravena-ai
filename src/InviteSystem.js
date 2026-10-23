@@ -1,33 +1,85 @@
 const Logger = require("./utils/Logger");
 const Database = require("./utils/Database");
+const LLMService = require("./services/LLMService");
 const path = require("path");
 const fs = require("fs").promises;
 
 const MIN_REASON_LENGTH = 15;
+const frasesNaoSabeLer = ["tenho permissão", "tenho permissao"];
 
 /**
  * Verifica se a string contém caracteres "estranhos" (fontes personalizadas,
- * zalgo, marcas de combinação, símbolos exóticos/ornamentais)
+ * zalgo, marcas de combinação abusivas, alfabetos exóticos usados como fontes ornamentais).
+ * Emojis normais e símbolos comuns (ex: ®, ©, ™) NÃO são considerados estranhos.
  * @param {string} str
  * @returns {boolean}
  */
 function hasStrangeCharacters(str) {
 	if (!str) return false;
 
-	// 1. Math Alphanumeric Symbols (e.g. 𝖲, 𝗔, 𝖫, 𝖵, 🄐, 𝕾, 𝗤, 𝔄, 𝓐)
-	const mathAndEnclosed = /[\u{1D400}-\u{1D7FF}\u{2460}-\u{24FF}\u{1F100}-\u{1F1FF}]/u;
-	if (mathAndEnclosed.test(str)) return true;
-	// 2. Combining marks (strikethrough, underline, Zalgo, Arabic combining marks, etc.)
-	/* eslint-disable no-misleading-character-class */
-	const combiningMarks =
-		/[\u0300-\u036F\u1DC0-\u1DFF\u20D0-\u20FF\uFE20-\uFE2F\u0610-\u061A\u064B-\u065F\u06D6-\u06DC\u06DF-\u06E8\u06EA-\u06EC]/;
-	/* eslint-enable no-misleading-character-class */
-	if (combiningMarks.test(str)) return true;
+	// Normaliza para NFC para evitar falsos positivos com acentuação latina padrão (ã, é, ç, etc.)
+	const normalized = str.normalize("NFC");
 
-	// 3. Specific decorative/exotic symbols commonly used in fancy nickname formatting:
-	const exoticOrOrnamental =
-		/[\u0F00-\u0FFF\u0A00-\u0A7F\u2C80-\u2CFF\u2700-\u27BF\u2500-\u25FF\u2600-\u26FF\u2200-\u22FF\u2300-\u23FF\u{10650}-\u{10660}]/u;
-	if (exoticOrOrnamental.test(str)) return true;
+	// 1. Math Alphanumeric Symbols (U+1D400 - U+1D7FF): Fontes matemáticas (negrito, itálico, script/cursiva, fraktur, double-struck, sans, mono)
+	// Ex: 𝓡, 𝓑, 𝖲, 𝗔, 𝕝, 𝚐, 𝓗, 𝓚, 𝔄
+	if (/[\u{1D400}-\u{1D7FF}]/u.test(normalized)) return true;
+
+	// 2. Fullwidth Latin / dígitos (U+FF01 - U+FF5E) usados como fonte: Ａ Ｂ Ｃ
+	if (/[\u{FF01}-\u{FF5E}]/u.test(normalized)) return true;
+
+	// 3. Enclosed Alphanumerics (U+2460 - U+24FF) ex: ①, ⑵, ⒜, ⓐ, Ⓐ
+	if (/[\u{2460}-\u{24FF}]/u.test(normalized)) return true;
+
+	// 4. Enclosed Alphanumeric Supplement (U+1F100 - U+1F1FF) usados como fonte ornamental
+	// Exclui bandeiras (1F1E6-1F1FF) e emojis quadrados padrão (🅰️, 🅱️, 🅾️, 🅿️, 🆎, 🆑, 🆒, 🆓, 🆔, 🆕, 🆖, 🆗, 🆘, 🆙, 🆚)
+	if (/[\u{1F110}-\u{1F16F}\u{1F130}-\u{1F14F}\u{1F120}-\u{1F12F}]/u.test(normalized)) return true;
+
+	// 5. Símbolos matemáticos em formato de letra usados como fonte (ℬ, ℰ, ℱ, ℋ, ℐ, ℒ, ℳ, ℛ, ℯ, ℊ, ℴ, ℭ, ℌ, ℑ, ℜ, ℨ, ℂ, ℍ, ℕ, ℙ, ℚ, ℝ, ℤ)
+	// Não inclui símbolos comuns como ™ (U+2122), № (U+2116), ℃, ℉
+	if (
+		/[\u2102\u210A-\u2113\u2115\u2119-\u211D\u2124\u2128\u212C-\u212D\u2130-\u2139\u213C-\u2149]/u.test(
+			normalized
+		)
+	)
+		return true;
+
+	// 6. Alfabetos/símbolos exóticos usados puramente como fontes decorativas em nicks/grupos:
+	// - Tai Viet (U+AA80-U+AADF, ex: ꫀ, ꪮ)
+	// - Tai Le (U+1950-U+197F, U+1980-U+19DF, ex: ᧉ, ᧓, ᥉)
+	// - Tai Tham (U+1A20-U+1AAF, ex: ᩥ)
+	// - Cherokee & Suplemento (U+13A0-U+13FF, U+AB70-U+ABBF, ex: ꭷ, ᎐)
+	// - Ethiopic (U+1200-U+137F, ex: ፝)
+	// - Coptic (U+2C80-U+2CFF, ex: ⲓ)
+	// - Georgian (U+10A0-U+10FF, U+2D00-U+2D2F, ex: ა, ⴄ)
+	// - Tifinagh (U+2D30-U+2D7F, ex: ⵿)
+	// - Meetei Mayek (U+ABC0-U+ABFF, ex: ꯭)
+	// - Vedic Extensions (U+1CD0-U+1CFF, ex: ᳟)
+	// - IPA / Extensões Fonéticas usadas como small caps (U+0250-U+02AF, U+1D00-U+1D2F, ex: ɪ, ɢ, ʟ, ɴ)
+	// - Glifos indic/orientais decorativos (Gujarati U+0A80-U+0AFF ex: ઇ, Odia U+0B00-U+0B7F ex: ଓ, Gurmukhi U+0A00-U+0A7F, Tibetan U+0F00-U+0FFF, Sinhala U+0D80-U+0DFF)
+	// - Runas (U+16A0-U+16FF), Gótico (U+10330-U+1034F), Glagolítico (U+2C00-U+2C5F)
+	// - Linear A/B (U+10000-U+100FF, U+10650-U+10660)
+	// - Lao marks (U+0EBC)
+	/* eslint-disable no-misleading-character-class */
+	const exoticScripts =
+		/[\u{0A00}-\u{0B7F}\u{0D80}-\u{0DFF}\u{0F00}-\u{0FFF}\u{10A0}-\u{10FF}\u{1200}-\u{137F}\u{13A0}-\u{13FF}\u{16A0}-\u{16FF}\u{1900}-\u{19DF}\u{1A20}-\u{1AAF}\u{1CD0}-\u{1CFF}\u{1D00}-\u{1D2F}\u{2C00}-\u{2C5F}\u{2C80}-\u{2CFF}\u{2D00}-\u{2D7F}\u{AA80}-\u{AADF}\u{AB70}-\u{ABFF}\u{10330}-\u{1034F}\u{10650}-\u{10660}\u{0250}-\u{02AF}\u{0EBC}]/u;
+	if (exoticScripts.test(normalized)) return true;
+
+	// 7. Marcas de combinação decorativas e Zalgo não-latino:
+	// - Diacríticos hebraicos usados como enfeite (U+0591-U+05C7 ex: ׁ, ׅ, ׂ, ֟, ִ)
+	// - Marcas árabes decorativas / Alcorânicas (U+0610-U+061A, U+064B-U+065F, U+06D6-U+06ED, U+08D4-U+08ED ex: ࣭, ࣪, ۫)
+	// - Marcas de combinação para símbolos (U+20D0-U+20E2, U+20E4-U+20FF - excluindo U+20E3 keycap de emojis)
+	// - Diacríticos estendidos / suplementares (U+1AB0-U+1AFF ex: ᪶, U+1DC0-U+1DFF)
+	// - Half marks combinados (U+FE20-U+FE2F)
+	const decorativeCombining =
+		/[\u{0591}-\u{05C7}\u{0610}-\u{061A}\u{064B}-\u{065F}\u{06D6}-\u{06ED}\u{08D4}-\u{08ED}\u{1AB0}-\u{1AFF}\u{1DC0}-\u{1DFF}\u{20D0}-\u{20E2}\u{20E4}-\u{20FF}\u{FE20}-\u{FE2F}]/u;
+	if (decorativeCombining.test(normalized)) return true;
+
+	// 8. Diacríticos empilhados / Zalgo / tachados / sublinhados com marcas de combinação:
+	// - Overlays, tachados, sublinhados, double diacritics (U+0332-U+0338, U+035C-U+0362)
+	// - Múltiplos diacríticos combinados consecutivos empilhados
+	if (/[\u0332-\u0338\u035C-\u0362]/.test(normalized)) return true;
+	if (/[\u0300-\u036F]{2,}/.test(normalized)) return true;
+	/* eslint-enable no-misleading-character-class */
 
 	return false;
 }
@@ -42,6 +94,229 @@ function hasStrangeCharacters(str) {
  * 5. Admins podem usar um comando para entrar no grupo
  */
 class InviteSystem {
+	static frasesNaoSabeLer = frasesNaoSabeLer;
+
+	// Registro de entradas automáticas recentes por bot (botId -> [timestamp, ...]) para limite de 3/30m
+	static recentBotJoins = new Map();
+
+	// Fila de convites aprovados aguardando bot disponível
+	static inviteQueue = [];
+
+	// Timer de processamento da fila de convites
+	static queueTimer = null;
+
+	// Histórico dos últimos convites aceitos (tanto diretos quanto da fila)
+	static recentlyAccepted = [];
+
+	/**
+	 * Adiciona um convite aprovado à fila de espera caso não haja bot disponível
+	 * @param {Object} item - Dados do convite a enfileirar
+	 * @returns {number} Posição na fila (1-indexed)
+	 */
+	static enqueueInvite(item) {
+		const existingIndex = InviteSystem.inviteQueue.findIndex(
+			(q) => q.inviteCode === item.inviteCode
+		);
+		if (existingIndex !== -1) {
+			return existingIndex + 1;
+		}
+		InviteSystem.inviteQueue.push({
+			...item,
+			attempts: 0
+		});
+		InviteSystem.startQueueTimer();
+		return InviteSystem.inviteQueue.length;
+	}
+
+	/**
+	 * Remove um convite da fila caso tenha sido aceito manualmente
+	 * @param {string} inviteCode
+	 * @returns {boolean}
+	 */
+	static removeFromQueue(inviteCode) {
+		const idx = InviteSystem.inviteQueue.findIndex((q) => q.inviteCode === inviteCode);
+		if (idx !== -1) {
+			InviteSystem.inviteQueue.splice(idx, 1);
+			if (InviteSystem.inviteQueue.length === 0 && InviteSystem.queueTimer) {
+				clearInterval(InviteSystem.queueTimer);
+				InviteSystem.queueTimer = null;
+			}
+			return true;
+		}
+		return false;
+	}
+
+	/**
+	 * Registra um convite aceito na lista dos últimos 10
+	 * @param {Object} entry
+	 */
+	static _pushRecentlyAccepted(entry) {
+		InviteSystem.recentlyAccepted.push({
+			...entry,
+			acceptedAt: Date.now()
+		});
+		if (InviteSystem.recentlyAccepted.length > 10) {
+			InviteSystem.recentlyAccepted.shift();
+		}
+	}
+
+	/**
+	 * Calcula o tempo estimado e hora prevista de entrada para uma dada posição na fila
+	 * @param {number} position - Posição na fila (1-indexed)
+	 * @returns {{ totalMinutes: number, tempo: string, horaPrevista: string, formatted: string }}
+	 */
+	static getETA(position = InviteSystem.inviteQueue.length) {
+		const pos = Math.max(1, position);
+		const intervalMinutes = 15;
+		const totalMinutes = pos * intervalMinutes;
+		const futureMs = Date.now() + totalMinutes * 60 * 1000;
+		const date = new Date(futureMs);
+		const horaPrevista = date.toLocaleTimeString("pt-BR", {
+			hour: "2-digit",
+			minute: "2-digit",
+			timeZone: "America/Sao_Paulo"
+		});
+		return {
+			totalMinutes,
+			tempo: `~${totalMinutes} minutos`,
+			horaPrevista,
+			formatted: `~${totalMinutes} min (às ${horaPrevista})`
+		};
+	}
+
+	/**
+	 * Inicia o timer da fila de convites (padrão a cada 15 minutos)
+	 * @param {number} intervalMs
+	 */
+	static startQueueTimer(intervalMs = 15 * 60 * 1000) {
+		if (InviteSystem.queueTimer) return;
+		InviteSystem.queueTimer = setInterval(() => {
+			InviteSystem.processQueueTick().catch((err) => {
+				console.error("[InviteSystem Queue Error]", err);
+			});
+		}, intervalMs);
+		if (typeof InviteSystem.queueTimer.unref === "function") {
+			InviteSystem.queueTimer.unref();
+		}
+	}
+
+	/**
+	 * Limpa a fila e cancela o timer (útil em testes ou shutdown)
+	 */
+	static clearQueue() {
+		if (InviteSystem.queueTimer) {
+			clearInterval(InviteSystem.queueTimer);
+			InviteSystem.queueTimer = null;
+		}
+		InviteSystem.inviteQueue = [];
+	}
+
+	/**
+	 * Processa o próximo item da fila quando um bot se torna disponível
+	 */
+	static async processQueueTick() {
+		if (InviteSystem.inviteQueue.length === 0) {
+			if (InviteSystem.queueTimer) {
+				clearInterval(InviteSystem.queueTimer);
+				InviteSystem.queueTimer = null;
+			}
+			return;
+		}
+
+		const item = InviteSystem.inviteQueue[0];
+		if (!item || !item.inviteSystem) {
+			InviteSystem.inviteQueue.shift();
+			return;
+		}
+
+		try {
+			// Tenta selecionar um bot disponível
+			const selectedBot = await item.inviteSystem.selectBestBotForAutoJoin();
+			if (!selectedBot) {
+				item.inviteSystem.logger.info(
+					`[Fila] Tique da fila executado, mas nenhum bot elegível disponível ainda. Mantendo ${item.inviteCode} na posição 1.`
+				);
+				return;
+			}
+
+			// Remove da fila para tentar aceitar
+			InviteSystem.inviteQueue.shift();
+
+			item.inviteSystem.logger.info(
+				`[Fila] Tentando aceitar convite ${item.inviteCode} com bot ${selectedBot.id}...`
+			);
+			const joinResult = await selectedBot.client.acceptInvite(item.inviteCode);
+
+			if (joinResult && joinResult.accepted) {
+				InviteSystem.recordBotJoin(selectedBot.id);
+				InviteSystem._pushRecentlyAccepted({
+					inviteCode: item.inviteCode,
+					authorId: item.authorId,
+					authorName: item.authorName,
+					botId: selectedBot.id,
+					groupName: item.groupName
+				});
+
+				await item.inviteSystem.database.savePendingJoin(item.inviteCode, {
+					authorId: item.authorId,
+					authorName: item.authorName,
+					groupJid: item.groupJid || null
+				});
+
+				const successMsg =
+					`✅ *[Fila de Convites]* Convite aceito automaticamente!\n` +
+					`🤖 *Bot:* ${selectedBot.id}\n` +
+					`👤 *Solicitante:* ${item.authorName} (${(item.authorId || "").split("@")[0]})\n` +
+					`🏷️ *Grupo:* ${item.groupName || "Desconhecido"}\n` +
+					`🔗 chat.whatsapp.com/${item.inviteCode}`;
+
+				if (item.inviteSystem.bot?.grupoLogs) {
+					await item.inviteSystem.bot.sendMessage(item.inviteSystem.bot.grupoLogs, successMsg);
+				}
+				if (
+					item.inviteSystem.bot?.grupoInvites &&
+					item.inviteSystem.bot.grupoInvites !== item.inviteSystem.bot.grupoLogs
+				) {
+					await item.inviteSystem.bot.sendMessage(item.inviteSystem.bot.grupoInvites, successMsg);
+				}
+			} else {
+				item.attempts = (item.attempts || 0) + 1;
+				item.inviteSystem.logger.warn(
+					`[Fila] Falha ao aceitar convite ${item.inviteCode} na tentativa ${item.attempts}/3: ${joinResult?.error || "Erro"}`
+				);
+				if (item.attempts < 3) {
+					// Volta para o final da fila
+					InviteSystem.inviteQueue.push(item);
+				} else {
+					const failMsg =
+						`❌ *[Fila de Convites]* Convite ${item.inviteCode} descartado após 3 tentativas sem sucesso.\n` +
+						`👤 *Solicitante:* ${item.authorName} (${(item.authorId || "").split("@")[0]})\n` +
+						`🏷️ *Grupo:* ${item.groupName || "Desconhecido"}`;
+					if (item.inviteSystem.bot?.grupoLogs) {
+						await item.inviteSystem.bot.sendMessage(item.inviteSystem.bot.grupoLogs, failMsg);
+					}
+					if (
+						item.inviteSystem.bot?.grupoInvites &&
+						item.inviteSystem.bot.grupoInvites !== item.inviteSystem.bot.grupoLogs
+					) {
+						await item.inviteSystem.bot.sendMessage(item.inviteSystem.bot.grupoInvites, failMsg);
+					}
+				}
+			}
+		} catch (err) {
+			item.inviteSystem?.logger?.error("[Fila] Erro no processamento do tick:", err);
+			item.attempts = (item.attempts || 0) + 1;
+			if (item.attempts < 3) {
+				InviteSystem.inviteQueue.push(item);
+			}
+		}
+
+		if (InviteSystem.inviteQueue.length === 0 && InviteSystem.queueTimer) {
+			clearInterval(InviteSystem.queueTimer);
+			InviteSystem.queueTimer = null;
+		}
+	}
+
 	/**
 	 * Cria uma nova instância do InviteSystem
 	 * @param {WhatsAppBot} bot - A instância do bot
@@ -56,6 +331,7 @@ class InviteSystem {
 		this.groupInviteCooldowns = new Map(); // Mapa de inviteCode -> timestamp do último convite do grupo
 		this.blockedUserNotifyCache = new Map(); // Mapa de author -> timestamp da última notificação de bloqueio
 		this.groupCooldownNotifyCache = new Map(); // Mapa de inviteCode -> timestamp da última notificação de cooldown
+		this.frasesNaoSabeLer = frasesNaoSabeLer;
 	}
 
 	rndString() {
@@ -63,8 +339,670 @@ class InviteSystem {
 	}
 
 	isCommunity(data) {
-		// Community has IsParent: true (não sei se só isso resolve...)
-		return data?.IsParent === true;
+		return (
+			data?.IsParent === true ||
+			data?.isParent === true ||
+			data?.IsCommunity === true ||
+			data?.isCommunity === true ||
+			data?.IsCommunityAnnounce === true ||
+			data?.isCommunityAnnounce === true
+		);
+	}
+
+	getParticipantCount(data) {
+		if (!data) return null;
+		if (typeof data.ParticipantCount === "number") return data.ParticipantCount;
+		if (typeof data.participantCount === "number") return data.participantCount;
+		if (Array.isArray(data.Participants)) return data.Participants.length;
+		if (Array.isArray(data.participants)) return data.participants.length;
+		if (typeof data.Size === "number") return data.Size;
+		if (typeof data.size === "number") return data.size;
+		return null;
+	}
+
+	getCommunityLink() {
+		return (
+			this.bot?.linkComunidade ||
+			process.env.LINK_COMUNIDADE ||
+			"https://chat.whatsapp.com/C47W0n3Bp9Z9Ra2ifzDDQe"
+		);
+	}
+
+	getBotAlreadyInGroupMessage() {
+		const communityLink = this.getCommunityLink();
+		return (
+			"Já tem um bot no grupo! Todos os bots rodam o mesmo código, no mesmo servidor e não adianta trocar um pelo outro, pois a instabilidade pode afetar qualquer um deles em períodos aleatórios.\n\n" +
+			"⚠️ *Atenção:* Remover o bot do grupo pode ocasionar o bloqueio se ele foi adicionado recentemente, e seu grupo não terá prioridade para voltar a ter o bot. Por isso, se quiser continuar usando, é importante pedir ajuda em vez de remover!\n\n" +
+			`Se precisar de ajuda, chame no !grupao / comunidade da ravena:\n${communityLink}`
+		);
+	}
+
+	getMinMembersMessage(configuredMinMembros) {
+		let contato = "no !grupao / comunidade da ravena";
+		if (this.bot?.numeroResponsavel && String(this.bot.numeroResponsavel).trim()) {
+			let respNum = String(this.bot.numeroResponsavel).split("@")[0].trim();
+			if (!respNum.startsWith("+")) {
+				respNum = `+${respNum.replace(/\D/g, "")}`;
+			}
+			contato = `administrador desta ravena comunitária em ${respNum}`;
+		}
+		return `Esta ravena não aceita convites de grupos com menos de ${configuredMinMembros} membros. Se tiver dúvidas, chame ${contato}`;
+	}
+
+	static canBotJoin(botId) {
+		const now = Date.now();
+		const windowMs = 30 * 60 * 1000;
+		const joins = (InviteSystem.recentBotJoins.get(botId) || []).filter((t) => now - t < windowMs);
+		InviteSystem.recentBotJoins.set(botId, joins);
+		return joins.length < 3;
+	}
+
+	static recordBotJoin(botId) {
+		const now = Date.now();
+		const joins = InviteSystem.recentBotJoins.get(botId) || [];
+		joins.push(now);
+		InviteSystem.recentBotJoins.set(botId, joins);
+	}
+
+	/**
+	 * Retorna todos os números de telefone conhecidos de bots (limpos apenas com dígitos)
+	 * @returns {Set<string>}
+	 */
+	getKnownBotNumbers({ excludeBanned = true } = {}) {
+		const numbers = new Set();
+
+		// Número do próprio bot
+		if (this.bot?.phoneNumber) {
+			const clean = String(this.bot.phoneNumber)
+				.split("@")[0]
+				.split(":")[0]
+				.replace(/[^0-9]/g, "");
+			if (clean) numbers.add(clean);
+		}
+		if (this.bot?.numero) {
+			const clean = String(this.bot.numero)
+				.split("@")[0]
+				.split(":")[0]
+				.replace(/[^0-9]/g, "");
+			if (clean) numbers.add(clean);
+		}
+
+		// Lista de outros bots configurados no bot atual
+		if (Array.isArray(this.bot?.otherBots)) {
+			for (const b of this.bot.otherBots) {
+				if (b) {
+					const clean = String(b)
+						.split("@")[0]
+						.split(":")[0]
+						.replace(/[^0-9]/g, "");
+					if (clean) numbers.add(clean);
+				}
+			}
+		}
+
+		// Todas as instâncias ativas no database
+		const allBots = this.database?.botInstances || [];
+		for (const b of allBots) {
+			if (b?.phoneNumber) {
+				const clean = String(b.phoneNumber)
+					.split("@")[0]
+					.split(":")[0]
+					.replace(/[^0-9]/g, "");
+				if (clean) numbers.add(clean);
+			}
+			if (b?.numero) {
+				const clean = String(b.numero)
+					.split("@")[0]
+					.split(":")[0]
+					.replace(/[^0-9]/g, "");
+				if (clean) numbers.add(clean);
+			}
+		}
+
+		if (excludeBanned) {
+			const bannedNumbers = this.getBannedBotNumbers();
+			for (const num of bannedNumbers) {
+				numbers.delete(num);
+			}
+		}
+
+		return numbers;
+	}
+
+	/**
+	 * Retorna todos os bots que estão habilitados e marcados como banidos
+	 * @returns {Array<Object>}
+	 */
+	getBannedBots() {
+		try {
+			const botsPath = path.resolve(__dirname, "../bots.json");
+			const raw = require("fs").readFileSync(botsPath, "utf8");
+			const bots = JSON.parse(raw);
+			if (Array.isArray(bots)) {
+				return bots.filter((b) => b && b.enabled === true && b.banido === true);
+			}
+		} catch (e) {
+			this.logger.warn("Erro ao ler bots.json para getBannedBots:", e.message);
+		}
+		const allBots = this.database?.botInstances || [];
+		return allBots.filter((b) => b && b.enabled === true && b.banido === true);
+	}
+
+	/**
+	 * Retorna o Set de números limpos dos bots que estão banidos e habilitados
+	 * @returns {Set<string>}
+	 */
+	getBannedBotNumbers() {
+		const numbers = new Set();
+		const bannedBots = this.getBannedBots();
+		for (const b of bannedBots) {
+			if (b?.phoneNumber) {
+				const clean = String(b.phoneNumber)
+					.split("@")[0]
+					.split(":")[0]
+					.replace(/[^0-9]/g, "");
+				if (clean) numbers.add(clean);
+			}
+			if (b?.numero) {
+				const clean = String(b.numero)
+					.split("@")[0]
+					.split(":")[0]
+					.replace(/[^0-9]/g, "");
+				if (clean) numbers.add(clean);
+			}
+		}
+		return numbers;
+	}
+
+	/**
+	 * Retorna o Set de IDs/nomes em lowercase de bots que estão marcados como banido: true e enabled: false
+	 * Usado para desconsiderar bots antigos banidos/desativados no histórico de estadias
+	 * @returns {Set<string>}
+	 */
+	getBannedDisabledBotIds() {
+		const ids = new Set();
+		try {
+			const botsPath = path.resolve(__dirname, "../bots.json");
+			const raw = require("fs").readFileSync(botsPath, "utf8");
+			const bots = JSON.parse(raw);
+			if (Array.isArray(bots)) {
+				for (const b of bots) {
+					if (b && b.banido === true && b.enabled === false) {
+						if (b.nome) ids.add(String(b.nome).toLowerCase());
+						if (b.id) ids.add(String(b.id).toLowerCase());
+					}
+				}
+			}
+		} catch (e) {
+			this.logger.warn("Erro ao ler bots.json em getBannedDisabledBotIds:", e.message);
+		}
+		return ids;
+	}
+
+	/**
+	 * Verifica se algum bot banido habilitado está atualmente presente nos participantes do convite
+	 * @param {Object} inviteInfoData
+	 * @returns {boolean}
+	 */
+	hasBannedBotInGroup(inviteInfoData) {
+		const participants = inviteInfoData?.Participants || inviteInfoData?.participants;
+		if (!participants || !Array.isArray(participants)) {
+			return false;
+		}
+		const bannedNumbers = this.getBannedBotNumbers();
+		if (bannedNumbers.size === 0) return false;
+
+		for (const p of participants) {
+			const rawNum =
+				typeof p === "string" ? p : p?.PhoneNumber || p?.JID || p?.phoneNumber || p?.jid || "";
+			const cleanNum = String(rawNum)
+				.split("@")[0]
+				.split(":")[0]
+				.replace(/[^0-9]/g, "");
+			if (cleanNum && bannedNumbers.has(cleanNum)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Verifica se o grupo possui canal de stream configurado (Twitch, Kick ou YouTube)
+	 * @param {string} groupJid
+	 * @returns {Promise<boolean>}
+	 */
+	async groupHasStreamChannel(groupJid) {
+		if (!groupJid) return false;
+		try {
+			const group = await this.database.getGroup(groupJid);
+			if (!group) return false;
+			const hasTwitch = Array.isArray(group.twitch) && group.twitch.length > 0;
+			const hasKick = Array.isArray(group.kick) && group.kick.length > 0;
+			const hasYoutube = Array.isArray(group.youtube) && group.youtube.length > 0;
+			return hasTwitch || hasKick || hasYoutube;
+		} catch (err) {
+			this.logger.error(`Erro ao checar canais de stream do grupo ${groupJid}:`, err);
+			return false;
+		}
+	}
+
+	/**
+	 * Seleciona bot VIP habilitado e disponível para aceitar convite (ex: doadores R$100+)
+	 * @returns {WhatsAppBotGo|null}
+	 */
+	selectVipBot() {
+		try {
+			const allBots = this.database?.botInstances || [];
+			const vipBots = allBots.filter((b) => {
+				if (!b || b.banido || !b.vip) return false;
+				if (b.enabled === false) return false;
+				if (b.useTelegram || b.useDiscord) return false;
+				if (b.ignoreInvites) return false;
+				if (!b.client || typeof b.client.acceptInvite !== "function") return false;
+				return true;
+			});
+			return vipBots[0] || null;
+		} catch (err) {
+			this.logger.error("Erro ao selecionar bot VIP:", err);
+			return null;
+		}
+	}
+
+	/**
+	 * Identifica quais bots conhecidos estão atualmente presentes nos participantes do grupo
+	 * @param {Object} inviteInfoData - Dados retornados por getInviteInfo
+	 * @param {Object} [options]
+	 * @param {boolean} [options.excludeBanned=true]
+	 * @returns {string[]} Array de números dos bots presentes no grupo
+	 */
+	getBotsInGroupFromInvite(inviteInfoData, { excludeBanned = true } = {}) {
+		const botsInGroup = [];
+		const participants = inviteInfoData?.Participants || inviteInfoData?.participants;
+		if (!participants || !Array.isArray(participants)) {
+			return botsInGroup;
+		}
+
+		const knownBotNumbers = this.getKnownBotNumbers({ excludeBanned });
+		for (const p of participants) {
+			const rawNum =
+				typeof p === "string" ? p : p?.PhoneNumber || p?.JID || p?.phoneNumber || p?.jid || "";
+			const cleanNum = String(rawNum)
+				.split("@")[0]
+				.split(":")[0]
+				.replace(/[^0-9]/g, "");
+			if (cleanNum && knownBotNumbers.has(cleanNum)) {
+				if (!botsInGroup.includes(cleanNum)) {
+					botsInGroup.push(cleanNum);
+				}
+			}
+		}
+
+		return botsInGroup;
+	}
+
+	/**
+	 * Avalia a solicitação de convite no modo RECENTLY_BANNED
+	 * @param {Object} params
+	 * @returns {Promise<{ shouldAutoAccept: boolean, reason: string, bannedModeReject?: string }>}
+	 */
+	async evaluateAutoAcceptRecentlyBanned({
+		isDonator = false,
+		donateValue = 0,
+		wasInGroupBefore = false,
+		hasBotInGroup = false,
+		hasBannedBotInGroup = false,
+		participantCount = 0,
+		groupJid = null
+	}) {
+		if (
+			process.env.DISABLE_INVITE_AUTO_ACCEPT === "true" ||
+			process.env.DISABLE_AUTO_ACCEPT === "true"
+		) {
+			return {
+				shouldAutoAccept: false,
+				reason: "Auto-accept desativado via configuração (.env)"
+			};
+		}
+
+		// Se já existe um bot ativo no grupo atualmente, nunca adicionar outro
+		if (hasBotInGroup) {
+			return {
+				shouldAutoAccept: false,
+				reason: "Já existe um bot no grupo atualmente"
+			};
+		}
+
+		// 1. Donates: Continua aceitando normalmente
+		if (isDonator) {
+			return {
+				shouldAutoAccept: true,
+				reason: `Doador (R$${donateValue}) - Aceite em modo RECENTLY_BANNED`
+			};
+		}
+
+		// 2. Grupos que nunca tiveram a ravena (novos): Não aceitar
+		const hadBot = hasBannedBotInGroup || wasInGroupBefore;
+		if (!hadBot) {
+			return {
+				shouldAutoAccept: false,
+				bannedModeReject: "new_group",
+				reason: "Grupo novo (modo RECENTLY_BANNED: aceitando apenas reposição de ravenas)"
+			};
+		}
+
+		// 3. Grupos que tem a ravena que foi banida nos membros (ou histórico anterior comprovado):
+		// Se >= 15 membros OU Grupo com canal twitch/kick/youtube configurado: aceitar automaticamente
+		const hasStreamChannel = await this.groupHasStreamChannel(groupJid);
+		const count = typeof participantCount === "number" ? participantCount : 0;
+
+		if (count >= 15 || hasStreamChannel) {
+			const justification = count >= 15 ? `${count} membros` : "canal de live configurado";
+			return {
+				shouldAutoAccept: true,
+				reason: `Reposição de ravena banida (${justification})`
+			};
+		}
+
+		// Caso contrário, negar e adicionar na mensagem "Grupo pequeno pendente"
+		return {
+			shouldAutoAccept: false,
+			bannedModeReject: "small_group",
+			reason: "Grupo pequeno pendente"
+		};
+	}
+
+	/**
+	 * Seleciona o melhor bot elegível para entrar no grupo automaticamente
+	 * Critérios:
+	 * - Bot normal (habilitado, não vip, não privado, não comunitário, não banido, não telegram/discord)
+	 * - Menor quantidade de mensagens nos últimos 3 dias via load_reports
+	 * - Máximo de 3 grupos a cada 30 minutos
+	 * @returns {Promise<WhatsAppBotGo|null>}
+	 */
+	async selectBestBotForAutoJoin() {
+		try {
+			const allBots = this.database.botInstances || [];
+			const eligibleBots = allBots.filter((b) => {
+				if (!b || b.banido || b.vip || b.privado || b.comunitario) return false;
+				if (b.useTelegram || b.useDiscord) return false;
+				if (b.ignoreInvites) return false;
+				if (!b.client || typeof b.client.acceptInvite !== "function") return false;
+				return true;
+			});
+
+			if (eligibleBots.length === 0) {
+				this.logger.warn("Nenhum bot normal elegível e disponível para auto-join");
+				return null;
+			}
+
+			// Busca totais de mensagens nos últimos 3 dias
+			const messageTotals = await this.database.getBotsMessageTotals();
+
+			// Ordena por menor mensagens nos últimos 3 dias
+			eligibleBots.sort((a, b) => {
+				const countA = messageTotals.get(a.id) || 0;
+				const countB = messageTotals.get(b.id) || 0;
+				return countA - countB;
+			});
+
+			for (const candidate of eligibleBots) {
+				if (InviteSystem.canBotJoin(candidate.id)) {
+					return candidate;
+				}
+			}
+
+			this.logger.warn("Todos os bots elegíveis atingiram o limite de 3 grupos em 30 minutos");
+			return null;
+		} catch (err) {
+			this.logger.error("Erro ao selecionar bot para auto join:", err);
+			return null;
+		}
+	}
+
+	/**
+	 * Avalia a solicitação de convite com a LLM
+	 * @param {Object} params
+	 * @returns {Promise<{ shouldAutoAccept: boolean, reason: string, rawResponse?: string }>}
+	 */
+	async evaluateAutoAcceptWithLLM({
+		userName,
+		authorId,
+		groupName,
+		participantCount,
+		description,
+		reason,
+		isDonator = false,
+		donateValue = 0,
+		wasInGroupBefore = false,
+		hasBotInGroup = false
+	}) {
+		if (
+			process.env.DISABLE_INVITE_AUTO_ACCEPT === "true" ||
+			process.env.DISABLE_AUTO_ACCEPT === "true"
+		) {
+			return {
+				shouldAutoAccept: false,
+				reason: "Auto-accept desativado via configuração (.env)"
+			};
+		}
+
+		// Se já existe um bot no grupo atualmente, NUNCA adicionar outro, independente do convite (inclusive se for doador)
+		if (hasBotInGroup) {
+			return {
+				shouldAutoAccept: false,
+				reason: "Já existe um bot no grupo atualmente"
+			};
+		}
+
+		// Se o bot já esteve no grupo: é porque removeram e não deve ser aceito automaticamente (desconsiderar se for doador)
+		if (wasInGroupBefore && !isDonator) {
+			return {
+				shouldAutoAccept: false,
+				reason:
+					"Bot já esteve neste grupo anteriormente (se saiu/removeram, não deve ser aceito automaticamente)"
+			};
+		}
+
+		// Doador acima de R$49: Aceite automático direto
+		if (isDonator && donateValue > 49) {
+			return {
+				shouldAutoAccept: true,
+				reason: `Doador VIP (R$${donateValue}) - Aceite automático garantido`
+			};
+		}
+
+		// 1. Pré-filtros determinísticos para economizar tokens
+		// Se doador >= 10, aceita independente da quantidade de membros
+		if (!isDonator || donateValue < 10) {
+			if (typeof participantCount === "number" && participantCount < 3) {
+				return {
+					shouldAutoAccept: false,
+					reason: `Grupo com poucos participantes (${participantCount} membros)`
+				};
+			}
+		}
+
+		// Se for doador, caracteres estranhos não são um problema
+		if (!isDonator) {
+			if (hasStrangeCharacters(userName)) {
+				return {
+					shouldAutoAccept: false,
+					reason: "Caracteres estranhos/ornamentais no nome do usuário"
+				};
+			}
+
+			if (hasStrangeCharacters(groupName)) {
+				return {
+					shouldAutoAccept: false,
+					reason: "Caracteres estranhos/ornamentais no título do grupo"
+				};
+			}
+
+			if (hasStrangeCharacters(description)) {
+				return {
+					shouldAutoAccept: false,
+					reason: "Caracteres estranhos/ornamentais na descrição do grupo"
+				};
+			}
+		}
+
+		// Rejeição de grupos de teste pelo título
+		const normGroupName = (groupName || "")
+			.toLowerCase()
+			.normalize("NFD")
+			.replace(/[\u0300-\u036f]/g, "");
+		if (/\b(teste|testes|test|tests|testar|testando)\b/i.test(normGroupName)) {
+			return {
+				shouldAutoAccept: false,
+				reason: `Grupo de testes identificado no título ("${groupName}")`
+			};
+		}
+
+		// Rejeição de motivos com menção a teste
+		const normReason = (reason || "")
+			.toLowerCase()
+			.normalize("NFD")
+			.replace(/[\u0300-\u036f]/g, "");
+		if (
+			/\b(testar|teste|testes|testando)\b/i.test(normReason) ||
+			normReason.includes("para testar") ||
+			normReason.includes("pra testar") ||
+			normReason.includes("so teste")
+		) {
+			return {
+				shouldAutoAccept: false,
+				reason: `Motivo menciona teste ("${reason}")`
+			};
+		}
+
+		// Se doador >= 30, aceita mesmo com motivo ruim
+		if (!isDonator || donateValue < 30) {
+			const cleanReason = (reason || "").trim().toLowerCase();
+			const badReasons = [
+				"tenho permissão",
+				"tenho permissao",
+				"sim",
+				"posso te colocar",
+				"entra aí",
+				"entra ai",
+				"entra por favor",
+				"entra pfv",
+				"coloca aí",
+				"quero testar",
+				"quero prosseguir",
+				"quero que entre",
+				"legal"
+			];
+			if (
+				badReasons.some(
+					(br) => cleanReason === br || cleanReason === `${br}.` || cleanReason === `${br}!`
+				)
+			) {
+				return {
+					shouldAutoAccept: false,
+					reason: `Motivo genérico/fraco ("${reason}")`
+				};
+			}
+		}
+
+		// 2. Avaliação via LLM
+		try {
+			const llmService = LLMService.getInstance();
+			const autoAcceptSchema = {
+				type: "json_schema",
+				json_schema: {
+					name: "auto_accept_evaluation",
+					schema: {
+						type: "object",
+						properties: {
+							should_auto_accept: {
+								type: "boolean",
+								description:
+									"True apenas se o grupo cumprir todos os critérios para ser aceito automaticamente."
+							},
+							reason: {
+								type: "string",
+								description:
+									"Explicação concisa (em português) do motivo para aceitar ou recusar automaticamente."
+							}
+						},
+						required: ["should_auto_accept", "reason"],
+						additionalProperties: false
+					}
+				}
+			};
+
+			const systemPrompt = `Você é um avaliador criterioso de convites de grupos para bots de WhatsApp.
+Seu objetivo é decidir se um grupo deve ser ACEITO AUTOMATICAMENTE ou se deve ser enviado para moderação manual humana.
+
+REGRAS ESTRITAS DE REJEIÇÃO (NUNCA ACEITAR AUTOMATICAMENTE):
+1. Caracteres estranhos/fontes ornamentais/zalgo no nome da pessoa, grupo ou descrição (desconsiderar se o usuário for doador — se for doador, caracteres estranhos NÃO são um problema). (OBS: emojis normais e símbolos comuns como ®, ©, ™, etc. NÃO são caracteres estranhos. Caracteres estranhos referem-se a fontes modificadas/personalizadas como 𝓡, 𝓑, 𝖲, 𝗔, 𝕝, 𝚐, alfabetos exóticos usados apenas para enfeitar letras, ou zalgo/combinações abusivas de acentos decorativos).
+2. Grupos com menos de 3 pessoas (a menos que o usuário seja doador R$10+).
+3. Grupos que pareçam ser de menor de idade (turmas de colégio, escola, 5° ano, 6° ano, 8° ano, série, vocabulário infantil/underage).
+4. Motivos ruins, preguiçosos ou genéricos ("tenho permissão", "sim", "posso te colocar", "entra aí", "entra por favor", etc., a menos que o usuário seja doador R$30+).
+5. Título, descrição ou motivo com qualquer sinal de racismo, homofobia, xenofobia, assédio, pedofilia, drogas ilícitas, gore, extremismo ou ódio (NUNCA aceitar, mesmo se for doador).
+6. Grupos de teste ou com finalidade de testes (palavra 'teste'/'testar' no nome do grupo, descrição ou motivo).
+7. Já existe um bot no grupo atualmente (NUNCA aceitar outro, independente do convite).
+8. O bot já esteve no grupo anteriormente (se saiu/removeram, não deve ser aceito, a menos que o solicitante seja doador).
+
+CRITÉRIOS POSITIVOS PARA ACEITAÇÃO AUTOMÁTICA:
+1. Usuário Doador (grande peso):
+   - Se for doador, caracteres estranhos ou fontes ornamentais NÃO são um problema.
+   - R$1 a R$10: Aceitar mesmo com motivo intermediário/simples se a descrição for coerente.
+   - R$10 a R$30: Aceitar independente da quantidade de membros.
+   - R$30 a R$49: Aceitar mesmo com motivo ruim/fraco.
+   - Acima de R$49: Sempre aceitar (desde que sem conteúdo ilegal/ódio).
+2. Motivo bem escrito, educado e detalhado, justificando o uso das funções do bot sem quebrar regras.
+3. Grupo de streamer: possui nome ou link de canal (Twitch, YouTube, Kick) na descrição ou tags "[OFF]" ou "[ON]" no título.
+
+Seja exigente: em caso de dúvida, falta de clareza ou risco potencial, recuse (should_auto_accept: false).
+Responda APENAS com um objeto JSON no formato especificado.`;
+
+			const donorInfo = isDonator ? `Sim (💸 R$${donateValue} 💰)` : "Não";
+
+			const prompt = `Analise a solicitação de convite abaixo:
+
+- Usuário solicitante: "${userName}" (${authorId.split("@")[0]})
+- Doador: ${donorInfo}
+- Nome do Grupo: "${groupName || "Desconhecido"}"
+- Membros: ${participantCount ?? "Desconhecido"}
+- Já existe bot no grupo atualmente: ${hasBotInGroup ? "Sim" : "Não"}
+- Bot já esteve neste grupo antes: ${wasInGroupBefore ? "Sim" : "Não"}
+- Descrição do Grupo: "${description || "Sem descrição"}"
+- Motivo enviado pelo usuário:
+"${reason}"
+
+Decida se este grupo deve ser aceito automaticamente.`;
+
+			const response = await llmService.getCompletion({
+				prompt,
+				systemContext: systemPrompt,
+				response_format: autoAcceptSchema,
+				priority: 2,
+				timeout: 30000
+			});
+
+			if (response) {
+				const cleanResponse = response.replace(/```json|```/g, "").trim();
+				const parsed = JSON.parse(cleanResponse);
+				return {
+					shouldAutoAccept: Boolean(parsed.should_auto_accept),
+					reason: parsed.reason || "Avaliado pela IA",
+					rawResponse: cleanResponse
+				};
+			} else {
+				return {
+					shouldAutoAccept: false,
+					reason: "IA não retornou resposta"
+				};
+			}
+		} catch (err) {
+			this.logger.error("Erro ao avaliar convite com LLM:", err);
+			return {
+				shouldAutoAccept: false,
+				reason: `Falha na avaliação IA: ${err.message}`
+			};
+		}
 	}
 
 	/**
@@ -87,6 +1025,106 @@ class InviteSystem {
 			const inviteLink = inviteMatch[0];
 			const inviteCode = inviteMatch[1];
 			const currentTime = Date.now();
+
+			// Checa se o link é comunidade antes de iniciar cooldown ou pedir motivo
+			let infoCheck = null;
+			try {
+				if (this.bot.client && typeof this.bot.client.getInviteInfo === "function") {
+					infoCheck = await this.bot.client.getInviteInfo(inviteCode);
+					// Checa se o link é comunidade antes de iniciar cooldown ou pedir motivo
+					if (infoCheck && this.isCommunity(infoCheck)) {
+						this.logger.info(
+							`Ignorando convite de comunidade de ${message.author} (${inviteCode}) sem aplicar cooldown.`
+						);
+						if (message.origin && typeof message.origin.react === "function") {
+							message.origin.react("👥");
+						}
+						await this.bot.sendMessage(
+							message.author,
+							"Este link parece ser de uma *comunidade*, e o bot não consegue entrar em comunidades inteiras. Por favor, tente novamente enviando o link do *grupo específico* dentro da comunidade que você deseja adicionar!"
+						);
+						return true;
+					}
+
+					if (infoCheck) {
+						// Checa se já existe algum bot no grupo
+						const botsInGroup = this.getBotsInGroupFromInvite(infoCheck);
+						if (botsInGroup.length > 0) {
+							this.logger.info(
+								`Ignorando convite de ${message.author} (${inviteCode}): já existe bot no grupo (+${botsInGroup.join(", +")}). Sem cooldown.`
+							);
+							if (message.origin && typeof message.origin.react === "function") {
+								message.origin.react("🤖");
+							}
+							await this.bot.sendMessage(message.author, this.getBotAlreadyInGroupMessage());
+							return true;
+						}
+
+						// Checa se extras.invites.minMembros está configurado
+						const configuredMinMembros = parseInt(this.bot?.extras?.invites?.minMembros, 10);
+						const count = this.getParticipantCount(infoCheck);
+
+						if (Number.isInteger(configuredMinMembros) && configuredMinMembros > 0) {
+							if (count !== null && count < configuredMinMembros) {
+								this.logger.info(
+									`Ignorando convite de ${message.author} (${inviteCode}): grupo possui ${count} membros, mínimo exigido é ${configuredMinMembros}. Sem cooldown.`
+								);
+								if (message.origin && typeof message.origin.react === "function") {
+									message.origin.react("👥");
+								}
+								await this.bot.sendMessage(
+									message.author,
+									this.getMinMembersMessage(configuredMinMembros)
+								);
+								return true;
+							}
+						}
+
+						// Checa se o grupo tem apenas 1 membro (hard filter - não repassa o convite)
+						if (count !== null && count <= 1) {
+							this.logger.info(
+								`Ignorando convite de grupo com apenas 1 membro de ${message.author} (${inviteCode}) sem repassar convite.`
+							);
+							if (message.origin && typeof message.origin.react === "function") {
+								message.origin.react("👤");
+							}
+							const botName = this.bot.nomeExibir || "ravenabot";
+							const communityLink = this.getCommunityLink();
+							await this.bot.sendMessage(
+								message.author,
+								`Este grupo tem apenas 1 membro. Lembre-se que a ${botName} pode ser usada diretamente no PV, não tem necessidade de criar um grupo com ela! Se quiser testar os comandos, entre na comunidade da ravenabot:\n${communityLink}`
+							);
+							return true;
+						}
+					}
+				}
+			} catch (infoErr) {
+				this.logger.debug(
+					`Erro ao checar info prévia do convite ${inviteCode} em processMessage:`,
+					infoErr?.message
+				);
+			}
+
+			// Salva imediatamente o código de convite com o JID do grupo e autor no histórico
+			try {
+				const userName =
+					message.name ?? message.pushName ?? message.pushname ?? message.authorName ?? "Pessoa";
+				await this.database.addInviteHistory({
+					code: inviteCode,
+					groupJid: infoCheck?.JID || null,
+					authorId: message.author,
+					authorName: userName,
+					timestamp: currentTime,
+					reason: null
+				});
+				await this.database.savePendingJoin(inviteCode, {
+					authorId: message.author,
+					authorName: userName,
+					groupJid: infoCheck?.JID || null
+				});
+			} catch (dbErr) {
+				this.logger.error("Erro ao salvar histórico prévio de convite em processMessage:", dbErr);
+			}
 
 			const isBlocked = await this.database.isUserInviteBlocked(message.author.split("@")[0]);
 			if (isBlocked) {
@@ -269,6 +1307,27 @@ class InviteSystem {
 				return true;
 			}
 
+			// Verifica se enviou frase de quem não sabe ler — também processado imediatamente
+			if (
+				(this.frasesNaoSabeLer || frasesNaoSabeLer).some((frase) =>
+					text.toLowerCase().includes(frase.toLowerCase())
+				)
+			) {
+				clearTimeout(timeout);
+				if (requestData.accumulationTimeout) clearTimeout(requestData.accumulationTimeout);
+				this.pendingRequests.delete(message.author);
+				await this.handleInviteRequest(
+					message.author,
+					inviteCode,
+					inviteLink,
+					text,
+					message,
+					verificationCode,
+					preConviteContent
+				);
+				return true;
+			}
+
 			// 2. Se já está acumulando mensagens, apenas adiciona ao buffer
 			if (accumulatedMessages) {
 				accumulatedMessages.push(text.trim());
@@ -330,6 +1389,25 @@ class InviteSystem {
 				inviteCode,
 				inviteLink,
 				"Nenhum motivo fornecido",
+				originalMessage,
+				verificationCode,
+				preConviteContent
+			);
+			return;
+		}
+
+		// Verifica frases de quem não sabe ler antes de checar tamanho
+		if (
+			(this.frasesNaoSabeLer || frasesNaoSabeLer).some((frase) =>
+				reason.toLowerCase().includes(frase.toLowerCase())
+			)
+		) {
+			this.pendingRequests.delete(authorId);
+			await this.handleInviteRequest(
+				authorId,
+				inviteCode,
+				inviteLink,
+				reason,
 				originalMessage,
 				verificationCode,
 				preConviteContent
@@ -510,47 +1588,125 @@ class InviteSystem {
 				return;
 			}
 
+			// Verifica se o motivo contém alguma frase de quem não sabe ler
+			const matchedFraseNaoSabeLer =
+				reason &&
+				(this.frasesNaoSabeLer || frasesNaoSabeLer).find((frase) =>
+					reason.toLowerCase().includes(frase.toLowerCase())
+				);
+
+			if (matchedFraseNaoSabeLer) {
+				this.logger.info(
+					`Usuário ${authorId} enviou frase que indica falta de leitura no motivo ("${matchedFraseNaoSabeLer}"). Ignorando convite.`
+				);
+
+				try {
+					const ignoredPath = path.join(
+						this.database.databasePath,
+						"textos",
+						"invite_ignorado.txt"
+					);
+					const ignoredText = await fs
+						.readFile(ignoredPath, "utf8")
+						.catch(() => "Leitura não é o seu forte, né? _Convite ignorado._");
+					await this.bot.sendMessage(authorId, ignoredText);
+				} catch (err) {
+					this.bot.sendMessage(authorId, "Leitura não é o seu forte, né? _Convite ignorado._");
+				}
+
+				const punishDuration = 10 * this.inviteCooldown * 60 * 1000;
+				const normalDuration = this.inviteCooldown * 60 * 1000;
+
+				const futureTime = Date.now() + punishDuration - normalDuration;
+				this.userCooldowns.set(authorId, futureTime);
+
+				return;
+			}
+
 			let inviteInfoData = null;
-			const otherBotsInGroup = [];
+			let otherBotsInGroup = [];
 			let ownerMatch = false;
 
 			try {
 				const infoResponse = await this.bot.client.getInviteInfo(inviteCode);
-				console.log(JSON.stringify(infoResponse, null, 2)); // Print raw data to terminal
+				this.logger.debug("Invite info response:", infoResponse);
 
 				if (infoResponse) {
 					inviteInfoData = infoResponse;
 
 					// 1. Check Community
 					if (this.isCommunity(inviteInfoData)) {
+						this.userCooldowns.delete(authorId);
+						this.groupInviteCooldowns.delete(inviteCode);
 						await this.bot.sendMessage(
 							authorId,
-							"Isto parece ser link de uma comunidade, se não for, ignore esta imagem. Se for, o bot não consegue entrar. Você precisa enviar o link do GRUPO dentro da comunidade que deseja que ele entre, um por vez"
+							"Este link parece ser de uma *comunidade*, e o bot não consegue entrar em comunidades inteiras. Por favor, tente novamente enviando o link do *grupo específico* dentro da comunidade que você deseja adicionar!"
 						);
+						return;
 					}
 
-					// 2. Check Owner PN
+					// 2. Check bot already in group (fallback)
+					otherBotsInGroup = this.getBotsInGroupFromInvite(inviteInfoData);
+					if (otherBotsInGroup.length > 0) {
+						this.logger.info(
+							`Convite ignorado para ${inviteCode} em handleInviteRequest: já existe bot no grupo (${otherBotsInGroup.join(", ")}). Encerrando ciclo sem cooldown.`
+						);
+						this.userCooldowns.delete(authorId);
+						this.groupInviteCooldowns.delete(inviteCode);
+						if (message?.origin && typeof message.origin.react === "function") {
+							message.origin.react("🤖");
+						}
+						await this.bot.sendMessage(authorId, this.getBotAlreadyInGroupMessage());
+						return;
+					}
+
+					// 3. Check extras.invites.minMembros (fallback)
+					const configuredMinMembros = parseInt(this.bot?.extras?.invites?.minMembros, 10);
+					const count = this.getParticipantCount(inviteInfoData);
+					if (
+						Number.isInteger(configuredMinMembros) &&
+						configuredMinMembros > 0 &&
+						count !== null &&
+						count < configuredMinMembros
+					) {
+						this.logger.info(
+							`Convite ignorado para ${inviteCode} em handleInviteRequest: grupo possui ${count} membros, mínimo exigido é ${configuredMinMembros}. Encerrando ciclo sem cooldown.`
+						);
+						this.userCooldowns.delete(authorId);
+						this.groupInviteCooldowns.delete(inviteCode);
+						if (message?.origin && typeof message.origin.react === "function") {
+							message.origin.react("👥");
+						}
+						await this.bot.sendMessage(authorId, this.getMinMembersMessage(configuredMinMembros));
+						return;
+					}
+
+					// 4. Check 1 member (hard filter - não repassa o convite)
+					if (count !== null && count <= 1) {
+						this.logger.info(
+							`Convite ignorado para ${inviteCode}: grupo tem apenas 1 membro (${inviteInfoData?.Name || "sem nome"}). Não repassando convite.`
+						);
+						this.userCooldowns.delete(authorId);
+						this.groupInviteCooldowns.delete(inviteCode);
+						if (message?.origin && typeof message.origin.react === "function") {
+							message.origin.react("👤");
+						}
+						const botName = this.bot.nomeExibir || "ravenabot";
+						const communityLink = this.getCommunityLink();
+						await this.bot.sendMessage(
+							authorId,
+							`Este grupo tem apenas 1 membro. Lembre-se que a ${botName} pode ser usada diretamente no PV, não tem necessidade de criar um grupo com ela! Se quiser testar os comandos, entre na comunidade da ravenabot:\n${communityLink}`
+						);
+						return;
+					}
+
+					// 5. Check Owner PN
 					if (inviteInfoData.OwnerPN) {
 						// Normalize PNs
 						const ownerNum = inviteInfoData.OwnerPN.split("@")[0];
 						const authorNum = authorId.split("@")[0];
 						if (ownerNum === authorNum) {
 							ownerMatch = true;
-						}
-					}
-
-					// 3. Check Participants for other bots
-					if (
-						inviteInfoData.Participants &&
-						Array.isArray(inviteInfoData.Participants) &&
-						this.bot.otherBots
-					) {
-						for (const p of inviteInfoData.Participants) {
-							const pNum = p.PhoneNumber ? p.PhoneNumber.split("@")[0] : p.JID.split("@")[0];
-							// this.bot.otherBots should be array of numbers (strings)
-							if (this.bot.otherBots.includes(pNum)) {
-								otherBotsInGroup.push(pNum);
-							}
 						}
 					}
 
@@ -562,13 +1718,6 @@ class InviteSystem {
 							authorId,
 							`🛑 A ${this.bot.nomeExibir || "ravenabot"} não recebe mais convite deste grupo, pois ele foi bloqueado.`
 						);
-
-						// if (this.bot.grupoInvites) {
-						// 	await this.bot.sendMessage(
-						// 		this.bot.grupoInvites,
-						// 		`🛑 Usuário ${authorId} tentou enviar convite de grupo bloqueado (JID detectado): ${inviteLink}\nGrupo: ${inviteInfoData.Name} (${inviteInfoData.JID})`
-						// 	);
-						// }
 						return;
 					}
 				}
@@ -590,11 +1739,6 @@ class InviteSystem {
 				// Continue processing if other error (maybe API down), but warn
 			}
 
-			if (otherBotsInGroup.length > 0) {
-				const botsStr = otherBotsInGroup.map((b) => `+${b}`).join(", ");
-				await this.bot.sendMessage(authorId, `⚠️ Bot ${botsStr} já está neste grupo!`);
-			}
-
 			// Obtém informações do usuário
 			const userName =
 				message.name ?? message.pushName ?? message.pushname ?? message.authorName ?? "Pessoa";
@@ -611,10 +1755,11 @@ class InviteSystem {
 				timestamp: Date.now()
 			};
 
-			// Alteração: usar savePendingJoin em vez de addPendingInvite
+			// Salva pending join com groupJid
 			await this.database.savePendingJoin(inviteCode, {
 				authorId,
-				authorName: userName
+				authorName: userName,
+				groupJid: inviteInfoData?.JID || null
 			});
 
 			await this.database.addInviteHistory({
@@ -626,28 +1771,325 @@ class InviteSystem {
 				reason
 			});
 
+			if (inviteInfoData?.JID) {
+				await this.database.updateInviteHistoryGroupJid(inviteCode, inviteInfoData.JID);
+			}
+
+			// Verifica se o bot já esteve no grupo anteriormente
+			let wasInGroupBefore = false;
+			let manualLeaveInfo = null;
+			let lastDossiersText = "";
+			let groupPeriods = [];
+
+			if (inviteInfoData?.JID) {
+				const bannedDisabledBotIds = this.getBannedDisabledBotIds();
+
+				try {
+					manualLeaveInfo = await this.database.getManualGroupLeave(inviteInfoData.JID);
+					if (manualLeaveInfo) {
+						const leaveBotId = String(manualLeaveInfo.bot_id || "").toLowerCase();
+						// Se o bot que já esteve no grupo é um banido true e enabled false, não deve ser considerado
+						if (!bannedDisabledBotIds.has(leaveBotId)) {
+							wasInGroupBefore = true;
+						}
+					}
+				} catch (leaveCheckErr) {
+					this.logger.error("Erro ao verificar saída manual do grupo:", leaveCheckErr);
+				}
+
+				try {
+					groupPeriods = await this.database.getGroupMembershipPeriods(inviteInfoData.JID);
+					if (groupPeriods && groupPeriods.length > 0) {
+						// Filtra apenas períodos de bots que NÃO sejam banido: true e enabled: false
+						const validPeriods = groupPeriods.filter((p) => {
+							const pBotId = String(p.bot_id || "").toLowerCase();
+							return !pBotId || !bannedDisabledBotIds.has(pBotId);
+						});
+						if (validPeriods.length > 0) {
+							wasInGroupBefore = true;
+						}
+					}
+				} catch (periodsErr) {
+					this.logger.error("Erro ao verificar períodos do grupo na base:", periodsErr);
+				}
+
+				try {
+					const existingGroup = await this.database.getGroup(inviteInfoData.JID);
+					if (existingGroup && !wasInGroupBefore) {
+						// Se só achou pelo existingGroup (sem períodos válidos e sem manualLeave válido):
+						// se todos os períodos registrados no grupo eram apenas de bots banidos/desativados, não marca wasInGroupBefore
+						const hasOnlyBannedDisabledPeriods =
+							groupPeriods &&
+							groupPeriods.length > 0 &&
+							groupPeriods.every((p) => {
+								const pBotId = String(p.bot_id || "").toLowerCase();
+								return pBotId && bannedDisabledBotIds.has(pBotId);
+							});
+						if (!hasOnlyBannedDisabledPeriods) {
+							wasInGroupBefore = true;
+						}
+					}
+				} catch (groupCheckErr) {
+					this.logger.warn(`Erro ao verificar grupo na base: ${groupCheckErr.message}`);
+				}
+
+				try {
+					const lastDossiers = await this.database.getLastGroupDossiers(inviteInfoData.JID, 3);
+					if (lastDossiers && lastDossiers.length > 0) {
+						lastDossiersText = "\n📊 *Últimos Dossiês Registrados:*\n";
+						lastDossiers.forEach((d, idx) => {
+							try {
+								const p =
+									typeof d.dossier_json === "string" ? JSON.parse(d.dossier_json) : d.dossier_json;
+								const dateStr = d.created_at
+									? ` (${new Date(d.created_at).toLocaleDateString("pt-BR")})`
+									: "";
+								let evText = "";
+								if (Array.isArray(p.classified_items) && p.classified_items.length > 0) {
+									evText =
+										"\n" +
+										p.classified_items
+											.map((it) => `  • *${it.category}:* "${it.evidence}"`)
+											.join("\n");
+								}
+								const underageTag = p.is_underage ? " 👶 [Menores]" : "";
+								lastDossiersText += `${idx + 1}. *[${p.type || "geral"}]* Nota: *${p.problematic_score}/10*${underageTag}${dateStr}\n- Resumo: ${p.summary}${evText}\n`;
+							} catch (e) {}
+						});
+					}
+				} catch (dossierErr) {
+					this.logger.error("Erro ao carregar últimos dossiês do grupo:", dossierErr);
+				}
+			}
+
+			// Verifica se o autor está na lista de doadores
+			let isDonator = false;
+			let donateValue = 0;
+
+			try {
+				const donations = await this.database.getDonations();
+
+				if (donations && donations.length > 0) {
+					const cleanAuthorId = authorId.replace(/[^0-9]/g, "");
+
+					isDonator = donations.some((donation) => {
+						if (donation.numero) {
+							const cleanDonorNumber = donation.numero.replace(/[^0-9]/g, "");
+							if (cleanDonorNumber.length > 10) {
+								if (
+									cleanDonorNumber.includes(cleanAuthorId) ||
+									cleanAuthorId.includes(cleanDonorNumber)
+								) {
+									donateValue = Number(donation.valor) || 0;
+									return true;
+								}
+							}
+						}
+						return false;
+					});
+				}
+			} catch (donationError) {
+				this.logger.error("Erro ao verificar se o autor é doador:", donationError);
+			}
+
+			// Avaliação para Auto-Accept (LLM normal ou RECENTLY_BANNED)
+			let autoAccepted = false;
+			let autoAcceptBot = null;
+			let enqueuedAutoAccept = false;
+			let queuePosition = 0;
+			let llmReason = "";
+			let evalResult = null;
+
+			const isAutoAcceptDisabled =
+				process.env.DISABLE_INVITE_AUTO_ACCEPT === "true" ||
+				process.env.DISABLE_AUTO_ACCEPT === "true";
+			const isRecentlyBanned = process.env.RECENTLY_BANNED === "true";
+
+			if (isAutoAcceptDisabled) {
+				llmReason = "Auto-accept desativado via configuração (.env)";
+				this.logger.info(
+					`[AutoAccept] Convite ${inviteCode} ignorando auto-accept (desativado via .env)`
+				);
+			} else if (wasInGroupBefore && !isDonator && !isRecentlyBanned) {
+				if (manualLeaveInfo) {
+					llmReason = `Bot já foi removido manualmente deste grupo anteriormente (${manualLeaveInfo.group_name || "Desconhecido"})`;
+				} else {
+					llmReason = `Bot já esteve neste grupo anteriormente (se saiu/removeram, não deve ser aceito automaticamente)`;
+				}
+				this.logger.info(
+					`[AutoAccept] Convite ${inviteCode} NÃO aceito automaticamente: ${llmReason}`
+				);
+			} else {
+				try {
+					const hasBannedBotInGroup = this.hasBannedBotInGroup(inviteInfoData);
+
+					if (isRecentlyBanned) {
+						evalResult = await this.evaluateAutoAcceptRecentlyBanned({
+							isDonator,
+							donateValue,
+							wasInGroupBefore,
+							hasBotInGroup: otherBotsInGroup.length > 0,
+							hasBannedBotInGroup,
+							participantCount: this.getParticipantCount(inviteInfoData) ?? 0,
+							groupJid: inviteInfoData?.JID || null
+						});
+					} else {
+						evalResult = await this.evaluateAutoAcceptWithLLM({
+							userName,
+							authorId,
+							groupName: inviteInfoData?.Name,
+							participantCount: inviteInfoData?.ParticipantCount,
+							description:
+								inviteInfoData?.Description || inviteInfoData?.Desc || inviteInfoData?.Topic || "",
+							reason,
+							isDonator,
+							donateValue,
+							wasInGroupBefore,
+							hasBotInGroup: otherBotsInGroup.length > 0
+						});
+					}
+
+					llmReason = evalResult.reason;
+
+					if (evalResult.shouldAutoAccept) {
+						let selectedBot = null;
+
+						if (this.bot?.comunitario) {
+							// Bots comunitários: convites só devem ser aceitos automaticamente pelo próprio bot recebido, nunca por outros bots
+							const isEligible =
+								!this.bot.banido &&
+								!this.bot.ignoreInvites &&
+								!this.bot.useTelegram &&
+								!this.bot.useDiscord &&
+								this.bot.client &&
+								typeof this.bot.client.acceptInvite === "function";
+
+							if (isEligible) {
+								if (InviteSystem.canBotJoin(this.bot.id)) {
+									selectedBot = this.bot;
+								} else {
+									this.logger.warn(
+										`[AutoAccept] Bot comunitário ${this.bot.id} atingiu o limite de 3 grupos em 30 minutos`
+									);
+									llmReason = `Aprovado pela IA (${evalResult.reason}), mas o bot comunitário ${this.bot.id} atingiu o limite de 3 grupos em 30 minutos`;
+								}
+							} else {
+								this.logger.warn(
+									`[AutoAccept] Bot comunitário ${this.bot.id} não está elegível/disponível para auto-join`
+								);
+								llmReason = `Aprovado pela IA (${evalResult.reason}), mas o bot comunitário ${this.bot.id} não está disponível para entrar`;
+							}
+						} else {
+							// Se donate R$100 ou acima: Aceitar sempre no bot vip que está enabled
+							if (isDonator && donateValue >= 100) {
+								selectedBot = this.selectVipBot();
+								if (selectedBot) {
+									this.logger.info(
+										`[AutoAccept] Convite ${inviteCode} direcionado para bot VIP (${selectedBot.id}) devido a donate R$${donateValue}`
+									);
+								} else {
+									this.logger.warn(
+										`[AutoAccept] Doador R$100+ (${donateValue}), mas nenhum bot VIP disponível. Tentando seleção normal.`
+									);
+								}
+							}
+
+							if (!selectedBot) {
+								selectedBot = await this.selectBestBotForAutoJoin();
+							}
+						}
+
+						if (selectedBot) {
+							this.logger.info(
+								`[AutoAccept] Convite ${inviteCode} aceito automaticamente pelo bot ${selectedBot.id}. Motivo: ${evalResult.reason}`
+							);
+							const joinResult = await selectedBot.client.acceptInvite(inviteCode);
+							if (joinResult && joinResult.accepted) {
+								autoAccepted = true;
+								autoAcceptBot = selectedBot;
+								InviteSystem.recordBotJoin(selectedBot.id);
+								InviteSystem._pushRecentlyAccepted({
+									inviteCode,
+									authorId,
+									authorName: userName,
+									botId: selectedBot.id,
+									groupName: inviteInfoData?.Name
+								});
+								await this.database.savePendingJoin(inviteCode, {
+									authorId,
+									authorName: userName,
+									groupJid: inviteInfoData?.JID || null
+								});
+							} else {
+								this.logger.warn(
+									`[AutoAccept] Falha do bot ${selectedBot.id} ao aceitar convite: ${joinResult?.error || "Erro desconhecido"}`
+								);
+								llmReason = `Aprovado pela IA, mas bot ${selectedBot.id} falhou ao entrar (${joinResult?.error || "Erro"})`;
+							}
+						} else if (!this.bot?.comunitario) {
+							// Nenhum bot disponível para entrar agora: criar fila com timer para ir aceitando aos poucos
+							queuePosition = InviteSystem.enqueueInvite({
+								inviteCode,
+								authorId,
+								authorName: userName,
+								groupName: inviteInfoData?.Name,
+								groupJid: inviteInfoData?.JID || null,
+								reason,
+								enqueuedAt: Date.now(),
+								inviteSystem: this
+							});
+							enqueuedAutoAccept = true;
+							const eta = InviteSystem.getETA(queuePosition);
+							llmReason = `Aprovado para auto accept → Enfileirado na posição ${queuePosition} (Previsão: ${eta.tempo}, às ${eta.horaPrevista})`;
+							this.logger.info(
+								`[AutoAccept] Convite ${inviteCode} colocado na fila de espera na posição ${queuePosition}. ETA: ${eta.formatted}`
+							);
+						}
+					}
+				} catch (evalErr) {
+					this.logger.error("Erro no fluxo de auto-accept:", evalErr);
+					llmReason = `Falha na avaliação: ${evalErr.message}`;
+				}
+			}
+
 			// Envia notificação para o usuário
 			let extraText = "";
 			let addedAny = false;
+			let headerText = "";
 
-			if (inviteInfoData?.ParticipantCount !== undefined && inviteInfoData.ParticipantCount <= 2) {
+			if (evalResult?.bannedModeReject === "new_group" && !isDonator) {
+				const bannedBots = this.getBannedBots();
+				const bannedBotName =
+					bannedBots[0]?.nomeExibir || bannedBots[0]?.nome || this.bot.nomeExibir || "ravena";
+				headerText = `🚨 A *${bannedBotName}* foi banida recentemente - neste momento, não estou aceitando nenhum convite novo, apenas repondo as ravenas no grupo\n\n`;
+			} else if (evalResult?.bannedModeReject === "small_group" && !isDonator) {
+				extraText += "\n- ⚠️ Grupo pequeno pendente";
+				addedAny = true;
+			}
+
+			if (inviteInfoData?.ParticipantCount !== undefined && inviteInfoData.ParticipantCount === 2) {
 				const botName = this.bot.nomeExibir || "ravena";
 				extraText += `\n- 😪 Este parece ser um grupo particular. Lembre-se que a ${botName} faz tudo no PV, não tem necessidade de criar um grupo com ela! Se quiser só brincar com os comandos, que tal entrar na nossa comunidade? Envie !grupao - temos grupos de downloads, jogos e bate papo.`;
 				addedAny = true;
 			}
 
 			if (
-				(inviteInfoData?.Name && hasStrangeCharacters(inviteInfoData.Name)) ||
-				(userName && hasStrangeCharacters(userName))
+				!isDonator &&
+				((inviteInfoData?.Name && hasStrangeCharacters(inviteInfoData.Name)) ||
+					(userName && hasStrangeCharacters(userName)))
 			) {
 				extraText +=
 					"\n- ⛔️ *Evito* grupos e pessoas com esses caracteres estranhos, pois geralmente são crianças.";
 				addedAny = true;
 			}
 
-			if (inviteInfoData && this.isCommunity(inviteInfoData)) {
+			const hasBotInGroup = otherBotsInGroup.length > 0;
+			if (hasBotInGroup) {
+				extraText += "\n- 🚨 Já tem uma ravena no seu grupo!";
+				addedAny = true;
+			} else if (wasInGroupBefore) {
 				extraText +=
-					"\n- 👎 *Não consigo* entrar em comunidade, você vai precisar mandar o convite do grupo em específico que eu devo entrar.";
+					"\n- ⚠️ Alguma ravena já esteve no seu grupo e foi removida. É provável que seu convite não seja aceito";
 				addedAny = true;
 			}
 
@@ -658,51 +2100,25 @@ class InviteSystem {
 			const invitesPosPath = path.join(this.database.databasePath, "textos", "invites_pos.txt");
 			const posConvite = await fs.readFile(invitesPosPath, "utf8");
 
-			await this.bot.sendMessage(
-				authorId,
-				"Seu convite foi recebido e será analisado." + extraText + posConvite
-			);
+			const finalUserMessage =
+				headerText + "Seu convite foi recebido e será analisado." + extraText + posConvite;
+
+			await this.bot.sendMessage(authorId, finalUserMessage);
 
 			// Envia notificações para o grupoInvites se configurado
 			if (this.bot.grupoInvites) {
 				try {
-					// Verifica se o autor está na lista de doadores
-					let isDonator = false;
-					let donateValue = 0;
-
-					try {
-						// Obtém todas as doações
-						const donations = await this.database.getDonations();
-
-						if (donations && donations.length > 0) {
-							// Remove caracteres especiais e espaços do número do autor para comparação
-							const cleanAuthorId = authorId.replace(/[^0-9]/g, "");
-
-							// Verifica se o autor está na lista de doadores
-							isDonator = donations.some((donation) => {
-								// Se o doador tem um número de telefone
-								if (donation.numero) {
-									// Remove caracteres especiais e espaços do número do doador
-									const cleanDonorNumber = donation.numero.replace(/[^0-9]/g, "");
-									//this.logger.debug(`[donate-invite] ${cleanDonorNumber} vs ${cleanAuthorId} =  ${cleanDonorNumber.includes(cleanAuthorId)} || ${ cleanAuthorId.includes(cleanDonorNumber)}`);
-									if (cleanDonorNumber.length > 10) {
-										if (
-											cleanDonorNumber.includes(cleanAuthorId) ||
-											cleanAuthorId.includes(cleanDonorNumber)
-										) {
-											donateValue = donation.valor;
-											return true;
-										}
-									}
-								}
-								return false;
-							});
-						}
-					} catch (donationError) {
-						this.logger.error("Erro ao verificar se o autor é doador:", donationError);
-					}
-
 					let infoMessageHeader = `📩 *Nova Solicitação de Convite de Grupo*\n\n`;
+					if (autoAccepted) {
+						infoMessageHeader =
+							`✨ *ACEITO AUTOMATICAMENTE:* ${llmReason}\n🤖 *Bot que entrou:* ${autoAcceptBot.id}\n\n` +
+							infoMessageHeader;
+					} else if (enqueuedAutoAccept) {
+						const eta = InviteSystem.getETA(queuePosition);
+						infoMessageHeader =
+							`⏳ *AUTO ACCEPT (FILA DE ESPERA):* ${llmReason}\n⏰ *Previsão de entrada:* ${eta.tempo} (às *${eta.horaPrevista}*)\n📍 *Posição na fila:* ${queuePosition}\n\n` +
+							infoMessageHeader;
+					}
 					if (isDonator) {
 						infoMessageHeader = `💸💸 R$${donateValue} 💸💸\n` + infoMessageHeader;
 					}
@@ -712,19 +2128,6 @@ class InviteSystem {
 					if (otherBotsInGroup.length > 0) {
 						const botsStr = otherBotsInGroup.map((b) => `+${b}`).join(", ");
 						botWarning = `\n⚠️ *Bot ${botsStr} Já está neste grupo!*`;
-					}
-
-					// Fetch Invite statistics
-					let wasInGroupBefore = false;
-					if (inviteInfoData?.JID) {
-						try {
-							const existingGroup = await this.database.getGroup(inviteInfoData.JID);
-							if (existingGroup) {
-								wasInGroupBefore = true;
-							}
-						} catch (groupCheckErr) {
-							this.logger.warn(`Erro ao verificar grupo na base: ${groupCheckErr.message}`);
-						}
 					}
 
 					let authorInvitesCount = 0;
@@ -768,7 +2171,10 @@ class InviteSystem {
 
 					if (inviteInfoData?.JID) {
 						try {
-							const periods = await this.database.getGroupMembershipPeriods(inviteInfoData.JID);
+							const periods =
+								groupPeriods && groupPeriods.length > 0
+									? groupPeriods
+									: await this.database.getGroupMembershipPeriods(inviteInfoData.JID);
 							if (periods && periods.length > 0) {
 								membershipHistoryText = `\n🚪 *Histórico de Estadia no Grupo:*\n`;
 								periods.forEach((p, idx) => {
@@ -796,7 +2202,8 @@ class InviteSystem {
 										durationText = " (tempo desconhecido)";
 									}
 
-									membershipHistoryText += `${idx + 1}. 🟢 ${joinDate} até 🔴 ${leaveDate}${durationText}\n`;
+									const botTag = p.bot_id ? ` [🤖 ${p.bot_id}]` : "";
+									membershipHistoryText += `${idx + 1}.${botTag} 🟢 ${joinDate} até 🔴 ${leaveDate}${durationText}\n`;
 								});
 							}
 						} catch (err) {
@@ -804,39 +2211,68 @@ class InviteSystem {
 						}
 					}
 
+					let manualLeaveWarning = "";
+					if (manualLeaveInfo) {
+						manualLeaveWarning = `\n⚠️ *Bot já foi removido manualmente deste grupo anteriormente (${manualLeaveInfo.group_name || "Desconhecido"})*\n`;
+					}
+
 					const infoMessage =
 						infoMessageHeader +
 						`🔗 *Link*: chat.whatsapp.com/${inviteCode}\n` +
 						`👤 *De:* ${userName} (${authorId.split("@")[0]})${ownerMark}${isDonator ? " 💰" : ""}\n` +
 						(inviteInfoData?.Name ? `🏷️ *Nome*: ${inviteInfoData.Name}\n` : "") +
+						(inviteInfoData?.JID ? `🫆 *ID*: ${inviteInfoData.JID}\n` : "") +
 						(inviteInfoData?.ParticipantCount
 							? `👥 *Membros*: ${inviteInfoData.ParticipantCount}\n`
 							: "") +
 						(wasInGroupBefore ? `⚠️ Já esteve neste grupo (${inviteInfoData?.JID || ""})\n` : "") +
+						manualLeaveWarning +
 						`- 📈 *Convites deste usuário*: ${authorInvitesCount}\n` +
 						`- 📊 *Vezes que este grupo foi indicado*: ${groupInvitesCount}\n` +
 						otherInvitersText +
 						membershipHistoryText +
 						`\n💬 *Motivo:*\n${reason}\n` +
 						botWarning +
+						(!autoAccepted && !enqueuedAutoAccept && llmReason
+							? `\n🤖 *Análise IA (Não aceito auto):* ${llmReason}\n`
+							: "") +
+						lastDossiersText +
 						(isDonator ? `\n💸💸${this.rndString()}💸💸` : `\n${this.rndString()}`);
 
 					await this.bot.sendMessage(this.bot.grupoInvites, infoMessage);
 
-					// Envia segunda mensagem com comando para aceitar
-					const commandMessage = `!sa-joinGrupo ${inviteCode} ${authorId} ${userName}`;
-					const blockCommand = `!sa-blockInvites ${authorId.split("@")[0]} ${inviteCode}`;
+					if (
+						enqueuedAutoAccept &&
+						this.bot.grupoLogs &&
+						this.bot.grupoLogs !== this.bot.grupoInvites
+					) {
+						const eta = InviteSystem.getETA(queuePosition);
+						const queueLogMsg =
+							`⏳ *[Fila de Auto Accept]* Convite colocado na fila de espera!\n` +
+							`🏷️ *Grupo:* ${inviteInfoData?.Name || "Desconhecido"}\n` +
+							`👤 *Solicitante:* ${userName} (${authorId.split("@")[0]})\n` +
+							`🔗 *Código:* ${inviteCode}\n` +
+							`⏰ *Previsão de entrada:* ${eta.tempo} (às *${eta.horaPrevista}*)\n` +
+							`📍 *Posição na fila:* ${queuePosition}`;
+						await this.bot.sendMessage(this.bot.grupoLogs, queueLogMsg);
+					}
 
-					await this.bot.sendMessage(this.bot.grupoInvites, commandMessage);
-					await this.bot.sendMessage(this.bot.grupoInvites, blockCommand);
+					// Envia comando para aceitar se não foi aceito automaticamente (apenas se não houver bot no grupo)
+					if (!autoAccepted && otherBotsInGroup.length === 0) {
+						const commandMessage = `!sa-joinGrupo ${inviteCode} ${authorId} ${userName}`;
+						await this.bot.sendMessage(this.bot.grupoInvites, commandMessage);
+					}
+
+					// Envia comando para bloquear convites (apenas se não houver bot no grupo)
+					if (otherBotsInGroup.length === 0) {
+						const blockCommand = `!sa-blockInvites ${authorId.split("@")[0]} ${inviteCode}`;
+						await this.bot.sendMessage(this.bot.grupoInvites, blockCommand);
+					}
 				} catch (error) {
 					this.logger.error("Erro ao enviar notificação de convite para grupoInvites:", error);
 				}
 			} else {
 				this.logger.warn("Nenhum grupoInvites configurado, o convite não será encaminhado");
-
-				// Notifica o usuário
-				//await this.bot.sendMessage(authorId, "Este bot não recebe convites.");
 			}
 		} catch (error) {
 			this.logger.error("Erro ao tratar solicitação de convite:", error);

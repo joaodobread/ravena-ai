@@ -1,3 +1,4 @@
+const axios = require("axios");
 const Logger = require("../utils/Logger");
 const Command = require("../models/Command");
 const ReturnMessage = require("../models/ReturnMessage");
@@ -288,39 +289,250 @@ const wrapWithRateLimit = (func, delay = 500, maxRetries = 3) => {
 };
 
 /**
- * Traduz texto para o idioma especificado
+ * Extrai texto de um objeto de mensagem em qualquer formato suportado
+ * @param {Object|string} msg - Objeto de mensagem ou string
+ * @returns {string} - Texto extraído ou string vazia
+ */
+function extractTextFromMessage(msg) {
+	if (!msg) return "";
+	if (typeof msg === "string") return msg.trim();
+	if (typeof msg.content === "string" && msg.content.trim()) return msg.content.trim();
+	if (typeof msg.caption === "string" && msg.caption.trim()) return msg.caption.trim();
+	if (typeof msg.body === "string" && msg.body.trim()) return msg.body.trim();
+	if (typeof msg.text === "string" && msg.text.trim()) return msg.text.trim();
+	if (msg.content && typeof msg.content === "object") {
+		if (typeof msg.content.text === "string" && msg.content.text.trim())
+			return msg.content.text.trim();
+		if (typeof msg.content.caption === "string" && msg.content.caption.trim())
+			return msg.content.caption.trim();
+		if (typeof msg.content.conversation === "string" && msg.content.conversation.trim())
+			return msg.content.conversation.trim();
+	}
+	if (msg.goMessageData?.Message) {
+		const m = msg.goMessageData.Message;
+		if (typeof m.conversation === "string" && m.conversation.trim()) return m.conversation.trim();
+		if (typeof m.extendedTextMessage?.text === "string" && m.extendedTextMessage.text.trim())
+			return m.extendedTextMessage.text.trim();
+		if (typeof m.imageMessage?.caption === "string" && m.imageMessage.caption.trim())
+			return m.imageMessage.caption.trim();
+		if (typeof m.videoMessage?.caption === "string" && m.videoMessage.caption.trim())
+			return m.videoMessage.caption.trim();
+		if (typeof m.documentMessage?.caption === "string" && m.documentMessage.caption.trim())
+			return m.documentMessage.caption.trim();
+	}
+	if (msg.origin) {
+		if (typeof msg.origin.body === "string" && msg.origin.body.trim())
+			return msg.origin.body.trim();
+		if (typeof msg.origin.caption === "string" && msg.origin.caption.trim())
+			return msg.origin.caption.trim();
+	}
+	return "";
+}
+
+/**
+ * 1. Tradução via DeepL API
+ */
+async function translateWithDeepL(text, sourceLanguage, targetLanguage) {
+	const apiKey = process.env.DEEPL_API_KEY;
+	if (!apiKey || apiKey.trim() === "") return null;
+
+	try {
+		const endpoint = apiKey.endsWith(":fx")
+			? "https://api-free.deepl.com/v2/translate"
+			: "https://api.deepl.com/v2/translate";
+
+		let target = (targetLanguage || "en").toUpperCase();
+		if (target === "EN" || target === "EN-US") target = "EN-US";
+		else if (target === "EN-GB") target = "EN-GB";
+		else if (target === "PT" || target === "PT-BR") target = "PT-BR";
+		else if (target === "PT-PT") target = "PT-PT";
+
+		let source =
+			sourceLanguage && sourceLanguage !== "auto" ? sourceLanguage.toUpperCase() : undefined;
+		if (source === "PT-BR" || source === "PT-PT") source = "PT";
+		if (source === "EN-US" || source === "EN-GB") source = "EN";
+
+		const response = await axios.post(
+			endpoint,
+			{
+				text: [text],
+				target_lang: target,
+				...(source ? { source_lang: source } : {})
+			},
+			{
+				headers: {
+					Authorization: `DeepL-Auth-Key ${apiKey}`,
+					"Content-Type": "application/json"
+				},
+				timeout: 10000
+			}
+		);
+
+		const translated = response.data?.translations?.[0]?.text;
+		if (translated && typeof translated === "string" && translated.trim().length > 0) {
+			logger.debug(`[translateWithDeepL] Tradução concluída com sucesso.`);
+			return translated.trim();
+		}
+	} catch (error) {
+		logger.warn(`[translateWithDeepL] Falha ao traduzir via DeepL: ${error.message}`);
+	}
+	return null;
+}
+
+/**
+ * 2. Tradução via LLM (LLMService)
+ */
+async function translateWithLLM(text, sourceLanguage, targetLanguage) {
+	try {
+		const LLMService = require("../services/LLMService");
+		const llmService = LLMService.getInstance();
+		const sourceLangName =
+			sourceLanguage && sourceLanguage !== "auto"
+				? LANGUAGE_NAMES[sourceLanguage] || sourceLanguage
+				: null;
+		const targetLangName = LANGUAGE_NAMES[targetLanguage] || targetLanguage || "English";
+
+		const fromText = sourceLangName ? `from ${sourceLangName} ` : "";
+		const completion = await llmService.getCompletion({
+			prompt: text,
+			systemContext: `You are a professional translator engine.
+Translate the provided text ${fromText}into ${targetLangName}.
+RULES:
+1. Translate the TEXT CONTENT accurately and naturally.
+2. DO NOT add explanations, conversational filler (e.g. "Here is the translation:"), notes, markdown code fences, or quotes.
+3. Keep emojis, punctuation, and formatting marks (*bold*, _italic_) intact.
+4. Output ONLY the translated text.`,
+			priority: 4
+		});
+
+		if (
+			completion &&
+			typeof completion === "string" &&
+			!completion.toLowerCase().startsWith("erro:") &&
+			!completion.toLowerCase().startsWith("não foi possível")
+		) {
+			const trimmed = completion.trim();
+			if (trimmed.length > 0) {
+				logger.debug(`[translateWithLLM] Tradução concluída com sucesso.`);
+				return trimmed;
+			}
+		}
+	} catch (error) {
+		logger.warn(`[translateWithLLM] Falha ao traduzir via LLM: ${error.message}`);
+	}
+	return null;
+}
+
+/**
+ * 3. Tradução via MyMemory API
+ */
+async function translateWithMyMemory(text, sourceLanguage, targetLanguage) {
+	try {
+		const src = (
+			sourceLanguage && sourceLanguage !== "auto" ? sourceLanguage : "auto"
+		).toLowerCase();
+		const tgt = (targetLanguage || "en").toLowerCase();
+
+		const response = await axios.get("https://api.mymemory.translated.net/get", {
+			params: {
+				q: text,
+				langpair: `${src}|${tgt}`
+			},
+			timeout: 10000
+		});
+
+		if (response.data && response.data.responseStatus === 200) {
+			const translated = response.data.responseData?.translatedText;
+			if (
+				translated &&
+				typeof translated === "string" &&
+				!translated.includes("MYMEMORY WARNING:") &&
+				translated.trim().length > 0
+			) {
+				logger.debug(`[translateWithMyMemory] Tradução concluída com sucesso.`);
+				return translated.trim();
+			}
+		}
+	} catch (error) {
+		logger.warn(`[translateWithMyMemory] Falha ao traduzir via MyMemory: ${error.message}`);
+	}
+	return null;
+}
+
+/**
+ * 4. Tradução via Google Translate (translate package)
+ */
+async function translateWithGoogle(text, sourceLanguage, targetLanguage) {
+	try {
+		const translateModule = await import("translate");
+		const translate = translateModule.default;
+		translate.engine = "google";
+
+		const translateWithRateLimit = wrapWithRateLimit(
+			async (txt, options) => await translate(txt, options)
+		);
+
+		const translatedText = await translateWithRateLimit(text, {
+			from: sourceLanguage && sourceLanguage !== "auto" ? sourceLanguage : "auto",
+			to: targetLanguage
+		});
+
+		if (translatedText && typeof translatedText === "string" && !translatedText.startsWith("<")) {
+			logger.debug(`[translateWithGoogle] Tradução concluída com sucesso.`);
+			return translatedText.trim();
+		}
+	} catch (error) {
+		logger.warn(`[translateWithGoogle] Falha ao traduzir via Google: ${error.message}`);
+	}
+	return null;
+}
+
+/**
+ * Traduz texto para o idioma especificado usando a cadeia de provedores:
+ * 1. DeepL
+ * 2. LLM
+ * 3. MyMemory
+ * 4. Google Translate
+ * 5. Fallback (texto original)
+ *
  * @param {string} text - Texto a ser traduzido
+ * @param {string} sourceLanguage - Código do idioma de origem
  * @param {string} targetLanguage - Código do idioma de destino
  * @returns {Promise<string>} - Texto traduzido
  */
 async function translateText(text, sourceLanguage, targetLanguage) {
-	try {
-		// Importar o módulo 'translate' dinamicamente
-		const translateModule = await import("translate");
-		const translate = translateModule.default;
-
-		// Configurar o mecanismo de tradução (padrão é 'google')
-		translate.engine = "google";
-		// Se você tiver uma chave API, pode configurá-la assim:
-		// translate.key = process.env.TRANSLATE_API_KEY;
-
-		// Aplicar rate limiting à tradução
-		const translateWithRateLimit = wrapWithRateLimit(async (text, options) => {
-			const resp = await translate(text, options);
-			console.log("trate", text, options, resp);
-			return resp;
-		});
-
-		// Traduzir o texto
-		const translatedText = await translateWithRateLimit(text, {
-			from: sourceLanguage,
-			to: targetLanguage
-		});
-		return translatedText;
-	} catch (error) {
-		logger.error("Erro ao traduzir texto:", error);
-		throw error;
+	if (!text || typeof text !== "string" || text.trim() === "") {
+		return text;
 	}
+
+	if (
+		sourceLanguage &&
+		sourceLanguage !== "auto" &&
+		targetLanguage &&
+		sourceLanguage.toLowerCase() === targetLanguage.toLowerCase()
+	) {
+		return text;
+	}
+
+	// 1. DeepL
+	const deeplResult = await translateWithDeepL(text, sourceLanguage, targetLanguage);
+	if (deeplResult && typeof deeplResult === "string") return deeplResult;
+
+	// 2. LLM
+	const llmResult = await translateWithLLM(text, sourceLanguage, targetLanguage);
+	if (llmResult && typeof llmResult === "string") return llmResult;
+
+	// 3. MyMemory
+	const myMemoryResult = await translateWithMyMemory(text, sourceLanguage, targetLanguage);
+	if (myMemoryResult && typeof myMemoryResult === "string") return myMemoryResult;
+
+	// 4. Google
+	const googleResult = await translateWithGoogle(text, sourceLanguage, targetLanguage);
+	if (googleResult && typeof googleResult === "string") return googleResult;
+
+	// 5. Fallback
+	logger.warn("Todos os provedores de tradução falharam, mantendo texto original.");
+	return text;
 }
 
 /**
@@ -387,7 +599,6 @@ async function handleTranslation(bot, message, args, group) {
 		}
 
 		let textToTranslate;
-		const quotedText = "";
 
 		// Verificar se é uma resposta a uma mensagem
 		if (args.length === 2) {
@@ -404,9 +615,7 @@ async function handleTranslation(bot, message, args, group) {
 					});
 				}
 
-				textToTranslate =
-					quotedMsg.caption ?? quotedMsg.content ?? quotedMsg.body ?? quotedMsg._data.body ?? "";
-				//quotedText = `Original: "${textToTranslate}"\n\n`;
+				textToTranslate = extractTextFromMessage(quotedMsg);
 			} catch (error) {
 				logger.error("Erro ao obter mensagem citada:", error);
 				return new ReturnMessage({
@@ -463,7 +672,7 @@ async function handleTranslation(bot, message, args, group) {
  * Processa uma reação para potencialmente traduzir uma mensagem
  * @param {WhatsAppBot} bot - Instância do bot
  * @param {Object} reaction - Dados da reação
- * @returns {Promise<boolean>} - True se a reação foi processada
+ * @returns {Promise<ReturnMessage|boolean>} - ReturnMessage com a tradução ou false
  */
 async function processTranslationReaction(bot, message, args, group) {
 	try {
@@ -480,24 +689,39 @@ async function processTranslationReaction(bot, message, args, group) {
 		}
 
 		const targetLanguage = FLAG_TO_LANGUAGE[emoji];
+		const textToTranslate = extractTextFromMessage(message);
 
-		const textToTranslate = message.content;
+		if (!textToTranslate) {
+			logger.debug(`[processTranslationReaction] Nenhum texto encontrado na mensagem da reação.`);
+			return false;
+		}
+
 		const chatId = message.group ?? message.author;
 
-		// Traduzir o texto
-		const translatedText = await translateText(textToTranslate, "pt", targetLanguage);
+		// Traduzir o texto (auto-detecta idioma de origem)
+		const translatedText = await translateText(textToTranslate, "auto", targetLanguage);
+
+		if (!translatedText || typeof translatedText !== "string") {
+			logger.warn(`[processTranslationReaction] Falha na tradução ou retorno inválido.`);
+			return false;
+		}
 
 		// Criar a resposta
-		const languageName = LANGUAGE_NAMES[targetLanguage];
+		const languageName = LANGUAGE_NAMES[targetLanguage] || targetLanguage;
 		const response = `🌐 *Tradução para ${languageName} (${reaction.reaction})*\n\n${translatedText}`;
+
+		const quotedId =
+			message.origin?.id?._serialized ||
+			message.id ||
+			(typeof message.origin?.id === "string" ? message.origin.id : undefined);
 
 		// Enviar a tradução
 		return new ReturnMessage({
 			chatId,
 			content: response,
 			options: {
-				quotedMessageId: message.origin.id._serialized,
-				goReply: message.origin
+				quotedMessageId: quotedId,
+				goReply: message.origin || message
 			}
 		});
 	} catch (error) {
@@ -534,4 +758,23 @@ const commands = [
 ];
 
 // Exportar comandos e manipulador de reação
-module.exports = { commands, translateText };
+const helper = {
+	about: "Tradução de textos para diversos idiomas com detecção automática",
+	implementation:
+		"Integra com provedores de tradução para traduzir mensagens citadas ou textos informados por argumentos",
+	tags: "traduzir,traducao,idiomas,ingles,espanhol,portugues,translate",
+	cmds: [
+		{
+			cmd: "!traduzir",
+			desc: "Traduz um texto citado ou informado para o idioma desejado",
+			usage: ["!traduzir en Olá mundo", "!traduzir pt (em resposta a uma mensagem)"],
+			category: "utilidades"
+		}
+	]
+};
+
+module.exports = {
+	helper,
+	commands,
+	translateText
+};

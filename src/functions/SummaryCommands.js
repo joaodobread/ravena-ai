@@ -7,10 +7,12 @@ const Command = require("../models/Command");
 const ReturnMessage = require("../models/ReturnMessage");
 const fs = require("fs").promises;
 const { extractFrames } = require("../utils/Conversions");
+const NSFWPredict = require("../utils/NSFWPredict");
 
 const logger = new Logger("summary-commands");
 const database = Database.getInstance();
 const llmService = LLMService.getInstance();
+const nsfwPredict = NSFWPredict.getInstance();
 const DB_NAME = "summaries";
 const activeAnalyses = new Set();
 const otherAI = [];
@@ -39,6 +41,9 @@ database.getSQLiteDb(
     dossier_json TEXT,
     conversation_history TEXT,
     analyzed_at_length INTEGER,
+    problematic_score REAL DEFAULT 0,
+    is_problematic INTEGER DEFAULT 0,
+    is_underage INTEGER DEFAULT 0,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
   CREATE INDEX IF NOT EXISTS idx_group_dossiers_gid ON group_dossiers(group_id);
@@ -47,9 +52,27 @@ database.getSQLiteDb(
     group_id TEXT PRIMARY KEY,
     json_data TEXT
   );
+
+  CREATE TABLE IF NOT EXISTS group_manual_leaves (
+    group_id TEXT PRIMARY KEY,
+    group_name TEXT,
+    left_at INTEGER,
+    bot_id TEXT
+  );
 `,
 	true
 );
+
+// Migração das colunas se a tabela já existir
+database
+	.dbRun(DB_NAME, `ALTER TABLE group_dossiers ADD COLUMN problematic_score REAL DEFAULT 0`)
+	.catch(() => {});
+database
+	.dbRun(DB_NAME, `ALTER TABLE group_dossiers ADD COLUMN is_problematic INTEGER DEFAULT 0`)
+	.catch(() => {});
+database
+	.dbRun(DB_NAME, `ALTER TABLE group_dossiers ADD COLUMN is_underage INTEGER DEFAULT 0`)
+	.catch(() => {});
 
 const mediaAnalysisSchema = {
 	type: "json_schema",
@@ -59,17 +82,28 @@ const mediaAnalysisSchema = {
 			type: "object",
 			properties: {
 				description: {
-					type: "string"
+					type: "string",
+					description:
+						"Descrição factual e objetiva da mídia visual em pt-BR (máximo 200 caracteres)."
 				},
 				type: {
 					type: "string",
-					enum: ["vida-real", "anime", "desenho", "jogo", "ia-generated", "documento", "outros"]
+					enum: ["vida-real", "anime", "desenho", "jogo", "ia-generated", "documento", "outros"],
+					description: "Categoria do conteúdo visual."
 				},
 				nsfw: {
-					type: "boolean"
+					type: "boolean",
+					description:
+						"True SOMENTE se houver nudez explícita (genitália visível, seios/mamilos femininos expostos) ou atos sexuais explícitos (penetração, sexo oral, masturbação). Roupas normais, saias curtas, uniformes, esportes, jogos e prints de conversas DEVEM ser false."
+				},
+				nsfw_reason: {
+					type: "string",
+					description:
+						"Se nsfw for true, especifique qual nudez explícita ou ato sexual visual foi identificado. Se nsfw for false, deixe uma string vazia."
 				}
 			},
-			required: ["description", "type", "nsfw"]
+			required: ["description", "type", "nsfw", "nsfw_reason"],
+			additionalProperties: false
 		}
 	}
 };
@@ -77,12 +111,14 @@ const mediaAnalysisSchema = {
 /**
  * Analisa um vídeo e retorna uma descrição
  * @param {Object} message - A mensagem contendo o vídeo
+ * @param {Object} [bot] - Instância do bot para disparo de moderação NSFW retroativa
  * @returns {Promise<string|boolean>} - Descrição do vídeo ou false
  */
-async function analyzeVideo(message) {
+async function analyzeVideo(message, bot = null) {
 	const tempDirBase = path.join(__dirname, "../../temp");
-	const tempDir = path.join(tempDirBase, `video_analysis_${Date.now()}`);
-	const videoPath = path.join(tempDirBase, `video_${Date.now()}.mp4`);
+	const timestamp = Date.now();
+	const tempDir = path.join(tempDirBase, `video_analysis_${timestamp}`);
+	const videoPath = path.join(tempDirBase, `video_${timestamp}.mp4`);
 
 	try {
 		// Garante diretórios
@@ -100,8 +136,8 @@ async function analyzeVideo(message) {
 
 		await fs.writeFile(videoPath, Buffer.from(media.data, "base64"));
 
-		// Extrai frames usando a função utilitária
-		const framePaths = await extractFrames(videoPath, tempDir, 30);
+		// Extrai frames usando a função utilitária (12 frames para equilibrar contexto e tokens)
+		const framePaths = await extractFrames(videoPath, tempDir, 12);
 
 		// Lê os frames
 		const frames = [];
@@ -110,26 +146,64 @@ async function analyzeVideo(message) {
 			frames.push(data);
 		}
 
+		// Limpa arquivos de vídeo e frames do disco imediatamente (não aguardar término da fila LLM)
+		await fs.unlink(videoPath).catch(() => {});
+		await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+
 		if (frames.length === 0) return false;
 
-		// Chama LLM
+		// Chama LLM com prompt direto/uncensored para análise e classificação de conteúdo
 		const completionOptions = {
 			prompt:
-				"Analyze the video frames provided and return a brief description ((in pt-BR, portuguese brazil)). Describe the main actions and events in the video. Also classify the type (real life, anime, game, etc) and if it contains NSFW content.",
-			systemContext: `You are an expert bot in video processing and analysis`,
+				"Analyze the video frames provided and return an objective, factual description in pt-BR (portuguese brazil, max 200 characters) of the main actions and events.\n" +
+				"Classify type: vida-real, anime, desenho, jogo, ia-generated, outros.\n" +
+				"STRICT NSFW RULES:\n" +
+				"- Set nsfw = true ONLY for real or animated EXPLICIT NUDITY (visible human genitalia, exposed bare female breasts/nipples) or EXPLICIT SEXUAL ACTS (intercourse, oral sex, masturbation).\n" +
+				"- Set nsfw = false for EVERYTHING ELSE: fully or partially clothed people, sports/celebrations (players hugging), work uniforms, short skirts/dresses, swimwear covering intimate parts, video games, cartoons, memes, and screen captures.\n" +
+				"- If no explicit genitalia, bare breasts, or sexual acts are visually visible, nsfw MUST be false and nsfw_reason empty.",
+			systemContext: `You are an expert, objective content moderation and video processing assistant. You analyze visual media objectively without false positives on normal, sports, or gaming scenes.`,
 			images: frames,
 			response_format: mediaAnalysisSchema,
-			maxTokens: 150,
+			maxTokens: 200,
 			debugPrompt: false,
 			timeout: 60000,
 			priority: 0
 		};
 
 		const response = await llmService.getCompletion(completionOptions);
+		if (!response || typeof response !== "string" || response.startsWith("Erro:")) {
+			logger.warn("Não foi possível obter análise do vídeo pelo LLM:", response);
+			return false;
+		}
+
 		try {
 			const parsed = JSON.parse(response);
-			const nsfwTag = parsed.nsfw ? "nsfw" : "sfw";
-			return `Video[${parsed.type}|${nsfwTag}|${parsed.description}]`;
+			const isActuallyNSFW =
+				Boolean(parsed.nsfw) &&
+				parsed.type !== "documento" &&
+				((typeof parsed.nsfw_reason === "string" && parsed.nsfw_reason.trim().length > 0) ||
+					(parsed.description &&
+						/nudez|sem roupa|pelad|genit|pênis|penis|vagina|vulva|seios|mamilo|sexo|porn/i.test(
+							parsed.description
+						)));
+			const nsfwTag = isActuallyNSFW ? "nsfw" : "sfw";
+
+			if (isActuallyNSFW && bot) {
+				nsfwPredict
+					.handleExternalDetection(bot, message, {
+						isNSFW: true,
+						type: parsed.type,
+						description: parsed.nsfw_reason || parsed.description,
+						source: "SummaryCommands:VisionAI:Video",
+						media: media?.data || (frames.length > 0 ? frames[0] : null),
+						mimetype: "video/mp4"
+					})
+					.catch((triggerErr) =>
+						logger.error("Erro no trigger NSFW de vídeo do SummaryCommands:", triggerErr)
+					);
+			}
+
+			return `Video[${parsed.type || "outros"}|${nsfwTag}|${parsed.description || ""}]`;
 		} catch (e) {
 			logger.warn("Falha ao analisar JSON do vídeo, retornando cru:", response);
 			return `Video[outros|sfw|${response}]`;
@@ -246,10 +320,6 @@ async function interactWithConversation(bot, message, args, group) {
 			});
 		}
 
-		logger.info(
-			`[${group.id}][interactWithConversation] Gerando interação para o grupo ${message.group}`
-		);
-
 		let recentMessages;
 
 		try {
@@ -264,10 +334,6 @@ async function interactWithConversation(bot, message, args, group) {
 			recentMessages = [];
 		}
 
-		logger.info(
-			`[${group.id}][interactWithConversation] Mensagens recentes: ${recentMessages.length}`
-		);
-
 		if (!recentMessages || recentMessages.length === 0) {
 			if (retornarErro) {
 				return new ReturnMessage({
@@ -279,8 +345,25 @@ async function interactWithConversation(bot, message, args, group) {
 			}
 		}
 
-		// Formata mensagens para prompt
-		const formattedMessages = formatMessagesForPrompt(recentMessages);
+		// Formata mensagens para prompt separando histórico antigo do foco principal (últimas 15 mensagens)
+		let historyFormatted = "";
+		if (recentMessages.length > 15) {
+			const olderMessages = recentMessages.slice(0, recentMessages.length - 15);
+			const latest15Messages = recentMessages.slice(-15);
+
+			const formattedOlder = formatMessagesForPrompt(olderMessages);
+			const formattedLatest = formatMessagesForPrompt(latest15Messages);
+
+			historyFormatted = `--- Contexto de onde veio o assunto (Mensagens antigas) ---
+${formattedOlder}
+
+--- ÚLTIMAS 15 MENSAGENS ENVIADAS (FOCO PRINCIPAL - textos e descrições de imagens, vídeos e áudios recentes) ---
+${formattedLatest}`;
+		} else {
+			const formattedLatest = formatMessagesForPrompt(recentMessages);
+			historyFormatted = `--- ÚLTIMAS MENSAGENS ENVIADAS (FOCO PRINCIPAL - textos e descrições de imagens, vídeos e áudios recentes) ---
+${formattedLatest}`;
+		}
 
 		const otherAIsPrompt = "";
 
@@ -288,13 +371,19 @@ async function interactWithConversation(bot, message, args, group) {
 			group.customAIPrompt && group.customAIPrompt.length > 0
 				? `\n\n((Sua personalidade: '${group.customAIPrompt}'))\n\n`
 				: "";
-		// Cria prompt para LLM
-		const prompt = `Responda apenas em português do brasil. A seguir anexei uma conversa recente de um grupo de WhatsApp. Crie uma única mensagem curta para interagir com o grupo de forma natural, como se você entendesse o assunto e quisesse participar da conversa com algo relevante. Tente usar o mesmo tom e estilo informal que as pessoas estão usando. A mensagem deve ser curta e natural. ${customPersonalidade}${otherAIsPrompt}
 
-${formattedMessages}`;
+		// Cria prompt para LLM
+		const prompt = `Responda apenas em português do brasil. A seguir anexei a conversa recente de um grupo de WhatsApp.
+
+SUA TAREFA:
+Foque o seu comentário/interação PRINCIPALMENTE nas últimas 15 mensagens enviadas (incluindo descrições de imagens, áudios, vídeos e textos) para garantir que sua resposta seja sobre o tópico ATUAL do grupo e não sobre algo atrasado. As mensagens anteriores foram incluídas apenas para você contextualizar de onde veio o assunto.
+
+Crie uma única mensagem curta para interagir com o grupo de forma natural, como se você entendesse o assunto e quisesse participar da conversa com algo relevante. Tente usar o mesmo tom e estilo informal que as pessoas estão usando. A mensagem deve ser curta e natural.${customPersonalidade}${otherAIsPrompt}
+
+${historyFormatted}`;
 
 		logger.info(
-			`[${group.id}][interactWithConversation] Enviando prompt: ${prompt.substring(0, 500)}`
+			`[${group.id}][interactWithConversation] Gerando interação para o grupo ${message.group} (Msgs recentes: ${recentMessages.length}, Total chars: ${prompt.length})`
 		);
 
 		// Obtém interação do LLM
@@ -348,14 +437,96 @@ ${formattedMessages}`;
 }
 
 /**
+ * Extrai menções numéricas a idade a partir de trechos de texto
+ * @param {string} text
+ * @returns {number[]}
+ */
+function extractAgesFromText(text) {
+	if (!text || typeof text !== "string") return [];
+	const regex =
+		/(?:idade[:\s]+|tenho\s+|tem\s+|fa[çc]o\s+)?(\d{1,2})\s*anos\b|idade[:\s]+(\d{1,2})\b|(?:tenho|tem|fa[çc]o)\s+(\d{1,2})\b/gi;
+	const matches = [...text.matchAll(regex)];
+	return matches.map((m) => parseInt(m[1] || m[2] || m[3], 10)).filter((n) => !isNaN(n));
+}
+
+/**
+ * Remove falsos positivos de menores de idade caso mencione apenas pessoas com 17 anos ou mais
+ * @param {object} parsed
+ * @returns {object}
+ */
+function filterUnderageFalsePositives(parsed) {
+	if (!parsed) return parsed;
+
+	const isUnderageCategory = (cat) => /crian[çc]a|adolescente|menor/i.test(cat || "");
+
+	// 1. Filtrar classified_items onde as idades mencionadas são apenas >= 17
+	if (Array.isArray(parsed.classified_items)) {
+		parsed.classified_items = parsed.classified_items.filter((item) => {
+			if (!isUnderageCategory(item.category)) {
+				return true;
+			}
+			const ages = extractAgesFromText(item.evidence);
+			if (ages.length > 0) {
+				const hasUnder17 = ages.some((age) => age >= 1 && age <= 16);
+				const has17Plus = ages.some((age) => age >= 17);
+				// Se só tem idades >= 17 anos (ex: 23, 24 anos) e nenhuma <= 16, é falso positivo
+				if (has17Plus && !hasUnder17) {
+					return false;
+				}
+			}
+			return true;
+		});
+	}
+
+	// 2. Filtrar underage_indicators onde as idades mencionadas são apenas >= 17
+	if (Array.isArray(parsed.underage_indicators)) {
+		parsed.underage_indicators = parsed.underage_indicators.filter((ind) => {
+			const ages = extractAgesFromText(ind);
+			if (ages.length > 0) {
+				const hasUnder17 = ages.some((age) => age >= 1 && age <= 16);
+				const has17Plus = ages.some((age) => age >= 17);
+				if (has17Plus && !hasUnder17) {
+					return false;
+				}
+			}
+			return true;
+		});
+	}
+
+	// 3. Se is_underage foi marcado como true, verificar se foi baseado apenas em maiores de 17 anos
+	if (parsed.is_underage) {
+		const remainingUnderageItems = (parsed.classified_items || []).filter((item) =>
+			isUnderageCategory(item.category)
+		);
+		const remainingUnderageIndicators = parsed.underage_indicators || [];
+
+		// Se não há nenhum indicador ou item de menores de 16 anos restante
+		if (remainingUnderageItems.length === 0 && remainingUnderageIndicators.length === 0) {
+			parsed.is_underage = false;
+			// Se a nota era exclusivamente pela detecção de menores (ex: peso base)
+			if (parsed.problematic_score >= 4 && (parsed.classified_items || []).length === 0) {
+				parsed.problematic_score = 0;
+			}
+		}
+	}
+
+	return parsed;
+}
+
+/**
  * Executa uma análise de dossiê do grupo usando IA
  * @param {string} chatId - Id do grupo
  * @param {string} pendingText - Texto pendente para análise
  * @param {object} bot - Instância do bot para enviar logs
  */
 async function runGroupAnalysis(chatId, pendingText, bot) {
+	// Bots privados e vips não devem gerar dossiês
+	if (bot && (bot.privado || bot.vip)) {
+		return;
+	}
+
 	if (activeAnalyses.has(chatId)) {
-		logger.debug(`[${chatId}] Análise de dossiê já em andamento, pulando.`);
+		// logger.debug(`[${chatId}] Análise de dossiê já em andamento, pulando.`);
 		return;
 	}
 	activeAnalyses.add(chatId);
@@ -387,7 +558,7 @@ async function runGroupAnalysis(chatId, pendingText, bot) {
 		}
 
 		const systemPrompt = `Você é um analista de grupos de segurança e moderação. 
-Seu objetivo é categorizar grupos de WhatsApp de forma ultra-concisa, com o objetivo principal de detectar grupos que praticam coisas ilegais (racismo, pedofilia, aliciamento de menores, xenofobia, vendas ilegais, extremismo, gore, etc.)
+Seu objetivo é categorizar grupos de WhatsApp de forma ultra-concisa, com o objetivo principal de detectar grupos que praticam coisas ilegais (racismo, pedofilia, aliciamento de menores, xenofobia, vendas ilegais, extremismo, gore, etc.) e identificar se o grupo é composto por crianças ou adolescentes (menores de idade).
 Você DEVE responder APENAS com um objeto JSON válido seguindo estritamente o esquema solicitado. 
 Não inclua explicações, introduções ou qualquer texto fora do JSON.`;
 
@@ -401,40 +572,96 @@ Não inclua explicações, introduções ou qualquer texto fora do JSON.`;
 						type: {
 							type: "string",
 							description:
-								"Tipo de conteúdo do grupo (apenas 1 palavra, ex: 'jogos', 'onibus', 'romance', 'politica')"
+								"Tipo de conteúdo do grupo (apenas 1 palavra, ex: 'jogos', 'onibus', 'romance', 'politica', 'escola')"
 						},
 						summary: {
 							type: "string",
 							description: "Frase de até 250 caracteres que resume o que é discutido no grupo"
 						},
+						is_underage: {
+							type: "boolean",
+							description:
+								"True SOMENTE se o grupo for comprovadamente ou predominantemente de crianças ou adolescentes de ATÉ 16 ANOS (ex: 10 a 16 anos). NUNCA marcar true para idades a partir de 17 anos (17, 18, 20, 23, 24 anos são adultos/maiores, JAMAIS crianças ou adolescentes)."
+						},
+						underage_indicators: {
+							type: "array",
+							description:
+								"Se is_underage for true, lista de padrões ou evidências observadas de menores de ATÉ 16 ANOS (ex: 'Membro declarou ter 13 anos', 'Alunos do 8º ano fundamental'). Se false ou se as idades forem a partir de 17 anos, lista vazia [].",
+							items: {
+								type: "string"
+							}
+						},
 						problematic_score: {
 							type: "number",
 							description:
-								"Nota de 0 a 10 (10: ilegal, racismo, gore, extremismo; 6: pornografia, hentai em excesso; 4: encontros, rolês, fotos sensuais, aparência, flertes grupos de troca de nudes/conteúdo, baladas, sexualidade; 3: insultos, discussões, disputas, xingamentos; 3: anúncios, troca de seguidores,divulgações; troca de seguidores; 0: bots, uso de comandos (!), advertências, chat geral, jogos, tecnologia, amigos ou hobbies)"
+								"Nota de 0 a 10 avaliando o comportamento e gravidade do conteúdo discutido no grupo (0: neutro/jogos/bots/escola/estudos/dia-a-dia; 2: discussões leves, xingamentos, flertes; 4: pornografia, nudes, drogas; 6 a 10: crimes, ilegal, racismo, gore, assédio, pedofilia/aliciamento). Avalie o teor da conversa na escala de 0 a 10 independentemente de idade (a pontuação base de proteção a menores é somada separadamente pelo sistema)."
+						},
+						classified_items: {
+							type: "array",
+							description:
+								"Lista de itens/comportamentos problemáticos ou suspeitos identificados, associando a categoria ou motivo à mensagem/fala exata como evidência",
+							items: {
+								type: "object",
+								properties: {
+									category: {
+										type: "string",
+										description:
+											"Categoria do problema (ex: 'Crianças/Adolescentes (até 16 anos)', 'Menores de idade (até 16 anos)', 'Teor racista', 'Gore', 'Xenofobia', 'Assédio', 'Pedofilia', 'Venda ilegal'). NUNCA usar categorias de menores para pessoas de 17 anos ou mais."
+									},
+									evidence: {
+										type: "string",
+										description:
+											"Citação exata ou quase exata da mensagem ou fala no formato 'Autor: Mensagem'"
+									}
+								},
+								required: ["category", "evidence"],
+								additionalProperties: false
+							}
 						}
 					},
-					required: ["type", "summary", "problematic_score"],
+					required: ["type", "summary", "is_underage", "problematic_score"],
 					additionalProperties: false
 				}
 			}
 		};
 
+		// Limita o texto para análise para evitar estourar o limite de tokens do modelo
+		const textToAnalyze = pendingText.length > 20000 ? pendingText.slice(-20000) : pendingText;
+
 		const prompt = `Analise a conversa abaixo e preencha o dossiê:
 - use apenas 1 palavra para 'type'.
 - seja extremamente suscinto no 'summary' (máximo 200 caracteres).
-- 'problematic_score' de 0 a 10.
+- 'is_underage': marque como true SOMENTE se detectar que o grupo é de crianças ou adolescentes de ATÉ 16 ANOS.
+  REGRA CRÍTICA DE IDADE:
+  * Crianças e adolescentes são ESTRITAMENTE pessoas de ATÉ 16 ANOS (ex: 10, 11, 12, 13, 14, 15, 16 anos).
+  * Pessoas com 17 anos ou mais (ex: 17, 18, 19, 20, 21, 22, 23, 24 anos) NÃO SÃO ADOLESCENTES NEM CRIANÇAS! São maiores/adultos.
+  * JAMAIS classifique pessoas de 17 anos ou mais (como 23 ou 24 anos) como 'Crianças/Adolescentes'.
+  * Se membros mencionarem ter 17, 18, 20, 23, 24 anos ou mais, isso indica um grupo de MAIORES/ADULTOS: 'is_underage' DEVE SER FALSE e 'classified_items' NÃO deve conter 'Crianças/Adolescentes'.
+  Padrões válidos de identificação de menores:
+  * Membros declarando explicitamente ter até 16 anos (ex: 'tenho 12 anos', 'faço 14', '15 anos', '16 anos');
+  * Menções a ensino fundamental ou anos iniciais do ensino médio (escola, série/ano como 7º/8º ano, lição de casa, provas escolares, uniforme de escola básica);
+  * Dinâmicas ou assuntos infantis/juvenis exclusivos de menores de 16 anos.
+- 'underage_indicators': se is_underage for true (até 16 anos), liste os motivos (ex: 'Membro declarou ter 13 anos', 'Conversas sobre provas do 8º ano'). Se false ou se as idades forem 17+, deixe vazio [].
+- 'problematic_score': de 0 a 10, avaliando o teor e comportamento do grupo:
+  * 0: grupo neutro/saudável, bots, jogos, escola, estudos, trabalho, amizade ou conversas cotidianas.
+  * 2: discussões, brigas leves, xingamentos pontuais, flertes ou brincadeiras picantes leves.
+  * 4: pornografia, compartilhamento/pedidos de nudes, drogas ou conteúdo adulto frequente.
+  * 6 a 10: crimes, venda ilegal, pedofilia, aliciamento, racismo, gore, violência explícita ou ameaças.
+  (Atenção: avalie estritamente o conteúdo/comportamento na nota de 0 a 10. Se for grupo de menores, o sistema somará automaticamente a pontuação base de proteção a menores).
+- 'classified_items': caso identifique falas problemáticas ou falas que comprovem menores de ATÉ 16 anos (ex: category: 'Crianças/Adolescentes', evidence: 'João: tenho 13 anos'), liste a categoria e a mensagem exata correspondente. NUNCA cite mensagens com idades de 17 anos ou mais (ex: 23 ou 24 anos) como evidência de crianças/adolescentes. Se não houver, deixe a lista vazia [].
 - Uso de bots é permitido e jamais deve ser flagrado como algo ruim
 - Anúncios, ofertas de troca de seguidores, divulgações de canais e conteúdo de NÃO são consinderados problemáticos
 ${historicalContext}
 
 Conversa:
-${pendingText}`;
+${textToAnalyze}`;
 
 		const response = await llmService.getCompletion({
 			prompt,
 			systemContext: systemPrompt,
 			response_format: dossierSchema,
-			priority: 10, // Baixa prioridade
+			priority: 0, // Baixa prioridade de background (0 = menor, 5 = maior)
+			maxTokens: 500,
 			debugPrompt: false
 		});
 
@@ -451,6 +678,14 @@ ${pendingText}`;
 
 			// Só limpa se o JSON tiver os campos obrigatórios
 			if (parsed.type && parsed.summary && typeof parsed.problematic_score === "number") {
+				// Filtra falsos positivos de menores de idade (ex: pessoas com 17 anos ou mais)
+				parsed = filterUnderageFalsePositives(parsed);
+
+				// Se is_underage for identificado (e confirmado até 16 anos), SOMA 4 pontos na nota
+				if (parsed.is_underage) {
+					parsed.problematic_score = Math.min(10, (parsed.problematic_score || 0) + 4);
+				}
+
 				// Para evitar deletar mensagens que chegaram ENQUANTO a IA analisava,
 				// vamos apenas remover o trecho que foi enviado para a análise.
 
@@ -464,14 +699,32 @@ ${pendingText}`;
 				let newPendingText = "";
 				if (currentStatus && currentStatus.pending_text) {
 					// Removemos do início do texto atual o que enviamos para a IA
-					newPendingText = currentStatus.pending_text.replace(pendingText, "");
+					newPendingText = currentStatus.pending_text.replace(textToAnalyze, "");
+					if (newPendingText.length > 20000) {
+						newPendingText = newPendingText.slice(-10000);
+					}
 				}
 
-				// 1. INSere o novo dossiê no histórico (guarda histórico da conversa se a nota for > 7)
+				// Determina se o dossiê é elegível para alerta (nota > 7 para adultos ou > 4 para menores com agravantes)
+				const isAlertEligible = parsed.is_underage
+					? parsed.problematic_score > 4
+					: parsed.problematic_score > 7;
+
+				// 1. INSere o novo dossiê no histórico (guarda histórico da conversa se for problemático/alerta)
+				const isProblematic = isAlertEligible ? 1 : 0;
+				const isUnderage = parsed.is_underage ? 1 : 0;
 				await database.dbRun(
 					DB_NAME,
-					`INSERT INTO group_dossiers (group_id, dossier_json, conversation_history, analyzed_at_length) VALUES (?, ?, ?, ?)`,
-					[chatId, JSON.stringify(parsed), parsed.problematic_score > 7 ? pendingText : null, 0]
+					`INSERT INTO group_dossiers (group_id, dossier_json, conversation_history, analyzed_at_length, problematic_score, is_problematic, is_underage) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+					[
+						chatId,
+						JSON.stringify(parsed),
+						isProblematic ? textToAnalyze : null,
+						0,
+						parsed.problematic_score,
+						isProblematic,
+						isUnderage
+					]
 				);
 
 				// 2. Limpa o texto analisado da tabela de status
@@ -497,32 +750,110 @@ ${pendingText}`;
 					`[${chatId}] Novo dossiê inserido. Histórico limitado a 15. ${newPendingText.length} chars remanescentes.`
 				);
 
-				// Alerta SuperAdmin se a nota for alta (> 7) e tiver bot disponível
-				if (bot && parsed.problematic_score > 7 && (bot.grupoLogs || process.env.GRUPO_LOGS)) {
-					const targetGroup = bot.grupoLogs || process.env.GRUPO_LOGS;
+				// Alerta SuperAdmin se elegível e tiver bot disponível
+				const targetGroup = bot
+					? bot.dossieGroups || bot.grupoLogs || process.env.GRUPO_DOSSIES || process.env.GRUPO_LOGS
+					: process.env.GRUPO_DOSSIES || process.env.GRUPO_LOGS;
+
+				if (bot && isAlertEligible && targetGroup) {
 					const groupData = await bot.database.getGroup(chatId);
-					const msgAlert = `⚠️ *ALERTA DE GRUPO POSSIVELMENTE PROBLEMÁTICO* ⚠️
+
+					// Conta a quantidade de reports problemáticos já gerados para este grupo
+					let reportsCount = 1;
+					try {
+						const countRow = await database.dbGet(
+							DB_NAME,
+							`SELECT COUNT(*) as count FROM group_dossiers 
+							 WHERE group_id = ? AND (is_problematic = 1 OR problematic_score > 7 OR json_extract(dossier_json, '$.problematic_score') > 7)`,
+							[chatId]
+						);
+						if (countRow && typeof countRow.count === "number") {
+							reportsCount = countRow.count;
+						}
+					} catch (countErr) {
+						logger.warn(`[${chatId}] Erro ao contar reports problemáticos:`, countErr);
+					}
+
+					let classifiedText = "";
+					if (Array.isArray(parsed.classified_items) && parsed.classified_items.length > 0) {
+						classifiedText =
+							"\n\n🚩 *Evidências / Mensagens Classificadas:*\n" +
+							parsed.classified_items
+								.map((item) => `• *${item.category}:* "${item.evidence}"`)
+								.join("\n");
+					}
+
+					let underageText = "";
+					if (parsed.is_underage) {
+						underageText = "\n👶 *Crianças/Adolescentes:* Detectado ⚠️";
+						if (
+							Array.isArray(parsed.underage_indicators) &&
+							parsed.underage_indicators.length > 0
+						) {
+							underageText +=
+								"\n" + parsed.underage_indicators.map((ind) => `  ▫️ ${ind}`).join("\n");
+						}
+					}
+
+					let lastDossiersText = "";
+					try {
+						const lastDossiers = await database.getLastGroupDossiers(chatId, 10);
+						if (lastDossiers && lastDossiers.length > 0) {
+							lastDossiersText = "\n📊 *Últimos Dossiês Registrados:*\n";
+							lastDossiers.forEach((d, idx) => {
+								try {
+									const p =
+										typeof d.dossier_json === "string"
+											? JSON.parse(d.dossier_json)
+											: d.dossier_json;
+									const dateStr = d.created_at
+										? ` (${new Date(d.created_at).toLocaleDateString("pt-BR")})`
+										: "";
+									let evText = "";
+									if (Array.isArray(p.classified_items) && p.classified_items.length > 0) {
+										evText =
+											"\n" +
+											p.classified_items
+												.map((it) => `  • *${it.category}:* "${it.evidence}"`)
+												.join("\n");
+									}
+									const underageTag = p.is_underage ? " 👶 [Menores]" : "";
+									lastDossiersText += `${idx + 1}. *[${p.type || "geral"}]* Nota: *${p.problematic_score}/10*${underageTag}${dateStr}\n- Resumo: ${p.summary}${evText}\n`;
+								} catch (e) {}
+							});
+						}
+					} catch (dossierErr) {
+						logger.error(`[${chatId}] Erro ao carregar últimos dossiês para alerta:`, dossierErr);
+					}
+
+					const alertTitle = parsed.is_underage
+						? "⚠️ *ALERTA DE GRUPO DE CRIANÇAS/ADOLESCENTES* ⚠️"
+						: "⚠️ *ALERTA DE GRUPO POSSIVELMENTE PROBLEMÁTICO* ⚠️";
+
+					const msgAlert = `${alertTitle}
 					
 📌 *Grupo:* ${groupData ? groupData.name : "N/A"}
 🆔 *ID:* ${chatId}
+🚨 *Reports:* ${reportsCount}
 🤖 *Bot:* ${bot.id}
 
 📊 *Análise:*
 - *Tipo:* ${parsed.type}
-- *Nota:* ${parsed.problematic_score}/10
-- *Resumo:* ${parsed.summary}`;
+- *Nota:* ${parsed.problematic_score}/10${underageText}
+- *Resumo:* ${parsed.summary}${classifiedText}
+${lastDossiersText}
+!sa-leaveGrupo ${chatId}`;
 
-					bot
-						.sendMessage(targetGroup, msgAlert)
-						.catch((e) => logger.error("Erro ao enviar alerta de dossiê:", e));
+					const targetGroups = Array.isArray(targetGroup)
+						? targetGroup
+						: typeof targetGroup === "string" && targetGroup.includes(",")
+							? targetGroup.split(",").map((g) => g.trim())
+							: [targetGroup];
 
-					if (parsed.problematic_score > 7) {
+					for (const tg of targetGroups) {
 						bot
-							.sendMessage(
-								targetGroup,
-								`📝 *Histórico da Conversa que gerou o dossiê:*\n\n${pendingText}`
-							)
-							.catch((e) => logger.error("Erro ao enviar histórico de msgs do dossiê:", e));
+							.sendMessage(tg, msgAlert)
+							.catch((e) => logger.error("Erro ao enviar alerta de dossiê:", e));
 					}
 				}
 			} else {
@@ -531,6 +862,30 @@ ${pendingText}`;
 		}
 	} catch (error) {
 		logger.error(`[${chatId}] Erro ao processar análise de dossiê:`, error);
+		try {
+			const currentStatus = await database.dbGet(
+				DB_NAME,
+				"SELECT pending_text FROM group_dossier_status WHERE group_id = ?",
+				[chatId]
+			);
+			if (
+				currentStatus &&
+				currentStatus.pending_text &&
+				currentStatus.pending_text.length > 30000
+			) {
+				const trimmed = currentStatus.pending_text.slice(-10000);
+				await database.dbRun(
+					DB_NAME,
+					"UPDATE group_dossier_status SET pending_text = ? WHERE group_id = ?",
+					[trimmed, chatId]
+				);
+				logger.warn(
+					`[${chatId}] Análise de dossiê falhou e pending_text estava com ${currentStatus.pending_text.length} chars. Truncado para 10000 chars para evitar loop.`
+				);
+			}
+		} catch (dbErr) {
+			logger.error(`[${chatId}] Erro ao truncar pending_text excedente:`, dbErr);
+		}
 	} finally {
 		activeAnalyses.delete(chatId);
 	}
@@ -552,7 +907,7 @@ async function storeMessage(message, chatId, bot) {
 		let llmUp = false;
 		try {
 			const servicesData = await Status.getServicesStatus();
-			if (servicesData.llm === "up") {
+			if (Status.isUp(servicesData.llm)) {
 				llmUp = true;
 			}
 		} catch (e) {
@@ -581,11 +936,16 @@ async function storeMessage(message, chatId, bot) {
 				if (imageData) {
 					const completionOptions = {
 						prompt:
-							"Analyze the picture and return a brief description ((in pt-BR, portuguese brazil)) ((try to stay below 200 characters)). Also classify the type (real life, anime, game, etc) and if it contains NSFW content.",
-						systemContext: `You are an expert bot in image processing and analysis`,
+							"Analyze the picture and return an objective, factual description in pt-BR (portuguese brazil, max 200 characters).\n" +
+							"Classify type: vida-real, anime, desenho, jogo, ia-generated, documento, outros.\n" +
+							"STRICT NSFW RULES:\n" +
+							"- Set nsfw = true ONLY for real or animated EXPLICIT NUDITY (visible human genitalia, exposed bare female breasts/nipples) or EXPLICIT SEXUAL ACTS (intercourse, oral sex, masturbation).\n" +
+							"- Set nsfw = false for EVERYTHING ELSE: clothed people, work uniforms, sports, short skirts/dresses, normal swimwear, gaming scenes, cartoons, memes, and screenshots of chats/documents/searches (text content or slang like 'mama' does NOT make an image visually NSFW).\n" +
+							"- If no explicit genitalia, bare breasts, or sexual acts are visually visible, nsfw MUST be false and nsfw_reason empty.",
+						systemContext: `You are an expert, objective content moderation and image processing assistant. You analyze visual media objectively without false positives on normal, sports, text screenshots, or gaming scenes.`,
 						image: imageData,
 						response_format: mediaAnalysisSchema,
-						maxTokens: 150,
+						maxTokens: 200,
 						debugPrompt: false,
 						priority: 1
 					};
@@ -600,12 +960,35 @@ async function storeMessage(message, chatId, bot) {
 					) {
 						try {
 							const parsed = JSON.parse(response);
-							const nsfwTag = parsed.nsfw ? "nsfw" : "sfw";
+							const isActuallyNSFW =
+								Boolean(parsed.nsfw) &&
+								parsed.type !== "documento" &&
+								((typeof parsed.nsfw_reason === "string" && parsed.nsfw_reason.trim().length > 0) ||
+									(parsed.description &&
+										/nudez|sem roupa|pelad|genit|pênis|penis|vagina|vulva|seios|mamilo|sexo|porn/i.test(
+											parsed.description
+										)));
+							const nsfwTag = isActuallyNSFW ? "nsfw" : "sfw";
 							const finalString = `Imagem[${parsed.type}|${nsfwTag}|${parsed.description}]`;
 							textContent = message.caption
 								? `${finalString}\nLegenda: ${message.caption}`
 								: finalString;
 							logger.info(`[${chatId}][storeMessage] Imagem interpretada: ${textContent}`);
+
+							if (isActuallyNSFW && bot) {
+								nsfwPredict
+									.handleExternalDetection(bot, message, {
+										isNSFW: true,
+										type: parsed.type,
+										description: parsed.nsfw_reason || parsed.description,
+										source: "SummaryCommands:VisionAI:Image",
+										media: imageData,
+										mimetype: message.content?.mimetype || "image/jpeg"
+									})
+									.catch((triggerErr) =>
+										logger.error("Erro no trigger NSFW de imagem do SummaryCommands:", triggerErr)
+									);
+							}
 						} catch (e) {
 							logger.warn("Falha ao analisar JSON da imagem, retornando cru:", response);
 							// Fallback if not JSON
@@ -617,7 +1000,7 @@ async function storeMessage(message, chatId, bot) {
 		} else if (message.type === "video" && llmUp) {
 			// Tenta interpretar o video usando Vision AI
 			if (message.content && !message.caption?.startsWith("!s")) {
-				const response = await analyzeVideo(message);
+				const response = await analyzeVideo(message, bot);
 
 				if (
 					response &&
@@ -631,6 +1014,22 @@ async function storeMessage(message, chatId, bot) {
 		}
 
 		if (textContent) {
+			// Ignora mensagens do grupo de dossiês
+			if (
+				bot &&
+				((typeof bot.isDossieGroup === "function" && bot.isDossieGroup(chatId)) ||
+					(bot.dossieGroups &&
+						(bot.dossieGroups === chatId ||
+							(Array.isArray(bot.dossieGroups) && bot.dossieGroups.includes(chatId)))))
+			) {
+				return;
+			}
+
+			// Ignora comandos que começam com '!' no histórico de conversas e dossiê
+			if (typeof textContent === "string" && textContent.trim().startsWith("!")) {
+				return;
+			}
+
 			// Zap/libs mudam tanto que pode vir de qualquer lugar, é foda, haja fallbacks
 			const fromMe =
 				message.goMessageData?.key?.fromMe ??
@@ -667,30 +1066,34 @@ async function storeMessage(message, chatId, bot) {
 				[chatId]
 			);
 
-			// 3. Atualiza Dossiê (Contagem de caracteres e texto pendente na tabela STATUS)
-			const msgString = `${authorName}: ${textContent}\n`;
+			// 3. Atualiza Dossiê (apenas para bots normais: bots privados e vips não devem gerar dossiês)
+			const isDossierEligible = !bot || (!bot.privado && !bot.vip);
 
-			// Upsert dossier status
-			await database.dbRun(
-				DB_NAME,
-				`INSERT INTO group_dossier_status (group_id, total_length_recorded, pending_text) 
-                 VALUES (?, ?, ?)
-                 ON CONFLICT(group_id) DO UPDATE SET 
-                    total_length_recorded = total_length_recorded + LENGTH(?),
-                    pending_text = pending_text || ?`,
-				[chatId, msgString.length, msgString, msgString, msgString]
-			);
+			if (isDossierEligible) {
+				const msgString = `${authorName}: ${textContent}\n`;
 
-			// Busca o status para decidir se dispara análise
-			const dossierStatus = await database.dbGet(
-				DB_NAME,
-				"SELECT pending_text FROM group_dossier_status WHERE group_id = ?",
-				[chatId]
-			);
+				// Upsert dossier status
+				await database.dbRun(
+					DB_NAME,
+					`INSERT INTO group_dossier_status (group_id, total_length_recorded, pending_text) 
+	                 VALUES (?, ?, ?)
+	                 ON CONFLICT(group_id) DO UPDATE SET 
+	                    total_length_recorded = total_length_recorded + LENGTH(?),
+	                    pending_text = pending_text || ?`,
+					[chatId, msgString.length, msgString, msgString, msgString]
+				);
 
-			if (dossierStatus && dossierStatus.pending_text.length >= 10000) {
-				// Dispara análise sem dar await para não travar a resposta
-				runGroupAnalysis(chatId, dossierStatus.pending_text, bot);
+				// Busca o status para decidir se dispara análise
+				const dossierStatus = await database.dbGet(
+					DB_NAME,
+					"SELECT pending_text FROM group_dossier_status WHERE group_id = ?",
+					[chatId]
+				);
+
+				if (dossierStatus && dossierStatus.pending_text.length >= 10000) {
+					// Dispara análise sem dar await para não travar a resposta
+					runGroupAnalysis(chatId, dossierStatus.pending_text, bot);
+				}
 			}
 
 			// Legado: Salva na tabela antiga como redundância por enquanto ou se necessário
@@ -706,16 +1109,18 @@ async function storeMessage(message, chatId, bot) {
 /**
  * Obtém mensagens recentes para um grupo
  * @param {string} chatId - O ID do grupo
+ * @param {number} [limit=150] - Limite máximo de mensagens recentes a buscar
  * @returns {Promise<Array>} - Array de objetos de mensagem
  */
-async function getRecentMessages(chatId) {
+async function getRecentMessages(chatId, limit = 150) {
+	if (!chatId) return [];
 	try {
 		const rows = await database.dbAll(
 			DB_NAME,
-			"SELECT author, text, timestamp FROM chat_conversations WHERE group_id = ? ORDER BY timestamp ASC",
-			[chatId]
+			"SELECT author, text, timestamp FROM chat_conversations WHERE group_id = ? ORDER BY timestamp DESC LIMIT ?",
+			[chatId, limit]
 		);
-		return rows.map((r) => ({
+		return rows.reverse().map((r) => ({
 			author: r.author,
 			text: r.text,
 			timestamp: r.timestamp
@@ -773,7 +1178,7 @@ const commands = [
 			before: process.env.LOADING_EMOJI ?? "⌛️",
 			after: "💬"
 		},
-		cooldown: 150,
+		cooldown: 55,
 		method: interactWithConversation
 	})
 ];
@@ -786,4 +1191,26 @@ module.exports.runGroupAnalysis = runGroupAnalysis;
 module.exports.formatMessagesForPrompt = formatMessagesForPrompt;
 
 // Exporta comandos
+const helper = {
+	about: "Resumos de conversas de grupos e interações inteligentes contextualizadas",
+	implementation:
+		"Armazena histórico recente de mensagens do chat e utiliza LLMs para gerar resumos concisos e intervenções bem-humoradas",
+	tags: "resumo,interagir,conversa,ia,mensagens,grupo",
+	cmds: [
+		{
+			cmd: "!resumo",
+			desc: "Gera um resumo das conversas recentes e assuntos debatidos no grupo",
+			usage: ["!resumo"],
+			category: "ia"
+		},
+		{
+			cmd: "!interagir",
+			desc: "Faz o bot interagir e comentar sobre os tópicos atuais da conversa",
+			usage: ["!interagir"],
+			category: "ia"
+		}
+	]
+};
+
+module.exports.helper = helper;
 module.exports.commands = commands;

@@ -78,10 +78,19 @@ async function showCommandsByCategory(bot, message, args, group) {
 			// Get fixed commands
 			const fixedCommands = bot.eventHandler.commandHandler.fixedCommands.getAllCommands();
 
-			// Filter commands by category
-			const commandsInCategory = fixedCommands.filter(
-				(cmd) => cmd.category && cmd.category.toLowerCase() === category && !cmd.hidden
-			);
+			// Filter commands by category with deduplication
+			const seenCommands = new Set();
+			const commandsInCategory = fixedCommands.filter((cmd) => {
+				if (!cmd.category || cmd.category.toLowerCase() !== category || cmd.hidden) {
+					return false;
+				}
+				const cmdKey = cmd.name?.toLowerCase();
+				if (cmdKey) {
+					if (seenCommands.has(cmdKey)) return false;
+					seenCommands.add(cmdKey);
+				}
+				return true;
+			});
 
 			// Get custom commands for this group
 			const customCommands = group
@@ -100,7 +109,13 @@ async function showCommandsByCategory(bot, message, args, group) {
 			}
 
 			// Build message
-			let menuText = `🤖 *Comandos na categoria '${category}'*\n\n`;
+			const customNames = {
+				interacao: "Interação",
+				integracao: "Interação",
+				ia: "IA"
+			};
+			const displayCategory = customNames[category] || category;
+			let menuText = `🤖 *Comandos na categoria '${displayCategory}'*\n\n`;
 
 			// Add fixed commands
 			if (commandsInCategory.length > 0) {
@@ -310,10 +325,18 @@ async function sendCommandList(bot, message, args, group) {
 			group && Array.isArray(group.mutedCategories) ? group.mutedCategories : [];
 		const mutedCommands = group && Array.isArray(group.mutedCommands) ? group.mutedCommands : [];
 
-		// Obtém todos os comandos fixos e filtra
+		// Obtém todos os comandos fixos e filtra com deduplicação por nome
+		const seenFixedCmds = new Set();
 		const fixedCommands = bot.eventHandler.commandHandler.fixedCommands
 			.getAllCommands()
 			.filter((cmd) => {
+				// Evita comandos duplicados com o mesmo nome
+				const cmdKey = cmd.name?.toLowerCase();
+				if (cmdKey) {
+					if (seenFixedCmds.has(cmdKey)) return false;
+					seenFixedCmds.add(cmdKey);
+				}
+
 				// Filtra por categoria
 				if (cmd.category && mutedCategories.includes(cmd.category.toLowerCase())) {
 					return false;
@@ -348,9 +371,10 @@ async function sendCommandList(bot, message, args, group) {
 		const categorizedCommands = groupCommandsByCategory(fixedCommands);
 
 		// Constrói mensagem
-		let menuText = "🤖 *Comandos Ravenabot*🐦‍⬛\n";
+		const botDisplayName = bot?.nomeExibir || "Ravenabot";
+		let menuText = `🤖 *Comandos ${botDisplayName}*🐦‍⬛\n`;
 		if (!group) {
-			menuText += `> _PV da *${bot.id}*_\n`;
+			menuText += `> _PV de *${bot?.nomeExibir || bot.id}*_\n`;
 		} else {
 			menuText += `> _Grupo ${group.name} _\n`;
 		}
@@ -364,10 +388,13 @@ async function sendCommandList(bot, message, args, group) {
 
 			// Adiciona cabeçalho da categoria com emoji
 			const emoji = CATEGORY_EMOJIS[category];
-			let nomeCategoria = category.charAt(0).toUpperCase() + category.slice(1);
-			if (nomeCategoria.length < 4) {
-				nomeCategoria = nomeCategoria.toUpperCase();
-			}
+			const customNames = {
+				interacao: "Interação",
+				integracao: "Interação",
+				ia: "IA"
+			};
+			const nomeCategoria =
+				customNames[category] || category.charAt(0).toUpperCase() + category.slice(1);
 			menuText += `\n${emoji} *${nomeCategoria}:*\n`;
 
 			// Agrupa comandos relacionados
@@ -383,6 +410,28 @@ async function sendCommandList(bot, message, args, group) {
 					menuText += `${formatCommandGroup(cmdGroup, prefix)}\n`;
 				} else {
 					// Comando individual
+					const cmd = Array.isArray(cmdGroup) ? cmdGroup[0] : cmdGroup;
+					menuText += `${formatSingleCommand(cmd, prefix)}\n`;
+				}
+			}
+		}
+
+		// Fallback para comandos em categorias não mapeadas ou 'resto'
+		const unmappedCommands = [];
+		for (const cat in categorizedCommands) {
+			if (!CATEGORY_EMOJIS[cat] && categorizedCommands[cat]?.length > 0) {
+				unmappedCommands.push(...categorizedCommands[cat]);
+			}
+		}
+
+		if (unmappedCommands.length > 0) {
+			menuText += `\n❓ *Outros:*\n`;
+			const groupedCommands = groupRelatedCommands(unmappedCommands);
+			const sortedGroups = sortCommands(groupedCommands);
+			for (const cmdGroup of sortedGroups) {
+				if (Array.isArray(cmdGroup) && cmdGroup.length > 1) {
+					menuText += `${formatCommandGroup(cmdGroup, prefix)}\n`;
+				} else {
 					const cmd = Array.isArray(cmdGroup) ? cmdGroup[0] : cmdGroup;
 					menuText += `${formatSingleCommand(cmd, prefix)}\n`;
 				}
@@ -671,4 +720,34 @@ Object.keys(CATEGORY_EMOJIS).forEach((category, v) => {
 	);
 });
 
-module.exports = { commands };
+const helper = {
+	about: "Menu de comandos dinâmico e categorizado com navegação completa",
+	implementation:
+		"Lê todos os comandos carregados no bot, agrupa por categoria segundo a ordem do MenuOrder.js e formata a resposta",
+	tags: "menu,ajuda,comandos,help,lista de comandos,navegacao",
+	cmds: [
+		{
+			cmd: "!cmd",
+			desc: "Exibe o menu principal com todas as categorias e comandos do bot",
+			usage: ["!cmd", "!cmd jogos", "!cmd ia", "!cmd midia"],
+			category: "geral"
+		},
+		{
+			cmd: "!cmd-grupo",
+			desc: "Exibe os comandos voltados para o uso no grupo",
+			usage: ["!cmd-grupo"],
+			category: "geral"
+		},
+		{
+			cmd: "!cmd-gerenciamento",
+			desc: "Exibe os comandos de administração e gerenciamento do grupo",
+			usage: ["!cmd-gerenciamento"],
+			category: "geral"
+		}
+	]
+};
+
+module.exports = {
+	helper,
+	commands
+};

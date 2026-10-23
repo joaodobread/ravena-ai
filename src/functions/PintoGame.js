@@ -4,6 +4,8 @@ const Logger = require("../utils/Logger");
 const ReturnMessage = require("../models/ReturnMessage");
 const Command = require("../models/Command");
 const Database = require("../utils/Database");
+const DonorBonusService = require("../services/DonorBonusService");
+const GroupContextHelper = require("../utils/GroupContextHelper");
 
 const logger = new Logger("pinto-game");
 const database = Database.getInstance();
@@ -85,18 +87,32 @@ function calculateScore(flaccid, erect, girth, curvature) {
 	return Math.round(weightedAvg * MAX_SCORE);
 }
 
+/**
+ * Retorna o nome do doutor para o jogo, usando o nome personalizado do bot se definido.
+ * @param {Object} bot - Instância do bot
+ * @returns {string} - Nome do doutor (ex: "Dr. Stallone", "Dr. Raveno")
+ */
+function getDoctorName(bot) {
+	if (!bot?.nomeExibir) return "Dr. Raveno";
+	const nome = bot.nomeExibir.trim();
+	if (/^dr[a-z]?\./i.test(nome)) {
+		return nome;
+	}
+	return `Dr. ${nome}`;
+}
+
 const INTRO_A = [
-	"Olá {pessoa}, entre e fique à vontade no consultório do Dr. Raveno! 🩺",
+	"Olá {pessoa}, entre e fique à vontade no consultório do {doutor}! 🩺",
 	"Seja bem-vindo(a), {pessoa}. Pode ir tirando a roupa para o exame... 🥼",
 	"Ah, {pessoa}! Estava te esperando. Sente-se na maca, por favor. 🛋️",
 	"Bom dia, {pessoa}. Pronto para sua avaliação trimestral? 📝",
 	"Ora ora, se não é o(a) {pessoa}. Veio finalmente tirar a prova? 🔍",
 	"Entre, {pessoa}. Não precisa ter vergonha, já vi de tudo por aqui. 🏥",
 	"Aproxime-se, {pessoa}. Vamos ver como andam as coisas... 🧐",
-	"Saudações, {pessoa}! O Dr. Raveno está pronto para atendê-lo(a). 🎩",
+	"Saudações, {pessoa}! O {doutor} está pronto para atendê-lo(a). 🎩",
 	"Oi {pessoa}, veio fazer o check-up de rotina? 💉",
 	"{pessoa}, você de novo? Veio ver se mudou alguma coisa? 🔄",
-	"Bem-vindo(a) à clínica de estética do Dr. Raveno, {pessoa}! ✨",
+	"Bem-vindo(a) à clínica de estética do {doutor}, {pessoa}! ✨",
 	"Olha só quem apareceu... Pode entrar, {pessoa}. 🚪",
 	"Sente-se, {pessoa}. O procedimento será rápido e indolor (espero). ⚡",
 	"Preparado(a) para o veredito, {pessoa}? A ciência não mente! 🔬",
@@ -116,7 +132,7 @@ const INTRO_B = [
 	"Sinto uma energia... potente vindo desta direção. ⚡",
 	"O clima esquentou de repente ou é impressão minha? 🔥",
 	"De acordo com os manuais de anatomia, isso aqui é raro... 📚",
-	"Mantenha a calma. O Dr. Raveno é profissional. 🧤",
+	"Mantenha a calma. O {doutor} é profissional. 🧤",
 	"Sempre fico surpreso com o que encontro nesta profissão... 😮",
 	"Tudo bem, respire fundo. O processo de medição vai começar. ⏱️"
 ];
@@ -142,15 +158,16 @@ const INTRO_C = [
 /**
  * Gera um comentário com base no score com maior variedade
  * @param {number} score - Score calculado
+ * @param {string} [doctorName] - Nome do médico/doutor
  * @returns {string} - Comentário engraçado
  */
-function getComment(score) {
+function getComment(score, doctorName = "Dr. Raveno") {
 	if (score >= 1000) return "🌌 *DEUS DO OLIMPO!* Isso não é um membro, é um monumento histórico!";
 	if (score >= 950)
 		return "🔥 *LENDÁRIO!* As lendas urbanas falavam de algo assim, mas eu não acreditava!";
 	if (score >= 900)
 		return "⚡ *IMPRESSIONANTE!* Você precisa de uma licença especial para carregar isso?";
-	if (score >= 850) return "🏆 *CAMPEÃO PESO-PESADO!* O Dr. Raveno ficou até sem fôlego!";
+	if (score >= 850) return `🏆 *CAMPEÃO PESO-PESADO!* O ${doctorName} ficou até sem fôlego!`;
 	if (score >= 800) return "🌟 *EXCEPCIONAL!* Um verdadeiro espécime de elite, parabéns!";
 	if (score >= 750) return "💎 *JOIA RARA!* Acima de qualquer expectativa razoável!";
 	if (score >= 700) return "👏 *INCRÍVEL!* Um resultado que impõe respeito em qualquer lugar!";
@@ -171,17 +188,86 @@ function getComment(score) {
 }
 
 /**
+ * Extrai o 1º mention do comando (via message.mentions, args ou quoted)
+ * @param {Object} message - Objeto da mensagem
+ * @param {Array} args - Argumentos do comando
+ * @returns {{ targetJid: string|null, targetText: string }}
+ */
+function extractFirstMention(message, args) {
+	let targetJid = null;
+	let targetText = "";
+
+	const rawMentions =
+		Array.isArray(message.mentions) && message.mentions.length > 0
+			? message.mentions
+			: Array.isArray(message.origin?.mentionedIds) && message.origin.mentionedIds.length > 0
+				? message.origin.mentionedIds
+				: [];
+
+	if (rawMentions.length > 0) {
+		targetJid = rawMentions[0];
+	}
+
+	const mentionArg = Array.isArray(args)
+		? args.find((a) => typeof a === "string" && a.startsWith("@"))
+		: null;
+
+	if (mentionArg) {
+		const cleanDigits = mentionArg.replace(/^@/, "").replace(/\D/g, "");
+		if (!targetJid && cleanDigits.length >= 7) {
+			targetJid = `${cleanDigits}@s.whatsapp.net`;
+		}
+		if (cleanDigits.length >= 7) {
+			targetText = `@${cleanDigits}`;
+		} else if (!targetJid) {
+			targetText = mentionArg;
+		}
+	}
+
+	if (!targetJid && !targetText) {
+		const quotedParticipant =
+			message.quotedParticipant ??
+			message.origin?.quotedParticipant ??
+			message.quotedMsg?.author ??
+			message.origin?.quotedMsg?.author ??
+			message.quotedMsg?.participant ??
+			message.origin?.quotedMsg?.participant;
+		if (quotedParticipant) {
+			targetJid = quotedParticipant;
+		}
+	}
+
+	if (targetJid && !targetText) {
+		const cleanNum = targetJid.split("@")[0].replace(/\D/g, "");
+		targetText = cleanNum ? `@${cleanNum}` : `@${targetJid.split("@")[0]}`;
+	}
+
+	return { targetJid, targetText };
+}
+
+/**
  * Gera as frases de introdução aleatórias
  * @param {string} userName - Nome do usuário
+ * @param {string} [doctorName] - Nome do médico/doutor
+ * @param {string} [targetText] - Menção ao usuário
  * @returns {string} - Frase combinada
  */
-function generateFlavorText(userName) {
-	const a = INTRO_A[Math.floor(Math.random() * INTRO_A.length)].replace(
-		"{pessoa}",
-		`*${userName}*`
-	);
-	const b = INTRO_B[Math.floor(Math.random() * INTRO_B.length)];
+function generateFlavorText(userName, doctorName = "Dr. Raveno", targetText = null) {
+	const a = INTRO_A[Math.floor(Math.random() * INTRO_A.length)]
+		.replace("{pessoa}", `*${userName}*`)
+		.replace("{doutor}", doctorName);
+	const b = INTRO_B[Math.floor(Math.random() * INTRO_B.length)].replace("{doutor}", doctorName);
 	const c = INTRO_C[Math.floor(Math.random() * INTRO_C.length)];
+
+	if (targetText) {
+		const mentionPhrases = [
+			`Ah, você trouxe ${targetText} junto pra consulta?`,
+			`${targetText}, pode ajudar a segurar aqui?`
+		];
+		const chosen = mentionPhrases[Math.floor(Math.random() * mentionPhrases.length)];
+		return `${a}\n${chosen}\n${b}\n${c}`;
+	}
+
 	return `${a}\n${b}\n${c}`;
 }
 
@@ -287,17 +373,30 @@ async function pintoCommand(bot, message, args, group) {
 			});
 		}
 
-		// Gera os valores aleatórios
-		const flaccid = generateRandomValue(MIN_FLACCID, MAX_FLACCID);
-		const erect = generateRandomValue(Math.max(flaccid, MIN_ERECT), MAX_ERECT); // Ereto é no mínimo igual ao flácido
-		const girth = generateRandomValue(MIN_GIRTH, MAX_GIRTH);
+		// Gera os valores aleatórios base
+		let flaccid = generateRandomValue(MIN_FLACCID, MAX_FLACCID);
+		let erect = generateRandomValue(Math.max(flaccid, MIN_ERECT), MAX_ERECT); // Ereto é no mínimo igual ao flácido
+		let girth = generateRandomValue(MIN_GIRTH, MAX_GIRTH);
 		const curvature = generateRandomValue(-30, 30);
 
-		// Calcula o score
+		// Bônus para doadores (+1% por real doado, sem ultrapassar os máximos definidos)
+		const donorTotal = await DonorBonusService.getDonorTotal(userId);
+		let donorBonusText = "";
+		if (donorTotal > 0) {
+			const bonusMult = 1 + donorTotal * 0.01;
+			flaccid = Math.min(MAX_FLACCID, Math.round(flaccid * bonusMult * 10) / 10);
+			erect = Math.min(MAX_ERECT, Math.round(erect * bonusMult * 10) / 10);
+			girth = Math.min(MAX_GIRTH, Math.round(girth * bonusMult * 10) / 10);
+			donorBonusText = `\n💎 *Benefício de Apoiador:* +${Math.round(donorTotal)}% de bônus estético aplicado!`;
+		}
+
+		// Calcula o score com os valores finais
 		const score = calculateScore(flaccid, erect, girth, curvature);
 
+		const doctorName = getDoctorName(bot);
+
 		// Obtém um comentário baseado no score
-		const comment = getComment(score);
+		const comment = getComment(score, doctorName);
 
 		// Timestamp atual
 		const currentTimestamp = Date.now();
@@ -347,24 +446,30 @@ async function pintoCommand(bot, message, args, group) {
 			curvatureText = `${absCurvature.toFixed(1)}°, torto para direita`;
 		}
 
+		// Determina menção
+		const { targetJid, targetText } = extractFirstMention(message, args);
+
 		// Prepara a mensagem de resposta
-		const flavorText = generateFlavorText(userName);
+		const flavorText = generateFlavorText(userName, doctorName, targetText);
 		const response =
 			`${flavorText}\n\n` +
 			`• *Comprimento Flácido:* ${flaccid.toFixed(1)} cm\n` +
 			`• *Comprimento Ereto:* ${erect.toFixed(1)} cm\n` +
 			`• *Circunferência:* ${girth.toFixed(1)} cm\n` +
 			`• *Curvatura:* ${curvatureText}\n` +
-			`• *Score:* _${score} pontos_\n\n` +
+			`• *Score:* _${score} pontos_${donorBonusText}\n\n` +
 			`${comment}\n\n` +
 			`> Você pode voltar daqui a ${COOLDOWN_DAYS} dias para refazermos sua avaliação.`;
+
+		const mentionsList = targetJid ? [targetJid] : [];
 
 		return new ReturnMessage({
 			chatId: groupId,
 			content: response,
 			options: {
 				quotedMessageId: message.origin.id._serialized,
-				goReply: message.origin
+				goReply: message.origin,
+				mentions: mentionsList
 			}
 		});
 	} catch (error) {
@@ -391,15 +496,16 @@ async function pintoCommand(bot, message, args, group) {
  */
 async function pintoRankingCommand(bot, message, args, group) {
 	try {
-		// Verifica se está em um grupo
-		if (!message.group) {
-			return new ReturnMessage({
-				chatId: message.author,
-				content: "🏆 O ranking do jogo só pode ser visualizado em grupos."
-			});
-		}
+		const {
+			targetGroup,
+			responseChatId: chatId,
+			errorResponse
+		} = await GroupContextHelper.resolveGroup(bot, message, group, {
+			featureName: "o ranking do jogo"
+		});
+		if (errorResponse) return errorResponse;
 
-		const groupId = message.group;
+		const groupId = targetGroup.id;
 
 		// Obtém o ranking do banco de dados
 		const topPlayers = await database.dbAll(
@@ -416,15 +522,13 @@ async function pintoRankingCommand(bot, message, args, group) {
 
 		if (topPlayers.length === 0) {
 			return new ReturnMessage({
-				chatId: groupId,
-				content: "🏆 Ainda não há dados para o ranking neste grupo. Use !pinto para participar!"
+				chatId,
+				content: `🏆 Ainda não há dados para o ranking no grupo ${targetGroup.name || targetGroup.id}. Use !pinto para participar!`
 			});
 		}
 
 		// Prepara a mensagem de ranking
-		let rankingMessage = `🍆 *Ranking do Tamanho - ${group.name || "Grupo"}*
-
-`;
+		let rankingMessage = `🍆 *Ranking do Tamanho - ${targetGroup.name || "Grupo"}*\n\n`;
 
 		topPlayers.forEach((player, index) => {
 			const medal = index === 0 ? "🥇" : index === 1 ? "🥈" : index === 2 ? "🥉" : `${index + 1}.`;
@@ -488,33 +592,16 @@ async function pintoRankingCommand(bot, message, args, group) {
  */
 async function pintoResetCommand(bot, message, args, group) {
 	try {
-		// Verifica se está em um grupo
-		if (!message.group) {
-			return [
-				new ReturnMessage({
-					chatId: message.author,
-					content: "O reset do jogo só pode ser executado em grupos."
-				})
-			];
-		}
+		const {
+			targetGroup,
+			responseChatId: chatId,
+			errorResponse
+		} = await GroupContextHelper.resolveGroupAndAdmin(bot, message, group, {
+			featureName: "os dados do jogo"
+		});
+		if (errorResponse) return [errorResponse];
 
-		const groupId = message.group;
-		const userId = message.author;
-
-		// Verifica se o usuário é admin
-		const isAdmin = await bot.isUserAdminInGroup(userId, groupId);
-		if (!isAdmin) {
-			return [
-				new ReturnMessage({
-					chatId: groupId,
-					content: "⛔ Apenas administradores podem resetar os dados do jogo.",
-					options: {
-						quotedMessageId: message.origin.id._serialized,
-						goReply: message.origin
-					}
-				})
-			];
-		}
+		const groupId = targetGroup.id;
 
 		// Verifica quantos jogadores existem antes de deletar
 		const countResult = await database.dbGet(
@@ -531,10 +618,10 @@ async function pintoResetCommand(bot, message, args, group) {
 		if (numJogadores === 0) {
 			return [
 				new ReturnMessage({
-					chatId: groupId,
-					content: "⚠️ Não há dados do jogo para este grupo.",
+					chatId,
+					content: `⚠️ Não há dados do jogo para o grupo ${targetGroup.name || targetGroup.id}.`,
 					options: {
-						quotedMessageId: message.origin.id._serialized,
+						quotedMessageId: message.origin?.id?._serialized,
 						goReply: message.origin
 					}
 				})
@@ -542,7 +629,10 @@ async function pintoResetCommand(bot, message, args, group) {
 		}
 
 		// Obtém o ranking atual antes de resetar
-		const rankingMessage = await pintoRankingCommand(bot, message, args, group);
+		const rankingMessage = await pintoRankingCommand(bot, message, args, targetGroup);
+		if (rankingMessage && rankingMessage.chatId !== chatId) {
+			rankingMessage.chatId = chatId;
+		}
 
 		// Reseta os dados do grupo (Scores)
 		await database.dbRun(
@@ -557,10 +647,10 @@ async function pintoResetCommand(bot, message, args, group) {
 		return [
 			rankingMessage,
 			new ReturnMessage({
-				chatId: groupId,
-				content: `🔄 *Dados do Jogo Pinto Resetados*\n\nForam removidos dados de ${numJogadores} jogadores deste grupo.\n\nO ranking acima mostra como estava antes do reset.`,
+				chatId,
+				content: `🔄 *Dados do Jogo Pinto Resetados*\n\nForam removidos dados de ${numJogadores} jogadores do grupo ${targetGroup.name || targetGroup.id}.\n\nO ranking acima mostra como estava antes do reset.`,
 				options: {
-					quotedMessageId: message.origin.id._serialized,
+					quotedMessageId: message.origin?.id?._serialized,
 					goReply: message.origin
 				}
 			})
@@ -618,4 +708,75 @@ const commands = [
 	})
 ];
 
-module.exports = { commands };
+const helper = {
+	about: "Brincadeira de medição diária de tamanho com ranking cômico do grupo",
+	implementation:
+		"Gera tamanho randômico por algoritmo diário determinístico por usuário, com mensagens de humor e ranking SQLite",
+	tags: "pinto,tamanho,ranking,zoeira,brincadeira,diversao",
+	cmds: [
+		{
+			cmd: "!pinto",
+			desc: "Mede seu tamanho do dia e exibe seu resultado",
+			usage: ["!pinto"],
+			category: "zoeira"
+		},
+		{
+			cmd: "!pinto-ranking",
+			desc: "Exibe o ranking dos maiores e menores tamanhos do grupo",
+			usage: ["!pinto-ranking"],
+			category: "zoeira"
+		},
+		{
+			cmd: "!pinto-reset",
+			desc: "Reseta os registros do jogo no grupo (Apenas Administradores)",
+			usage: ["!pinto-reset"],
+			category: "zoeira"
+		}
+	]
+};
+
+/**
+ * Obtém o ranking semanal do PintoGame para o resumo semanal
+ * @param {number} sinceMs
+ * @returns {Promise<Array<Object>>}
+ */
+async function getWeeklyPintoStats(sinceMs) {
+	try {
+		const rows = await database.dbAll(
+			dbName,
+			`SELECT user_id,
+			        MAX(user_name) as user_name,
+			        MAX(erect) as erect,
+			        MAX(score) as score
+			 FROM pinto_history
+			 WHERE timestamp >= ?
+			   AND user_id NOT LIKE 'user_%'
+			   AND user_id NOT IN ('user1', 'user2', '5511999999999@s.whatsapp.net')
+			   AND user_id NOT LIKE 'user%@s.whatsapp.net'
+			   AND group_id != '123@g.us'
+			   AND group_id NOT LIKE 'test_%'
+			   AND group_id != 'group1'
+			   AND group_id NOT LIKE 'grp%'
+			   AND group_id != 'SEU_GROUP_ID_AQUI@g.us'
+			 GROUP BY user_id
+			 ORDER BY score DESC, erect DESC
+			 LIMIT 10`,
+			[sinceMs]
+		);
+		return (rows || []).map((r) => ({
+			user_id: r.user_id,
+			user_name: r.user_name || "Jogador",
+			erect: Number(r.erect) || 0,
+			score: Number(r.score) || 0
+		}));
+	} catch (error) {
+		logger.error("Erro ao buscar estatísticas semanais do PintoGame:", error);
+		return [];
+	}
+}
+
+module.exports = {
+	helper,
+	commands,
+	getWeeklyPintoStats
+};

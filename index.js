@@ -17,11 +17,15 @@ const ytdlUpdater = require("./src/utils/YtdlUpdater");
 const BotAPI = require("./src/BotAPI");
 const Database = require("./src/utils/Database");
 const StabilityMonitor = require("./src/services/StabilityMonitor");
+const ProfileStatusScheduler = require("./src/services/ProfileStatusScheduler");
+const LLMDailyReportService = require("./src/services/LLMDailyReportService");
+const ChatCleanerScheduler = require("./src/services/ChatCleanerScheduler");
 const fs = require("fs");
 const crypto = require("crypto");
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const CurrencyConverter = require("./src/utils/CurrencyConverter");
+const PhoneUtils = require("./src/utils/PhoneUtils");
 
 /**
  * Exemplo de criação de múltiplas instâncias de bot
@@ -36,6 +40,9 @@ async function main() {
 	const logger = new Logger("main");
 	const botInstances = [];
 	let botAPI;
+	let statusScheduler;
+	let llmDailyReportService;
+	let chatCleanerScheduler;
 
 	try {
 		const disableActivity = process.env.DISABLE_ACTIVITY === "true";
@@ -83,12 +90,20 @@ async function main() {
 		const whitelistSet = new Set();
 
 		// Add super admins
-		superAdmins.forEach((admin) => whitelistSet.add(admin.replace(/\D/g, "")));
+		superAdmins.forEach((admin) => {
+			const clean = PhoneUtils.cleanPhone(admin);
+			if (clean) {
+				PhoneUtils.getPhoneVariants(clean).forEach((v) => whitelistSet.add(v));
+			}
+		});
 
 		// Add donors
 		donations.forEach((donor) => {
 			if (donor.numero) {
-				whitelistSet.add(donor.numero.replace(/\D/g, ""));
+				const clean = PhoneUtils.cleanPhone(donor.numero);
+				if (clean) {
+					PhoneUtils.getPhoneVariants(clean).forEach((v) => whitelistSet.add(v));
+				}
 			}
 		});
 
@@ -98,6 +113,11 @@ async function main() {
 		let redisDbAtual = 0;
 		for (const rBot of rBots) {
 			if (!rBot.enabled) continue;
+
+			// Fallback de dossieGroups para grupoLogs caso não informado no bots.json
+			if (!rBot.dossieGroups) {
+				rBot.dossieGroups = rBot.dossieGroup ?? rBot.grupoLogs;
+			}
 
 			let newRBot;
 			if (rBot.useTelegram) {
@@ -119,6 +139,11 @@ async function main() {
 
 					// IDs dos canais para notificações - do .env
 					grupoLogs: process.env.TELEGRAM_GRUPO_LOGS,
+					dossieGroups:
+						rBot.dossieGroups ??
+						rBot.grupoLogs ??
+						process.env.TELEGRAM_GRUPO_DOSSIES ??
+						process.env.TELEGRAM_GRUPO_LOGS,
 					grupoAvisos: process.env.TELEGRAM_GRUPO_AVISOS,
 					notificarDonate: rBot.notificarDonate ?? false,
 
@@ -131,7 +156,8 @@ async function main() {
 					updateStatus: rBot.updateStatus ?? true,
 					aiPersonality: rBot.aiPersonality ?? "",
 					nomeExibir: rBot.nomeExibir,
-					sendJoinInfo: rBot.sendJoinInfo
+					sendJoinInfo: rBot.sendJoinInfo,
+					extras: rBot.extras ?? {}
 				});
 
 				redisDbAtual++;
@@ -152,6 +178,11 @@ async function main() {
 
 					// IDs dos canais para notificações - do .env
 					grupoLogs: process.env.GRUPO_LOGS_DISCORD,
+					dossieGroups:
+						rBot.dossieGroups ??
+						rBot.grupoLogs ??
+						process.env.GRUPO_DOSSIES_DISCORD ??
+						process.env.GRUPO_LOGS_DISCORD,
 					grupoAvisos: process.env.GRUPO_AVISOS_DISCORD,
 					notificarDonate: rBot.notificarDonate ?? false,
 
@@ -164,7 +195,8 @@ async function main() {
 					updateStatus: rBot.updateStatus ?? true,
 					aiPersonality: rBot.aiPersonality ?? "",
 					nomeExibir: rBot.nomeExibir,
-					sendJoinInfo: rBot.sendJoinInfo
+					sendJoinInfo: rBot.sendJoinInfo,
+					extras: rBot.extras ?? {}
 				});
 
 				redisDbAtual++;
@@ -202,6 +234,11 @@ async function main() {
 					// IDs dos grupos para notificações da comunidade
 					grupoEstabilidade: rBot.grupoEstabilidade ?? process.env.GRUPO_ESTABILIDADE,
 					grupoLogs: rBot.grupoLogs ?? process.env.GRUPO_LOGS,
+					dossieGroups:
+						rBot.dossieGroups ??
+						rBot.grupoLogs ??
+						process.env.GRUPO_DOSSIES ??
+						process.env.GRUPO_LOGS,
 					grupoInvites: rBot.grupoInvites ?? process.env.GRUPO_INVITES,
 					grupoAvisos: rBot.grupoAvisos ?? process.env.GRUPO_AVISOS,
 					grupoAnuncios: rBot.grupoAnuncios ?? process.env.GRUPO_ANUNCIOS,
@@ -224,7 +261,9 @@ async function main() {
 					updateStatus: rBot.updateStatus ?? true,
 					aiPersonality: rBot.aiPersonality ?? "",
 					nomeExibir: rBot.nomeExibir,
-					sendJoinInfo: rBot.sendJoinInfo
+					deleteMessagesInterval: rBot.deleteMessagesInterval ?? false,
+					sendJoinInfo: rBot.sendJoinInfo,
+					extras: rBot.extras ?? {}
 				});
 
 				redisDbAtual++;
@@ -236,7 +275,38 @@ async function main() {
 			botInstances.push(newRBot);
 		}
 
+		database.botInstances = botInstances;
 		logger.info("Todos os bots inicializados e rodando");
+
+		// Inicializa scheduler para escalonar (stagger) atualização de status dos bots a cada 5 minutos
+		statusScheduler = ProfileStatusScheduler.getInstance({
+			bots: botInstances
+		});
+		if (!disableActivity) {
+			statusScheduler.start();
+		}
+
+		// Inicializa serviço de relatório diário de LLM (22:00 BRT)
+		llmDailyReportService = LLMDailyReportService.getInstance();
+		if (!disableActivity) {
+			llmDailyReportService.start();
+		}
+
+		// Inicializa serviço de resumo semanal dos jogos (Domingo 22:00 BRT)
+		const WeeklyGameDigestService = require("./src/services/WeeklyGameDigestService");
+		const weeklyDigestService = WeeklyGameDigestService.getInstance();
+		botInstances.forEach((b) => weeklyDigestService.registerBot(b));
+		if (!disableActivity) {
+			weeklyDigestService.start();
+		}
+
+		// Inicializa scheduler de limpeza automática de mensagens (ClearChat - 03:30 BRT)
+		chatCleanerScheduler = ChatCleanerScheduler.getInstance({
+			bots: botInstances
+		});
+		if (!disableActivity) {
+			chatCleanerScheduler.start();
+		}
 
 		// Inicializa servidor da API
 		botAPI = new BotAPI({
@@ -265,6 +335,16 @@ async function main() {
 			logger.error("Encerramento excedeu o tempo limite, forcando saida.");
 			process.exit(1);
 		}, 25000).unref();
+
+		// Para o scheduler de status
+		if (statusScheduler) {
+			statusScheduler.stop();
+		}
+
+		// Para o scheduler de relatório diário de LLM
+		if (llmDailyReportService) {
+			llmDailyReportService.stop();
+		}
 
 		// 1. Para o servidor API primeiro para não aceitar novas conexões
 		if (botAPI) {

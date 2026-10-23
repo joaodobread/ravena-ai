@@ -1,6 +1,7 @@
 const Redis = require("ioredis");
 const Logger = require("../utils/Logger");
 const Database = require("../utils/Database");
+const { safeJsonParse } = require("../utils/JsonUtils");
 
 const CACHE_CONFIG = {
 	pushName: { ttl: 30 * 24 * 60 * 60, table: "pushnames" }, // 30 days
@@ -133,6 +134,9 @@ class CacheManager {
 		// Start cleanup timer (every hour)
 		this.cleanupTimer = setInterval(() => this.cleanExpired(), 60 * 60 * 1000);
 
+		// Start vacuum timer (every 6 hours)
+		this.vacuumTimer = setInterval(() => this.runVacuum(), 6 * 60 * 60 * 1000);
+
 		// Setup shutdown hook
 		this.setupShutdown();
 
@@ -197,7 +201,7 @@ class CacheManager {
 					return { id: key, pushName: row[valCol] };
 				}
 
-				return JSON.parse(row[valCol]);
+				return safeJsonParse(row[valCol]);
 			}
 			return null;
 		} catch (e) {
@@ -300,11 +304,20 @@ class CacheManager {
 			for (const table of tables) {
 				await this.database.dbRun(this.DB_NAME, `DELETE FROM ${table} WHERE expires_at < ?`, [now]);
 			}
-
-			// Reclaim empty space from deleted records incrementally (1000 pages = ~4MB per hour)
-			await this.database.dbRun(this.DB_NAME, "PRAGMA incremental_vacuum(1000)");
 		} catch (e) {
 			this.logger.error("Error cleaning expired cache:", e);
+		}
+	}
+
+	/**
+	 * Run periodic incremental vacuum every 6 hours to reclaim disk space
+	 */
+	async runVacuum() {
+		try {
+			this.logger.info("CacheManager: Running scheduled vacuum (incremental)...");
+			await this.database.dbRun(this.DB_NAME, "PRAGMA incremental_vacuum(5000)");
+		} catch (e) {
+			this.logger.error("CacheManager: Error during scheduled vacuum:", e);
 		}
 	}
 
@@ -323,7 +336,9 @@ class CacheManager {
 			try {
 				await this.redisClient.set(redisKey, JSON.stringify(data), "EX", ttl);
 				return;
-			} catch (err) {}
+			} catch (err) {
+				this.logger.debug("Redis operation error:", err.message);
+			}
 		}
 
 		// Memory
@@ -343,8 +358,10 @@ class CacheManager {
 		if (this.redisClient) {
 			try {
 				const cached = await this.redisClient.get(redisKey);
-				if (cached) return JSON.parse(cached);
-			} catch (err) {}
+				if (cached) return safeJsonParse(cached);
+			} catch (err) {
+				this.logger.debug("Redis operation error:", err.message);
+			}
 		}
 
 		// Memory
@@ -374,7 +391,9 @@ class CacheManager {
 			try {
 				await this.redisClient.set(redisKey, JSON.stringify(data), "EX", ttl);
 				return;
-			} catch (err) {}
+			} catch (err) {
+				this.logger.debug("Redis operation error:", err.message);
+			}
 		}
 
 		this.chatCache.push(data);
@@ -391,8 +410,10 @@ class CacheManager {
 		if (this.redisClient) {
 			try {
 				const cached = await this.redisClient.get(redisKey);
-				if (cached) return JSON.parse(cached);
-			} catch (err) {}
+				if (cached) return safeJsonParse(cached);
+			} catch (err) {
+				this.logger.debug("Redis operation error:", err.message);
+			}
 		}
 
 		const memItem = this.chatCache.find((m) => m.key && m.key.id == id);
@@ -420,7 +441,9 @@ class CacheManager {
 			try {
 				await this.redisClient.set(redisKey, JSON.stringify(data), "EX", ttl);
 				return;
-			} catch (err) {}
+			} catch (err) {
+				this.logger.debug("Redis operation error:", err.message);
+			}
 		}
 
 		this.messageCache.push(data);
@@ -441,7 +464,9 @@ class CacheManager {
 			try {
 				await this.redisClient.set(redisKey, JSON.stringify(key), "EX", ttl);
 				return;
-			} catch (err) {}
+			} catch (err) {
+				this.logger.debug("Redis operation error:", err.message);
+			}
 		}
 
 		this.messageCache.push(key);
@@ -458,8 +483,10 @@ class CacheManager {
 		if (this.redisClient) {
 			try {
 				const cached = await this.redisClient.get(redisKey);
-				if (cached) return JSON.parse(cached);
-			} catch (err) {}
+				if (cached) return safeJsonParse(cached);
+			} catch (err) {
+				this.logger.debug("Redis operation error:", err.message);
+			}
 		}
 
 		const memItem = this.messageCache.find((m) => m.key && m.key.id == id);
@@ -487,7 +514,9 @@ class CacheManager {
 			try {
 				await this.redisClient.set(redisKey, JSON.stringify(data), "EX", ttl);
 				return;
-			} catch (err) {}
+			} catch (err) {
+				this.logger.debug("Redis operation error:", err.message);
+			}
 		}
 
 		this.messageCache.push(data);
@@ -509,7 +538,9 @@ class CacheManager {
 			try {
 				await this.redisClient.set(redisKey, JSON.stringify(message), "EX", ttl);
 				return;
-			} catch (err) {}
+			} catch (err) {
+				this.logger.debug("Redis operation error:", err.message);
+			}
 		}
 
 		this.messageCache.push(message);
@@ -526,8 +557,10 @@ class CacheManager {
 		if (this.redisClient) {
 			try {
 				const cached = await this.redisClient.get(redisKey);
-				if (cached) return JSON.parse(cached);
-			} catch (err) {}
+				if (cached) return safeJsonParse(cached);
+			} catch (err) {
+				this.logger.debug("Redis operation error:", err.message);
+			}
 		}
 
 		const memItem = this.messageCache.find((m) => m.id == id || (m.key && m.key.id == id));
@@ -554,7 +587,9 @@ class CacheManager {
 			try {
 				await this.redisClient.set(redisKey, JSON.stringify(data), "EX", ttl);
 				return;
-			} catch (err) {}
+			} catch (err) {
+				this.logger.debug("Redis operation error:", err.message);
+			}
 		}
 
 		this.contactCache.push(data);
@@ -571,8 +606,10 @@ class CacheManager {
 		if (this.redisClient) {
 			try {
 				const cached = await this.redisClient.get(redisKey);
-				if (cached) return JSON.parse(cached);
-			} catch (err) {}
+				if (cached) return safeJsonParse(cached);
+			} catch (err) {
+				this.logger.debug("Redis operation error:", err.message);
+			}
 		}
 
 		const memItem = this.contactCache.find((c) => c.number == id);
@@ -598,7 +635,9 @@ class CacheManager {
 			try {
 				await this.redisClient.set(redisKey, name, "EX", ttl);
 				return;
-			} catch (err) {}
+			} catch (err) {
+				this.logger.debug("Redis operation error:", err.message);
+			}
 		}
 
 		const existingIndex = this.telegramNameCache.findIndex((i) => i.id === userId);
@@ -620,7 +659,9 @@ class CacheManager {
 			try {
 				const cachedName = await this.redisClient.get(redisKey);
 				if (cachedName) return cachedName;
-			} catch (err) {}
+			} catch (err) {
+				this.logger.debug("Redis operation error:", err.message);
+			}
 		}
 
 		const item = this.telegramNameCache.find((i) => i.id === userId);
@@ -646,7 +687,7 @@ class CacheManager {
 		if (this.redisClient) {
 			try {
 				const cachedData = await this.redisClient.get(redisKey);
-				if (cachedData) return JSON.parse(cachedData);
+				if (cachedData) return safeJsonParse(cachedData, {});
 			} catch (err) {
 				this.logger.error(`Error retrieving cooldowns from Redis: ${err.message}`);
 			}
