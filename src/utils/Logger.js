@@ -2,6 +2,88 @@ const fs = require("fs");
 const path = require("path");
 const util = require("util");
 
+const LOG_DIR = path.join(__dirname, "../../logs");
+const FLUSH_INTERVAL_MS = 250;
+const MAX_BUFFER_BYTES = 256 * 1024;
+
+const today = () => new Date().toISOString().split("T")[0]; // YYYY-MM-DD
+
+/**
+ * Arquivos de log compartilhados por nome: dezenas de Loggers com o mesmo nome
+ * usam um unico descritor, um buffer e uma unica rotacao.
+ * @type {Map<string, {fd: number|null, date: string, buffer: string[], size: number}>}
+ */
+const sinks = new Map();
+let flushTimer = null;
+let dirReady = false;
+
+function ensureLogDirectory() {
+	if (dirReady) return;
+	if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
+	dirReady = true;
+}
+
+function openSink(name, sink) {
+	if (sink.fd !== null) {
+		try {
+			fs.closeSync(sink.fd);
+		} catch (error) {
+			console.error("Erro ao fechar arquivo de log:", error);
+		}
+		sink.fd = null;
+	}
+	try {
+		sink.fd = fs.openSync(path.join(LOG_DIR, `${sink.date}-${name}.log`), "a");
+	} catch (error) {
+		console.error("Erro ao abrir arquivo de log:", error);
+	}
+}
+
+function flushSink(name, sink) {
+	if (sink.buffer.length === 0) return;
+	const chunk = sink.buffer.join("");
+	sink.buffer = [];
+	sink.size = 0;
+	if (sink.fd === null) return;
+	try {
+		fs.writeSync(sink.fd, chunk);
+	} catch (error) {
+		console.error("Erro ao escrever no arquivo de log:", error);
+		openSink(name, sink); // tenta reabrir; o lote perdido nao e reenviado
+	}
+}
+
+function flushAll() {
+	for (const [name, sink] of sinks) flushSink(name, sink);
+}
+
+function tick() {
+	const date = today();
+	for (const [name, sink] of sinks) {
+		flushSink(name, sink);
+		if (sink.date !== date) {
+			sink.date = date;
+			openSink(name, sink);
+		}
+	}
+}
+
+function getSink(name) {
+	let sink = sinks.get(name);
+	if (!sink) {
+		ensureLogDirectory();
+		sink = { fd: null, date: today(), buffer: [], size: 0 };
+		sinks.set(name, sink);
+		openSink(name, sink);
+		if (!flushTimer) {
+			flushTimer = setInterval(tick, FLUSH_INTERVAL_MS);
+			flushTimer.unref();
+			process.on("exit", flushAll);
+		}
+	}
+	return sink;
+}
+
 /**
  * Utilitário de Logger para registrar mensagens no console e arquivo
  */
@@ -12,72 +94,8 @@ class Logger {
 	 */
 	constructor(name) {
 		this.name = name;
-		this.logDir = path.join(__dirname, "../../logs");
-		this.currentDate = new Date().toISOString().split("T")[0]; // YYYY-MM-DD
-		this.logFile = null;
 		this.debugMode = process.env.DEBUG === "true";
-
-		// Cria diretório de log se não existir
-		this.ensureLogDirectory();
-
-		// Abre arquivo de log
-		this.openLogFile();
-
-		// Configura rotação à meia-noite
-		this.setupRotation();
-	}
-
-	/**
-	 * Garante que o diretório de log exista
-	 */
-	ensureLogDirectory() {
-		if (!fs.existsSync(this.logDir)) {
-			fs.mkdirSync(this.logDir, { recursive: true });
-		}
-	}
-
-	/**
-	 * Abre arquivo de log
-	 */
-	openLogFile() {
-		const logFileName = `${this.currentDate}-${this.name}.log`;
-		const logFilePath = path.join(this.logDir, logFileName);
-
-		// Fecha arquivo existente se estiver aberto
-		if (this.logFile) {
-			try {
-				fs.closeSync(this.logFile);
-			} catch (error) {
-				console.error("Erro ao fechar arquivo de log:", error);
-			}
-		}
-
-		// Abre novo arquivo para anexar
-		try {
-			this.logFile = fs.openSync(logFilePath, "a");
-		} catch (error) {
-			console.error("Erro ao abrir arquivo de log:", error);
-			this.logFile = null;
-		}
-	}
-
-	/**
-	 * Configura rotação de logs à meia-noite
-	 */
-	setupRotation() {
-		const now = new Date();
-		const tomorrow = new Date(now);
-		tomorrow.setDate(now.getDate() + 1);
-		tomorrow.setHours(0, 0, 0, 0);
-
-		const timeUntilMidnight = tomorrow - now;
-
-		// Define timeout para rotacionar logs à meia-noite
-		setTimeout(() => {
-			this.currentDate = new Date().toISOString().split("T")[0];
-			this.openLogFile();
-			this.setupRotation(); // Configura próxima rotação
-		}, timeUntilMidnight);
+		this.sink = getSink(name);
 	}
 
 	/**
@@ -118,15 +136,10 @@ class Logger {
 		console[consoleMethod](logMessage);
 
 		// Registra no arquivo
-		if (this.logFile) {
-			try {
-				fs.writeSync(this.logFile, logMessage + "\n");
-			} catch (error) {
-				console.error("Erro ao escrever no arquivo de log:", error);
-				// Tenta reabrir arquivo de log
-				this.openLogFile();
-			}
-		}
+		const sink = this.sink;
+		sink.buffer.push(logMessage + "\n");
+		sink.size += logMessage.length;
+		if (sink.size >= MAX_BUFFER_BYTES) flushSink(this.name, sink);
 	}
 
 	/**
