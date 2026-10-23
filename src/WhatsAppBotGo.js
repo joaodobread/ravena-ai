@@ -1,5 +1,3 @@
-const qrcode = require("qrcode-terminal");
-const qrimg = require("qr-image");
 const { randomBytes } = require("crypto");
 const imagemagick = require("imagemagick");
 const ffmpeg = require("fluent-ffmpeg");

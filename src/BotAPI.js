@@ -11,7 +11,6 @@ const upload = multer({
 	limits: { fileSize: 50 * 1024 * 1024 }
 });
 const fs = require("fs").promises;
-const qrcode = require("qr-base64");
 const { exec, spawn } = require("child_process");
 const axios = require("axios");
 const WebManagement = require("./utils/WebManagement");
