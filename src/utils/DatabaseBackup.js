@@ -104,6 +104,8 @@ class DatabaseBackup {
 					const items = fs.readdirSync(target);
 					for (const item of items) {
 						if (backedUpFiles.has(item)) continue; // Already backed up safely
+						// -wal/-shm/-journal de bancos ja copiados via backup online ja estao incluidos nele
+						if (backedUpFiles.has(item.replace(/-(wal|shm|journal)$/, ""))) continue;
 						this.backupDirectory(path.join(target, item), path.join(dest, item));
 					}
 				}
