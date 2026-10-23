@@ -1,6 +1,10 @@
 // Carrega variáveis de ambiente do arquivo .env
 require("dotenv").config();
 
+// Axios nao tem timeout por padrao: uma API externa travada deixaria o comando pendurado para sempre.
+// O timeout do axios (Node) e de inatividade do socket, entao downloads grandes que fluem nao sao afetados.
+require("axios").defaults.timeout = parseInt(process.env.HTTP_DEFAULT_TIMEOUT_MS, 10) || 60000;
+
 const TelegramBot = require("./src/TelegramBot");
 const WhatsAppBotGo = require("./src/WhatsAppBotGo");
 const DiscordBot = require("./src/DiscordBot");

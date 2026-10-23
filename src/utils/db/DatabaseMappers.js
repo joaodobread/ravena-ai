@@ -26,6 +26,7 @@ class DatabaseMappers {
 
 		this.databasePath = path.join(__dirname, "../../../data");
 		this.connections = {}; // name → better-sqlite3 Database instance
+		this._stmtCache = new WeakMap(); // conn → Map(sql → statement)
 	}
 
 	// ---------------------------------------------------------------------------
@@ -210,6 +211,28 @@ class DatabaseMappers {
 	// ---------------------------------------------------------------------------
 
 	/**
+	 * Returns a prepared statement, reusing it per connection (preparing is the costly part).
+	 * The cache is tied to the connection object, so reopening a connection drops it automatically.
+	 * @param {Object} conn - better-sqlite3 connection
+	 * @param {string} sql
+	 */
+	_prepare(conn, sql) {
+		let cache = this._stmtCache.get(conn);
+		if (!cache) {
+			cache = new Map();
+			this._stmtCache.set(conn, cache);
+		}
+		let stmt = cache.get(sql);
+		if (!stmt) {
+			stmt = conn.prepare(sql);
+			// SQL dinamico (ex.: IN com N placeholders) nao pode crescer sem limite
+			if (cache.size >= 500) cache.delete(cache.keys().next().value);
+			cache.set(sql, stmt);
+		}
+		return stmt;
+	}
+
+	/**
 	 * Execute a write statement (INSERT / UPDATE / DELETE / CREATE …).
 	 * @param {string} name - Database name
 	 * @param {string} sql
@@ -219,7 +242,7 @@ class DatabaseMappers {
 	run(name, sql, params = []) {
 		try {
 			const conn = this.getConnection(name);
-			const stmt = conn.prepare(sql);
+			const stmt = this._prepare(conn, sql);
 			return Array.isArray(params) ? stmt.run(...params) : stmt.run(params);
 		} catch (err) {
 			this._handleError(name, err);
@@ -237,7 +260,7 @@ class DatabaseMappers {
 	get(name, sql, params = []) {
 		try {
 			const conn = this.getConnection(name);
-			const stmt = conn.prepare(sql);
+			const stmt = this._prepare(conn, sql);
 			return Array.isArray(params) ? stmt.get(...params) : stmt.get(params);
 		} catch (err) {
 			this._handleError(name, err);
@@ -255,7 +278,7 @@ class DatabaseMappers {
 	all(name, sql, params = []) {
 		try {
 			const conn = this.getConnection(name);
-			const stmt = conn.prepare(sql);
+			const stmt = this._prepare(conn, sql);
 			return Array.isArray(params) ? stmt.all(...params) : stmt.all(params);
 		} catch (err) {
 			this._handleError(name, err);
