@@ -26,9 +26,7 @@ RUN --mount=type=cache,id=s/ff036bb5-ef37-42a1-b695-b45e0e6b362f-/var/cache/apt,
     libpango1.0-dev \
     libjpeg-dev \
     libgif-dev \
-    librsvg2-dev \
-    && curl -sSL https://dl.min.io/client/mc/release/linux-amd64/mc -o /usr/local/bin/mc \
-    && chmod +x /usr/local/bin/mc
+    librsvg2-dev
 
 # Set working directory
 WORKDIR /app

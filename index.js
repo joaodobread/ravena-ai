@@ -12,7 +12,6 @@ const ytdlUpdater = require("./src/utils/YtdlUpdater");
 
 const BotAPI = require("./src/BotAPI");
 const Database = require("./src/utils/Database");
-const minioSetup = require("./src/utils/MinioSetup");
 const StabilityMonitor = require("./src/services/StabilityMonitor");
 const fs = require("fs");
 const crypto = require("crypto");
@@ -26,9 +25,6 @@ const CurrencyConverter = require("./src/utils/CurrencyConverter");
 async function main() {
 	logCleaner.start();
 	ytdlUpdater.start();
-
-	// Configura políticas de retenção do MinIO (Background)
-	minioSetup.init().catch((err) => console.error("[MinioSetup Error]", err));
 
 	// Atualiza cotação do dólar na inicialização
 	await CurrencyConverter.updateRate();
@@ -306,16 +302,15 @@ async function main() {
 	process.on("SIGINT", () => shutdown("SIGINT"));
 	process.on("SIGTERM", () => shutdown("SIGTERM"));
 
-	process.on("unhandledRejection", (reason, p) => {
+	process.on("unhandledRejection", (reason) => {
 		logger.warn("---- Rejection não tratada ");
-		logger.warn(p);
-		logger.warn(reason.stack);
+		logger.warn(reason instanceof Error ? reason.stack : String(reason));
 		logger.warn("---- Fim ");
 	});
 
 	process.on("uncaughtException", (err) => {
 		logger.error("---- Erro Não tratado ");
-		logger.error(err.stack);
+		logger.error(err instanceof Error ? err.stack : String(err));
 		logger.error("---- Fim ");
 	});
 }

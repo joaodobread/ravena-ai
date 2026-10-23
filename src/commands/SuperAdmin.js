@@ -5,7 +5,7 @@ const Database = require("../utils/Database");
 const ReturnMessage = require("../models/ReturnMessage");
 const AdminUtils = require("../utils/AdminUtils");
 const LLMService = require("../services/LLMService");
-const { exec } = require("child_process");
+const { execFile } = require("child_process");
 
 /**
  * Manipula comandos super admin (apenas para admins do sistema)
@@ -161,10 +161,11 @@ class SuperAdmin {
 		try {
 			if (!this.isSuperAdmin(message.author)) return;
 			if (args[0]) {
-				// Mac tem 17 caracteres
 				const macAddress = args[0].trim();
-				if (macAddress.length === 17) {
-					exec(`wakeonlan ${macAddress}`);
+				if (/^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$/.test(macAddress)) {
+					execFile("wakeonlan", [macAddress], (err) => {
+						if (err) this.logger.error(`Erro ao enviar magic packet para ${macAddress}:`, err);
+					});
 					return new ReturnMessage({
 						chatId: message.group ?? message.author,
 						content: `✅ Sending magic packet to 255.255.255.255:9 with ${macAddress}`

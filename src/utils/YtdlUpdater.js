@@ -1,4 +1,4 @@
-const { exec } = require("child_process");
+const { execFile } = require("child_process");
 const path = require("path");
 const cron = require("node-cron");
 const Logger = require("./Logger");
@@ -12,7 +12,7 @@ const scriptPath = path.resolve(__dirname, "..", "..", "update-ytdl.sh");
 function runUpdate() {
 	return new Promise((resolve, reject) => {
 		logger.info("Starting yt-dlp update process...");
-		exec(`bash "${scriptPath}"`, (error, stdout, stderr) => {
+		execFile("bash", [scriptPath], (error, stdout, stderr) => {
 			if (error) {
 				logger.error(`Error updating yt-dlp: ${error.message}`);
 				return reject(error);
