@@ -254,8 +254,17 @@ async function main() {
 	}
 
 	// Manipula encerramento do programa sequencialmente para evitar corrupção de arquivos
+	let shuttingDown = false;
 	const shutdown = async (signal) => {
+		if (shuttingDown) return;
+		shuttingDown = true;
 		logger.info(`Desligando bots e servidor API (${signal})...`);
+
+		// Garante que o processo termina mesmo se algum passo travar (o Railway manda SIGKILL apos ~10s)
+		setTimeout(() => {
+			logger.error("Encerramento excedeu o tempo limite, forcando saida.");
+			process.exit(1);
+		}, 25000).unref();
 
 		// 1. Para o servidor API primeiro para não aceitar novas conexões
 		if (botAPI) {
