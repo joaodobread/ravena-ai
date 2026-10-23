@@ -2,7 +2,7 @@ const fs = require("fs");
 const path = require("path");
 const mysql = require("mysql2/promise");
 const Logger = require("./Logger");
-const sqlite3 = require("sqlite3").verbose();
+const BetterSQLite = require("better-sqlite3");
 
 class DatabaseBackup {
 	constructor(databaseInstance) {
@@ -297,7 +297,7 @@ class DatabaseBackup {
 			if (!db) {
 				const dbPath = path.join(this.databasePath, "sqlites", `${dbName}.db`);
 				if (!fs.existsSync(dbPath)) return;
-				db = new sqlite3.Database(dbPath);
+				db = new BetterSQLite(dbPath, { readonly: true, timeout: 5000 });
 				temporary = true;
 			}
 
@@ -317,28 +317,28 @@ class DatabaseBackup {
 		}
 	}
 
+	/**
+	 * Executa um SELECT em uma conexão better-sqlite3 pura ou no Sqlite3MockWrapper
+	 * (que delega para as conexões gerenciadas pelo DatabaseMappers).
+	 */
+	queryAll(db, sql, params = []) {
+		if (db.mappers) return db.mappers.all(db.name, sql, params);
+		return db.prepare(sql).all(...params);
+	}
+
 	async getTables(db) {
-		return new Promise((resolve, reject) => {
-			db.all("SELECT name FROM sqlite_master WHERE type='table'", (err, rows) => {
-				if (err) reject(err);
-				else resolve(rows.map((r) => r.name));
-			});
-		});
+		return this.queryAll(db, "SELECT name FROM sqlite_master WHERE type='table'").map(
+			(r) => r.name
+		);
 	}
 
 	async getPrimaryKeys(db, tableName) {
-		return new Promise((resolve, reject) => {
-			db.all(`PRAGMA table_info(${tableName})`, (err, rows) => {
-				if (err) reject(err);
-				else {
-					const pks = rows
-						.filter((r) => r.pk > 0)
-						.sort((a, b) => a.pk - b.pk)
-						.map((r) => r.name);
-					resolve(pks.length > 0 ? pks : ["rowid"]);
-				}
-			});
-		});
+		const rows = this.queryAll(db, `PRAGMA table_info(${tableName})`);
+		const pks = rows
+			.filter((r) => r.pk > 0)
+			.sort((a, b) => a.pk - b.pk)
+			.map((r) => r.name);
+		return pks.length > 0 ? pks : ["rowid"];
 	}
 
 	async syncTable(sqliteDb, tableName, pks, remoteConn) {
@@ -346,12 +346,7 @@ class DatabaseBackup {
 			const createSql = await this.getRemoteCreateStatement(sqliteDb, tableName, pks);
 			await remoteConn.execute(createSql);
 
-			const rows = await new Promise((resolve, reject) => {
-				sqliteDb.all(`SELECT * FROM ${tableName}`, (err, rows) => {
-					if (err) reject(err);
-					else resolve(rows);
-				});
-			});
+			const rows = this.queryAll(sqliteDb, `SELECT * FROM ${tableName}`);
 
 			if (rows.length === 0) {
 				this.logger.debug(`Table ${tableName}: No rows to sync.`);
@@ -375,12 +370,7 @@ class DatabaseBackup {
 	}
 
 	async getRemoteCreateStatement(sqliteDb, tableName, pks) {
-		const info = await new Promise((resolve, reject) => {
-			sqliteDb.all(`PRAGMA table_info(${tableName})`, (err, rows) => {
-				if (err) reject(err);
-				else resolve(rows);
-			});
-		});
+		const info = this.queryAll(sqliteDb, `PRAGMA table_info(${tableName})`);
 
 		const columns = info.map((col) => {
 			let type = "TEXT";
@@ -445,7 +435,6 @@ class DatabaseBackup {
 	 * @returns {boolean} - True if healthy
 	 */
 	isBackupFileHealthy(filePath) {
-		const BetterSQLite = require("better-sqlite3");
 		let conn;
 		try {
 			conn = new BetterSQLite(filePath, { readonly: true, timeout: 2000 });
@@ -630,23 +619,18 @@ ${err.message}`);
 
 				// Create a new empty SQLite to populate
 				if (fs.existsSync(dbPath)) fs.unlinkSync(dbPath);
-				newDb = new sqlite3.Database(dbPath);
+				newDb = new BetterSQLite(dbPath);
 
 				// 1. Initialize schema
 				if (schema) {
 					const schemaStatements = schema.split(";").filter((s) => s.trim() !== "");
-					await new Promise((resolve, reject) => {
-						newDb.serialize(() => {
-							for (const stmt of schemaStatements) {
-								newDb.run(stmt, (err) => {
-									if (err) {
-										this.logger.error(`Error initializing schema statement: ${stmt}`, err);
-									}
-								});
-							}
-							resolve();
-						});
-					});
+					for (const stmt of schemaStatements) {
+						try {
+							newDb.exec(stmt);
+						} catch (err) {
+							this.logger.error(`Error initializing schema statement: ${stmt}`, err);
+						}
+					}
 				}
 
 				// 2. Identify tables relevant to this DB
@@ -683,14 +667,16 @@ ${err.message}`);
 					}
 				}
 
-				await new Promise((resolve) => newDb.close(() => resolve()));
+				newDb.close();
 				await connection.end();
 				this.logger.info(`Cloud restoration successful for ${dbName} from ${serverUri}`);
 				return true;
 			} catch (e) {
 				this.logger.error(`Cloud restore failed from ${serverUri}:`, e);
-				if (newDb) {
-					await new Promise((resolve) => newDb.close(() => resolve()));
+				if (newDb && newDb.open) {
+					try {
+						newDb.close();
+					} catch (err) {}
 				}
 				if (connection) {
 					try {
@@ -714,24 +700,20 @@ ${err.message}`);
 
 		const sql = `INSERT INTO \`${tableName}\` (${columns}) VALUES (${placeholders})`;
 
-		return new Promise((resolve, reject) => {
-			sqliteDb.serialize(() => {
-				sqliteDb.run("BEGIN TRANSACTION");
-				const stmt = sqliteDb.prepare(sql);
-				for (const row of rows) {
-					stmt.run(keys.map((k) => row[k]));
-				}
-				stmt.finalize();
-				sqliteDb.run("COMMIT", (err) => {
-					if (err) {
-						sqliteDb.run("ROLLBACK");
-						reject(err);
-					} else {
-						resolve();
-					}
-				});
-			});
+		const stmt = sqliteDb.prepare(sql);
+		// better-sqlite3 só aceita number/string/bigint/Buffer/null; mysql2 pode retornar Date/boolean
+		const toSqliteValue = (v) => {
+			if (v instanceof Date) return v.getTime();
+			if (typeof v === "boolean") return v ? 1 : 0;
+			if (v === undefined) return null;
+			return v;
+		};
+		const insertAll = sqliteDb.transaction((batch) => {
+			for (const row of batch) {
+				stmt.run(keys.map((k) => toSqliteValue(row[k])));
+			}
 		});
+		insertAll(rows);
 	}
 
 	async reinitConnection(dbName) {
