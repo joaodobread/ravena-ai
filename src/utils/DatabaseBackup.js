@@ -648,7 +648,9 @@ ${err.message}`);
 			// Fallback re-init
 			try {
 				await this.reinitConnection(dbName);
-			} catch (e) {}
+			} catch (e) {
+				this.logger.error(`Fallback re-init de '${dbName}' falhou apos erro de restauracao:`, e);
+			}
 		} finally {
 			this.recoveringDbs.delete(dbName);
 		}
