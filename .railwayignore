@@ -1,0 +1,14 @@
+# Arquivos que o `railway up` não precisa enviar.
+# data/ e public/ já são ignorados pelo .dockerignore (o volume monta /app/data em produção).
+data/
+public/
+simulador/
+logs/
+downloads/
+temp/
+media/
+node_modules/
+.opencode/
+*.db
+*.log
+.DS_Store
