@@ -155,7 +155,7 @@ database.addLoadReport(reportObj)
 
 ## Backup
 
-- **Local**: cópias agendadas em `data/backups/` (0h, 6h, 12h, 18h por padrão)
+- **Local**: 1 cópia por dia em `data/backups/` (4h por padrão, compactada em `.db.gz`), mantida por `BACKUP_RETENTION_DAYS` dias (padrão 15)
 - **Remoto**: sincronização MySQL via `SQLITE_REMOTE_SERVERS` no `.env` (inicia **5 minutos** após o bot subir)
 - **Restauração**: em caso de corrupção (`SQLITE_CORRUPT`), o `DatabaseBackup` restaura automaticamente do backup mais recente
 

@@ -2,6 +2,8 @@ const fs = require("fs");
 const path = require("path");
 const mysql = require("mysql2/promise");
 const Logger = require("./Logger");
+const zlib = require("zlib");
+const { pipeline } = require("stream/promises");
 const BetterSQLite = require("better-sqlite3");
 
 class DatabaseBackup {
@@ -12,8 +14,8 @@ class DatabaseBackup {
 		this.databasePath = path.join(__dirname, "../../data");
 		this.backupPath = path.join(__dirname, "../../data/backups");
 
-		this.maxBackups = parseInt(process.env.MAX_BACKUPS) || 120;
-		this.backupRetentionDays = parseInt(process.env.BACKUP_RETENTION_DAYS) || 30;
+		// 1 backup por dia (veja SCHEDULED_BACKUP_HOURS), mantido por N dias
+		this.backupRetentionDays = parseInt(process.env.BACKUP_RETENTION_DAYS) || 15;
 
 		// Remote Backup Config
 		this.remoteEnabled = process.env.SQLITE_REMOTE_BACKUP === "true";
@@ -107,6 +109,8 @@ class DatabaseBackup {
 				}
 			}
 
+			await this.compressBackupDir(path.join(backupDir, "sqlites"));
+
 			this.logger.info(`File backup created: ${backupDir}`);
 			this.cleanupOldScheduledBackups();
 
@@ -165,32 +169,98 @@ class DatabaseBackup {
 		}
 	}
 
+	/**
+	 * Compacta com gzip todos os arquivos .db de um diretório de backup (remove o original).
+	 * Se a compactação de um arquivo falhar, o original é mantido.
+	 */
+	async compressBackupDir(dir) {
+		if (!fs.existsSync(dir)) return;
+		for (const file of fs.readdirSync(dir)) {
+			if (!file.endsWith(".db")) continue;
+			const src = path.join(dir, file);
+			const dest = `${src}.gz`;
+			try {
+				await pipeline(
+					fs.createReadStream(src),
+					zlib.createGzip({ level: 9 }),
+					fs.createWriteStream(dest)
+				);
+				fs.unlinkSync(src);
+			} catch (e) {
+				this.logger.error(`Failed to compress backup ${src}:`, e);
+				try {
+					fs.unlinkSync(dest);
+				} catch {}
+			}
+		}
+	}
+
+	/**
+	 * Converte o nome do diretório (2026-10-23T18-16-51-621Z) em timestamp.
+	 */
+	parseBackupTimestamp(name) {
+		const iso = name.replace(/T(\d{2})-(\d{2})-(\d{2})-(\d+)Z/, "T$1:$2:$3.$4Z");
+		return new Date(iso).getTime();
+	}
+
+	/**
+	 * Mantém 1 backup por dia (o mais recente do dia) e remove os mais antigos que
+	 * BACKUP_RETENTION_DAYS. O backup mais recente nunca é removido.
+	 */
 	cleanupOldScheduledBackups() {
 		try {
 			const now = Date.now();
 			const retentionPeriod = this.backupRetentionDays * 24 * 60 * 60 * 1000;
 
+			// Ordenados do mais novo para o mais antigo
 			const backupDirs = this.getSortedLocalBackups();
+			const keptDays = new Set();
 
-			if (backupDirs.length > this.maxBackups) {
-				const dirsToDelete = backupDirs.slice(this.maxBackups);
-				for (const dir of dirsToDelete) {
-					// We still need to check date for retention
-					const dirDate = new Date(
-						dir.name.replace(/-/g, (m, i) =>
-							i === 4 || i === 7 || i === 10 ? m : i === 13 || i === 16 ? ":" : i === 19 ? "." : m
-						)
-					).getTime();
+			backupDirs.forEach((dir, index) => {
+				const ts = this.parseBackupTimestamp(dir.name);
+				if (isNaN(ts)) return; // nome inesperado: não mexe
 
-					if (isNaN(dirDate) || now - dirDate > retentionPeriod) {
-						this.deleteDirectory(dir.path);
-						this.logger.info(`Old backup removed: ${dir.name}`);
-					}
+				const day = dir.name.slice(0, 10);
+				const expired = now - ts > retentionPeriod;
+				const duplicateDay = keptDays.has(day);
+
+				if (index > 0 && (expired || duplicateDay)) {
+					this.deleteDirectory(dir.path);
+					this.logger.info(
+						`Old backup removed: ${dir.name} (${expired ? "expirado" : "já existe backup do dia"})`
+					);
+				} else {
+					keptDays.add(day);
 				}
-			}
+			});
 		} catch (error) {
 			this.logger.error("Error cleaning up old backups:", error);
 		}
+	}
+
+	/**
+	 * Localiza o arquivo de um banco dentro de um backup (.db.gz ou .db legado) e
+	 * devolve um caminho de arquivo SQLite legível (descompacta para um temporário se preciso).
+	 * @returns {{ filePath: string, temporary: boolean } | null}
+	 */
+	async resolveBackupFile(backupPath, dbFile) {
+		const raw = path.join(backupPath, "sqlites", dbFile);
+		const gz = `${raw}.gz`;
+		if (fs.existsSync(gz)) {
+			const tmp = path.join(this.backupPath, `.restore-${process.pid}-${dbFile}`);
+			try {
+				await pipeline(fs.createReadStream(gz), zlib.createGunzip(), fs.createWriteStream(tmp));
+				return { filePath: tmp, temporary: true };
+			} catch (e) {
+				this.logger.warn(`Failed to decompress ${gz}: ${e.message}`);
+				try {
+					fs.unlinkSync(tmp);
+				} catch {}
+				return null;
+			}
+		}
+		if (fs.existsSync(raw)) return { filePath: raw, temporary: false };
+		return null;
 	}
 
 	getSortedLocalBackups() {
@@ -438,14 +508,7 @@ class DatabaseBackup {
 		let conn;
 		try {
 			conn = new BetterSQLite(filePath, { readonly: true, timeout: 2000 });
-			const result = conn.pragma("integrity_check");
-			if (Array.isArray(result) && result[0] === "ok") {
-				return true;
-			}
-			if (result === "ok") {
-				return true;
-			}
-			return false;
+			return conn.pragma("integrity_check", { simple: true }) === "ok";
 		} catch (e) {
 			this.logger.warn(`Integrity check failed for backup file ${filePath}: ${e.message}`);
 			return false;
@@ -539,23 +602,26 @@ Error: \`${error.message}\``);
 			if (!restored) {
 				const localBackups = this.getSortedLocalBackups();
 				for (const backup of localBackups) {
-					const backupFilePath = path.join(backup.path, "sqlites", dbFile);
-					if (fs.existsSync(backupFilePath)) {
-						if (this.isBackupFileHealthy(backupFilePath)) {
-							try {
-								fs.copyFileSync(backupFilePath, dbPath);
-								restored = true;
-								backupUsed = `file from ${backup.name}`;
-								break;
-							} catch (e) {
-								this.logger.error(
-									`Failed to restore from local backup ${backup.name}: ${e.message}`
-								);
-							}
+					const resolved = await this.resolveBackupFile(backup.path, dbFile);
+					if (!resolved) continue;
+					try {
+						if (this.isBackupFileHealthy(resolved.filePath)) {
+							fs.copyFileSync(resolved.filePath, dbPath);
+							restored = true;
+							backupUsed = `file from ${backup.name}`;
 						} else {
 							this.logger.warn(`Skipping corrupt local backup: ${backup.name}`);
 						}
+					} catch (e) {
+						this.logger.error(`Failed to restore from local backup ${backup.name}: ${e.message}`);
+					} finally {
+						if (resolved.temporary) {
+							try {
+								fs.unlinkSync(resolved.filePath);
+							} catch {}
+						}
 					}
+					if (restored) break;
 				}
 			}
 

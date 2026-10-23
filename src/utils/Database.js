@@ -113,7 +113,7 @@ class Database {
 			? process.env.SCHEDULED_BACKUP_HOURS.split(",")
 					.map((h) => parseInt(h.trim()))
 					.filter((h) => !isNaN(h))
-			: [0, 6, 12, 18];
+			: [4];
 
 		// Shared Blocked Contacts (Global by type)
 		this.globalBlockedContacts = {
